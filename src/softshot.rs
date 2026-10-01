@@ -905,10 +905,16 @@ mod tests {
         for want in ["Setting", "Language", "Layout", "Follow system"] {
             assert!(en.iter().any(|t| t == want), "英文界面缺少「{want}」：{en:?}");
         }
-        // 语言名用各自母语书写，两种语言下都在
-        assert!(en.iter().any(|t| t == "中文") && en.iter().any(|t| t == "English"), "语言选项应列出两种语言");
+        // English 选项任何环境都在；「中文」在没有中文字体的机器上按设计不提供（选了也会回退英文），
+        // Ubuntu CI runner 就是这种情况，所以这里要分开断言
+        assert!(en.iter().any(|t| t == "English"), "语言选项应列出 English");
+        if app.debug_has_cjk() {
+            assert!(en.iter().any(|t| t == "中文"), "有中文字体时应列出「中文」选项");
+        } else {
+            assert!(!en.iter().any(|t| t == "中文"), "没有中文字体时不应提供「中文」选项");
+        }
 
-        // 中文：只有系统里真的有中文字体时才切得过去（没有字体时程序会回退英文，CI 上就是这种情况）
+        // 中文：只有系统里真的有中文字体时才切得过去（没有字体时程序会回退英文）
         if app.debug_has_cjk() {
             assert_eq!(app.debug_set_language("zh"), "zh");
             let zh = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
