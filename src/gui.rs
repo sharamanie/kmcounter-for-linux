@@ -1209,6 +1209,13 @@ impl App {
         self.s()
     }
 
+    /// 系统里有没有中文字体（测试据此决定是否检查中文界面）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_has_cjk(&self) -> bool {
+        self.has_cjk
+    }
+
     /// 指定屏幕物理尺寸（测试里让「屏幕尺寸」有一个确定的数值）
     #[cfg(feature = "softshot")]
     #[cfg_attr(not(test), allow(dead_code))]

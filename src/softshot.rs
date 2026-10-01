@@ -416,8 +416,10 @@ mod tests {
         app.debug_set_hour(Some(10));
         drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
         let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        // 文案随语言变（CI 上 LANG=C 会回退英文），所以按文案表匹配而不是硬编码中文
+        let invalid_mark = app.debug_strings().hour_invalid;
         assert!(
-            texts.iter().any(|t| t.contains("已作废")),
+            texts.iter().any(|t| t.contains(invalid_mark.trim_end_matches('）').trim_end_matches(')'))),
             "提示行应说明该小时已作废：{texts:?}"
         );
         // 切到 9 时（未作废）就不该再有作废提示
@@ -433,7 +435,7 @@ mod tests {
         app9.debug_set_hour(Some(9));
         drive(&mut app9, &ctx9, 1260.0, 900.0, 3, vec![]);
         let texts9 = frame_texts(&ctx9, &mut app9, 1260.0, 900.0);
-        assert!(!texts9.iter().any(|t| t.contains("已作废")), "9 时未作废，不应有提示");
+        assert!(!texts9.iter().any(|t| t.contains(invalid_mark)), "9 时未作废，不应有提示");
     }
 
     /// 托盘呼出 → 视图切回今日；日历里点某天 → 直接切过去（没数据的天不生效）
@@ -455,7 +457,7 @@ mod tests {
         }
         let (mut app, ctx) = headless_app(store);
         drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
-        assert_eq!(app.debug_view_label(), "总计", "初始视图是总计");
+        assert_eq!(app.debug_view_label(), app.debug_strings().total_label, "初始视图是总计");
 
         // 托盘呼出标志 → 下一帧切到今日
         app.debug_flags().show_today.store(true, Ordering::Relaxed);
@@ -500,10 +502,10 @@ mod tests {
         let texts = frame_texts(&ctx2, &mut app2, 1260.0, 900.0);
         let month = today.format("%Y / %m").to_string();
         assert!(texts.iter().any(|t| t == &month), "应显示月份 {month}：{texts:?}");
-        for wd in ["一", "二", "三", "四", "五", "六", "日"] {
+        for wd in app.debug_strings().weekdays.split(' ') {
             assert!(texts.iter().any(|t| t == wd), "缺少星期表头 {wd}");
         }
-        for want in ["今天", "总计"] {
+        for want in [app.debug_strings().cal_today, app.debug_strings().total_label] {
             assert!(texts.iter().any(|t| t == want), "缺少「{want}」入口");
         }
         // 日期格子：本月 1 号与今天的日号都应出现
@@ -574,7 +576,7 @@ mod tests {
         let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
         let month = today.format("%Y / %m").to_string();
         assert!(texts.iter().any(|t| t == &month), "趋势页日历应显示月份 {month}");
-        for want in ["今天", "总计"] {
+        for want in [app.debug_strings().cal_today, app.debug_strings().total_label] {
             assert!(texts.iter().any(|t| t == want), "趋势页日历缺少「{want}」入口");
         }
         // 再点一次标题 → 收起
@@ -881,27 +883,30 @@ mod tests {
         app.debug_open_panel();
         drive(&mut app, &ctx, 1260.0, 1400.0, 3, vec![]);
 
-        // 默认（中文）：设置面板里是中文文案
-        let zh = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
-        for want in ["设置", "语言", "键盘布局", "跟随系统"] {
-            assert!(zh.iter().any(|t| t == want), "中文界面缺少「{want}」：{zh:?}");
-        }
-        assert!(zh.iter().any(|t| t == "中文") && zh.iter().any(|t| t == "English"), "语言选项应列出两种语言");
-
-        // 切到英文（与点“保存”同路径）
+        // 切到英文（与点“保存”同路径）。英文不依赖字体，任何环境都能切
         assert_eq!(app.debug_set_language("en"), "en");
         let en = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
         for want in ["Setting", "Language", "Layout", "Follow system"] {
             assert!(en.iter().any(|t| t == want), "英文界面缺少「{want}」：{en:?}");
         }
-        assert!(!en.iter().any(|t| t == "设置"), "切到英文后不应再有中文文案");
         // 语言名用各自母语书写，两种语言下都在
-        assert!(en.iter().any(|t| t == "中文") && en.iter().any(|t| t == "English"));
+        assert!(en.iter().any(|t| t == "中文") && en.iter().any(|t| t == "English"), "语言选项应列出两种语言");
 
-        // 切回中文
-        assert_eq!(app.debug_set_language("zh"), "zh");
-        let back = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
-        assert!(back.iter().any(|t| t == "设置"));
+        // 中文：只有系统里真的有中文字体时才切得过去（没有字体时程序会回退英文，CI 上就是这种情况）
+        if app.debug_has_cjk() {
+            assert_eq!(app.debug_set_language("zh"), "zh");
+            let zh = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
+            for want in ["设置", "语言", "键盘布局", "跟随系统"] {
+                assert!(zh.iter().any(|t| t == want), "中文界面缺少「{want}」：{zh:?}");
+            }
+            assert!(!zh.iter().any(|t| t == "Setting"), "中文界面不应出现英文文案");
+            // 再切回英文同样生效
+            assert_eq!(app.debug_set_language("en"), "en");
+            let back = frame_texts(&ctx, &mut app, 1260.0, 1400.0);
+            assert!(back.iter().any(|t| t == "Setting"), "切回英文应立刻生效");
+        } else {
+            println!("[softshot] 系统没有中文字体，跳过中文界面断言");
+        }
     }
 
     /// 点击键盘右上角的分布条 → 选中该小时；再点一次 → 回到全天；
