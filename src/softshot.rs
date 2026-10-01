@@ -22,6 +22,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+thread_local! {
+    /// 每个线程一条单调递增的虚拟时间轴。
+    /// egui 在 debug 构建里会断言 “Time shouldn't move backwards”（release 下被编译掉），
+    /// 所以每次 `ctx.run` 的时间必须严格递增——CI 跑的是 debug 构建，离屏测试曾经就炸在这里。
+    static FRAME_TIME: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// 下一帧的虚拟时间（+0.2s，保证单调）
+pub(crate) fn next_time() -> f64 {
+    FRAME_TIME.with(|t| {
+        let v = t.get() + 0.2;
+        t.set(v);
+        v
+    })
+}
+
 /// RGBA 画布（预乘 alpha，与 egui 顶点色一致）
 struct Canvas {
     w: usize,
@@ -251,7 +267,7 @@ pub fn render(store: Store, cfg: Config, cfg_dir: &Path, out_prefix: &str, width
         let h = if frame < 3 { 1400.0 } else { canvas_h };
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, h)));
-        raw.time = Some(frame as f64 * 0.5);
+        raw.time = Some(next_time());
         let out = ctx.run(raw, |ctx| app.draw(ctx));
         apply_textures(&mut textures, &out.textures_delta);
         let (base_h, panel_extra, content_bottom, bottom_top) = app.debug_layout();
@@ -319,7 +335,7 @@ mod tests {
     fn frame_texts(ctx: &egui::Context, app: &mut App, width: f32, height: f32) -> Vec<String> {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
-        raw.time = Some(1.0);
+        raw.time = Some(next_time());
         let out = ctx.run(raw, |ctx| app.draw(ctx));
         let mut texts = Vec::new();
         let mut push_shape = |sh: &egui::Shape| {
@@ -346,7 +362,7 @@ mod tests {
         for i in 0..frames {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
-            raw.time = Some(i as f64 * 0.2);
+            raw.time = Some(next_time());
             if i + 1 == frames {
                 raw.events = events.clone();
             }
@@ -708,7 +724,7 @@ mod tests {
         drive(&mut app, &ctx, 1260.0, 1400.0, 3, vec![]);
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1260.0, 1400.0)));
-        raw.time = Some(9.0);
+        raw.time = Some(next_time());
         let out = ctx.run(raw, |ctx| app.draw(ctx));
         let mut items: Vec<(f32, f32, String)> = Vec::new();
         let mut walk = |sh: &egui::Shape| match sh {
@@ -738,7 +754,7 @@ mod tests {
     fn frame_texts_pos(ctx: &egui::Context, app: &mut App, width: f32, height: f32) -> Vec<(f32, f32, f32, String)> {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
-        raw.time = Some(9.0);
+        raw.time = Some(next_time());
         let out = ctx.run(raw, |ctx| app.draw(ctx));
         let mut items: Vec<(f32, f32, f32, String)> = Vec::new();
         let mut push = |t: &egui::epaint::TextShape| {
