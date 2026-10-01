@@ -31,32 +31,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 失败时把 panic 摘要打成注解（::error::）：不用登录、不用翻日志，
-      # 在 Actions 页面的 “Annotations” 里就能直接看到哪个测试挂了、为什么挂
+      # 失败时把摘要打成注解（::error::）：不用登录、不用翻日志，
+      # 在 Actions 页面的 “Annotations” 里就能直接看到哪个测试挂了、为什么挂。
+      # 注意显式指定 bash：Windows runner 默认是 pwsh，这里的管道/PIPESTATUS 只在 bash 下成立
       - name: Test
+        shell: bash
         run: |
-          set +e
-          cargo test --locked 2>&1 | tee /tmp/test.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            grep -aE "panicked at|^thread |^---- |^failures:|^test result:|assertion|  left:|  right:" /tmp/test.log | head -40 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
+          set -o pipefail
+          if cargo test --locked 2>&1 | tee /tmp/test.log; then
+            exit 0
           fi
-          exit $status
+          echo "::error::cargo test 失败，摘要如下"
+          grep -aE "error(\[|:)|panicked at|^failures:|^test result:|assertion|  left:|  right:|No such file" /tmp/test.log \
+            | head -30 | while IFS= read -r line; do echo "::error::$line"; done
+          tail -15 /tmp/test.log | while IFS= read -r line; do echo "::error::tail | $line"; done
+          exit 1
 
       # softshot 特性 = 无 GPU 的软件光栅化出图，附带界面交互测试（点击分布条/按键）
       - name: Test (softshot feature)
+        shell: bash
         run: |
-          set +e
-          cargo test --locked --features softshot 2>&1 | tee /tmp/softshot.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            grep -aE "panicked at|^thread |^---- |^failures:|^test result:|assertion|  left:|  right:" /tmp/softshot.log | head -40 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
+          set -o pipefail
+          if cargo test --locked --features softshot 2>&1 | tee /tmp/softshot.log; then
+            exit 0
           fi
-          exit $status
+          echo "::error::cargo test (softshot) 失败，摘要如下"
+          grep -aE "error(\[|:)|panicked at|^failures:|^test result:|assertion|  left:|  right:|No such file" /tmp/softshot.log \
+            | head -30 | while IFS= read -r line; do echo "::error::$line"; done
+          tail -15 /tmp/softshot.log | while IFS= read -r line; do echo "::error::tail | $line"; done
+          exit 1
 
       - name: Build release
         run: cargo build --release --locked
