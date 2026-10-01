@@ -31,12 +31,32 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # 失败时把 panic 摘要打成注解（::error::）：不用登录、不用翻日志，
+      # 在 Actions 页面的 “Annotations” 里就能直接看到哪个测试挂了、为什么挂
       - name: Test
-        run: cargo test --locked
+        run: |
+          set +e
+          cargo test --locked 2>&1 | tee /tmp/test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -aE "panicked at|^thread |^---- |^failures:|^test result:|assertion|  left:|  right:" /tmp/test.log | head -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit $status
 
       # softshot 特性 = 无 GPU 的软件光栅化出图，附带界面交互测试（点击分布条/按键）
       - name: Test (softshot feature)
-        run: cargo test --locked --features softshot
+        run: |
+          set +e
+          cargo test --locked --features softshot 2>&1 | tee /tmp/softshot.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -aE "panicked at|^thread |^---- |^failures:|^test result:|assertion|  left:|  right:" /tmp/softshot.log | head -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit $status
 
       - name: Build release
         run: cargo build --release --locked
