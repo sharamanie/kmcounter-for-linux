@@ -1,0 +1,8 @@
+/target
+*.json.tmp
+*.json.bak
+Cargo.lock.bak
+# 个人统计/配置（原版 KMCounter 的数据文件，放在仓库目录里时不要提交）
+KMCounter.ini
+# 软渲染调试输出
+*.ppm

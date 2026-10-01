@@ -1,0 +1,399 @@
+//! 界面文案（中/英），对应原版的 MultiLanguage 段。
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    Zh,
+    En,
+}
+
+impl Lang {
+    pub fn resolve(cfg_lang: &str) -> Lang {
+        match cfg_lang {
+            "zh" => return Lang::Zh,
+            "en" => return Lang::En,
+            _ => {}
+        }
+        // auto：跟随系统 LANG
+        if let Ok(l) = std::env::var("LANG") {
+            if l.to_lowercase().starts_with("zh") {
+                return Lang::Zh;
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Windows 下看系统 UI 语言
+            if std::env::var("SYSTEM_LANGUAGE").map(|v| v.starts_with("zh")).unwrap_or(false) {
+                return Lang::Zh;
+            }
+        }
+        Lang::En
+    }
+
+    /// 中文界面需要 CJK 字体，缺字体时退回英文
+    pub fn downgrade_if_no_cjk(self, has_cjk: bool) -> Lang {
+        match self {
+            Lang::Zh if !has_cjk => {
+                log::warn!("未找到中文字体，界面退回英文。可在配置中指定 font_path。");
+                Lang::En
+            }
+            other => other,
+        }
+    }
+}
+
+pub struct Strings {
+    pub app_title: &'static str,
+    pub menu_stats: &'static str,
+    pub menu_settings: &'static str,
+    pub menu_autostart: &'static str,
+    pub menu_exit: &'static str,
+    pub col_item: &'static str,
+    pub col_today: &'static str,
+    pub col_total: &'static str,
+    pub mouse_move: &'static str,
+    pub keystrokes: &'static str,
+    /// 键盘分区（统计表的细分项）
+    pub zone_main: &'static str,
+    pub zone_function: &'static str,
+    pub zone_control: &'static str,
+    pub zone_numpad: &'static str,
+    pub lbutton: &'static str,
+    pub rbutton: &'static str,
+    pub mbutton: &'static str,
+    pub xbutton: &'static str,
+    pub wheel: &'static str,
+    pub hwheel: &'static str,
+    pub monitor: &'static str,
+    pub unit_m: &'static str,
+    pub unit_times: &'static str,
+    pub unit_inch: &'static str,
+    pub total_label: &'static str,
+    pub view_date_prefix: &'static str,
+    pub not_enough_hint: &'static str,
+    pub welcome_main: &'static str,
+    pub welcome_sub: &'static str,
+    pub settings_title: &'static str,
+    pub settings_history: &'static str,
+    pub settings_history_sub: &'static str,
+    pub settings_storage: &'static str,
+    pub settings_days: &'static str,
+    pub settings_screen: &'static str,
+    pub settings_screen_sub: &'static str,
+    pub settings_width: &'static str,
+    pub settings_height: &'static str,
+    pub settings_mm: &'static str,
+    pub settings_limits: &'static str,
+    pub settings_limits_sub: &'static str,
+    pub settings_limit_move: &'static str,
+    pub settings_limit_click: &'static str,
+    pub settings_limit_keys: &'static str,
+    pub unit_km_per_hour: &'static str,
+    pub unit_per_hour: &'static str,
+    pub hour_invalid: &'static str,
+    pub invalid_mark: &'static str,
+    pub settings_window: &'static str,
+    pub settings_window_sub: &'static str,
+    pub settings_keep_on_top: &'static str,
+    pub settings_language: &'static str,
+    pub settings_language_sub: &'static str,
+    pub lang_auto: &'static str,
+    pub lang_no_cjk: &'static str,
+    pub settings_layout: &'static str,
+    pub settings_layout_sub: &'static str,
+    pub settings_key_w: &'static str,
+    pub settings_key_h: &'static str,
+    pub settings_key_spacing: &'static str,
+    pub settings_h_spacing: &'static str,
+    pub settings_v_spacing: &'static str,
+    pub settings_px: &'static str,
+    pub settings_cancel: &'static str,
+    pub settings_save: &'static str,
+    pub input_error: &'static str,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub input_error_linux_hint: &'static str,
+    pub nav_hint: &'static str,
+    pub top_keys: &'static str,
+    pub tab_heatmap: &'static str,
+    pub tab_trend: &'static str,
+    pub gran_hourly: &'static str,
+    pub gran_daily: &'static str,
+    pub gran_weekly: &'static str,
+    pub gran_monthly: &'static str,
+    pub gran_yearly: &'static str,
+    pub trend_hint: &'static str,
+    pub trend_no_data: &'static str,
+    pub trend_mouse_distance: &'static str,
+    pub stat_this_hour: &'static str,
+    pub stat_that_hour: &'static str,
+    pub stat_that_week: &'static str,
+    pub stat_that_month: &'static str,
+    pub stat_this_week: &'static str,
+    pub stat_this_month: &'static str,
+    pub stat_vs_hour: &'static str,
+    pub stat_vs_week: &'static str,
+    pub stat_vs_month: &'static str,
+    pub stat_flat: &'static str,
+    pub all_day: &'static str,
+    pub hour_suffix: &'static str,
+    pub hour_dist: &'static str,
+    pub strip_hint: &'static str,
+    pub cal_today: &'static str,
+    pub weekdays: &'static str,
+    pub hour_peak: &'static str,
+    pub sel_prefix: &'static str,
+    pub sel_sum: &'static str,
+    pub sel_clear: &'static str,
+    pub sel_hint: &'static str,
+    pub more_label: &'static str,
+    pub more_collapse: &'static str,
+}
+
+const ZH: Strings = Strings {
+    app_title: "KMCounter-rs",
+    menu_stats: "统计",
+    menu_settings: "设置",
+    menu_autostart: "开机启动",
+    menu_exit: "退出",
+    col_item: "项目",
+    col_today: "今日",
+    col_total: "总计",
+    mouse_move: "鼠标移动",
+    keystrokes: "键盘敲击",
+    zone_main: "主键盘区",
+    zone_function: "功能键区",
+    zone_control: "控制键区",
+    zone_numpad: "数字键区",
+    lbutton: "左键点击",
+    rbutton: "右键点击",
+    mbutton: "中键点击",
+    xbutton: "侧键点击",
+    wheel: "滚轮滚动",
+    hwheel: "滚轮横滚",
+    monitor: "屏幕尺寸",
+    unit_m: "米",
+    unit_times: "次",
+    unit_inch: "寸",
+    total_label: "总计",
+    view_date_prefix: "当前显示数据",
+    not_enough_hint: "当前时段按键次数较少，故暂未生成按键热点图。",
+    welcome_main: "欢迎使用 KMCounter-rs",
+    welcome_sub: "KMCounter-rs 将常驻托盘为你统计键鼠使用情况，点击托盘图标即可查看统计结果。",
+    settings_title: "设置",
+    settings_history: "历史数据",
+    settings_history_sub: "设置历史数据保留时长。",
+    settings_storage: "存储",
+    settings_days: "天",
+    settings_screen: "屏幕尺寸",
+    settings_screen_sub: "设置显示器的真实尺寸。",
+    settings_width: "屏幕宽",
+    settings_height: "屏幕高",
+    settings_mm: "毫米",
+    settings_limits: "数据校验",
+    settings_limits_sub: "某个小时超过阈值就整小时作废：原始数值仍记录并打标记，只是不计入当日/总计（0 = 关闭）。",
+    settings_limit_move: "鼠标移动上限",
+    settings_limit_click: "鼠标点击上限",
+    settings_limit_keys: "键盘敲击上限",
+    unit_km_per_hour: "公里/小时",
+    unit_per_hour: "次/小时",
+    hour_invalid: "该小时数据已作废（超过阈值，未计入当日/总计；原始数值仍保留）",
+    invalid_mark: "（已作废）",
+    settings_window: "窗口",
+    settings_window_sub: "从托盘呼出窗口时的行为。",
+    settings_keep_on_top: "呼出时置顶（否则只激活，可能被其他窗口挡住）",
+    settings_language: "语言",
+    settings_language_sub: "界面显示语言，保存后立即生效。",
+    lang_auto: "跟随系统",
+    lang_no_cjk: "未找到中文字体，界面仍为英文（可在配置文件中指定 font_path）。",
+    settings_layout: "键盘布局",
+    settings_layout_sub: "设置键盘热力图的尺寸。",
+    settings_key_w: "键宽",
+    settings_key_h: "键高",
+    settings_key_spacing: "键间距",
+    settings_h_spacing: "区域水平间距",
+    settings_v_spacing: "区域垂直间距",
+    settings_px: "像素",
+    settings_cancel: "取消",
+    settings_save: "保存",
+    input_error: "输入捕获未就绪：",
+    input_error_linux_hint: "请将用户加入 input 组后重新登录：sudo usermod -aG input $USER",
+    nav_hint: "◀ ▶ 或 上下/翻页键/滚轮 查看历史 · 点击日期打开日历",
+    top_keys: "最常用按键",
+    tab_heatmap: "热力图",
+    tab_trend: "趋势",
+    gran_hourly: "每小时",
+    gran_daily: "每日",
+    gran_weekly: "每周",
+    gran_monthly: "每月",
+    gran_yearly: "每年",
+    trend_hint: "滚轮 / 上下键按当前粒度翻页 · 悬停看数值，点击跳到那天 · 窗口：时 72 小时 / 日 120 天 / 周 104 周 / 月 24 月 / 年 全部",
+    trend_no_data: "暂无数据",
+    trend_mouse_distance: "鼠标移动距离",
+    stat_this_hour: "本小时",
+    stat_that_hour: "该小时",
+    stat_that_week: "该周",
+    stat_that_month: "该月",
+    stat_this_week: "本周",
+    stat_this_month: "本月",
+    stat_vs_hour: "对比前一日同一小时（等长窗口）",
+    stat_vs_week: "对比前一周同期（等长窗口）",
+    stat_vs_month: "对比前一个月同期（等长窗口）",
+    stat_flat: "持平",
+    all_day: "全天",
+    hour_suffix: " 时",
+    hour_dist: "每小时分布",
+    strip_hint: "（点击只看该小时）",
+    cal_today: "今天",
+    weekdays: "一 二 三 四 五 六 日",
+    hour_peak: "最活跃时段",
+    sel_prefix: "已选",
+    sel_sum: "合计",
+    sel_clear: "清空选择",
+    sel_hint: "点击键盘上的按键可选中并查看其按压次数；再次点击取消",
+    more_label: "展开更多",
+    more_collapse: "收起",
+};
+
+const EN: Strings = Strings {
+    app_title: "KMCounter-rs",
+    menu_stats: "Statistics",
+    menu_settings: "Setting",
+    menu_autostart: "Start-Up",
+    menu_exit: "Exit",
+    col_item: "Item",
+    col_today: "Today",
+    col_total: "Total",
+    mouse_move: "MouseMove",
+    keystrokes: "Keystrokes",
+    zone_main: "Main area",
+    zone_function: "Function keys",
+    zone_control: "Control keys",
+    zone_numpad: "Numpad",
+    lbutton: "LButton",
+    rbutton: "RButton",
+    mbutton: "MButton",
+    xbutton: "XButton",
+    wheel: "Wheel",
+    hwheel: "HWheel",
+    monitor: "Monitor",
+    unit_m: "m",
+    unit_times: " ",
+    unit_inch: "inch",
+    total_label: "Total",
+    view_date_prefix: "Date",
+    not_enough_hint: "Keystrokes in this period are too few, heatmap not generated yet.",
+    welcome_main: "Welcome to KMCounter-rs",
+    welcome_sub: "KMCounter-rs stays in your tray and records keyboard/mouse usage. Click the tray icon to view results.",
+    settings_title: "Setting",
+    settings_history: "History",
+    settings_history_sub: "Set the storage time of history data.",
+    settings_storage: "Storage",
+    settings_days: "days",
+    settings_screen: "Monitor",
+    settings_screen_sub: "Set the real size of the monitor.",
+    settings_width: "Width",
+    settings_height: "Height",
+    settings_mm: "mm",
+    settings_limits: "Data checks",
+    settings_limits_sub: "An hour exceeding a threshold is voided: the raw values are still recorded and marked, they just do not count towards the day/total (0 = off).",
+    settings_limit_move: "Mouse distance",
+    settings_limit_click: "Mouse clicks",
+    settings_limit_keys: "Keystrokes",
+    unit_km_per_hour: "km/h",
+    unit_per_hour: "/h",
+    hour_invalid: "This hour was voided (threshold exceeded, not counted in day/total; raw values kept)",
+    invalid_mark: " (voided)",
+    settings_window: "Window",
+    settings_window_sub: "What happens when the window is restored from the tray.",
+    settings_keep_on_top: "Keep on top when restored (otherwise it may stay behind other windows)",
+    settings_language: "Language",
+    settings_language_sub: "Interface language; applies as soon as you save.",
+    lang_auto: "Follow system",
+    lang_no_cjk: "No CJK font found, staying in English (set font_path in the config file).",
+    settings_layout: "Layout",
+    settings_layout_sub: "Set the size of the heatmap.",
+    settings_key_w: "Key Width",
+    settings_key_h: "Key Height",
+    settings_key_spacing: "Key Spacing",
+    settings_h_spacing: "HSpacing",
+    settings_v_spacing: "VSpacing",
+    settings_px: "px",
+    settings_cancel: "Cancel",
+    settings_save: "Save",
+    input_error: "Input capture not ready: ",
+    input_error_linux_hint: "Add yourself to the input group and re-login: sudo usermod -aG input $USER",
+    nav_hint: "◀ ▶ or Up/Down, PageUp/PageDown, Wheel for history; click the date for a calendar",
+    top_keys: "Top keys",
+    tab_heatmap: "Heatmap",
+    tab_trend: "Trends",
+    gran_hourly: "Hourly",
+    gran_daily: "Daily",
+    gran_weekly: "Weekly",
+    gran_monthly: "Monthly",
+    gran_yearly: "Yearly",
+    trend_hint: "Wheel / Up-Down pages by the current unit · Hover for values, click to jump to that day · windows: 72 hours / 120 days / 104 weeks / 24 months / all years",
+    trend_no_data: "No data yet",
+    trend_mouse_distance: "Mouse distance",
+    stat_this_hour: "This hour",
+    stat_that_hour: "That hour",
+    stat_that_week: "That week",
+    stat_that_month: "That month",
+    stat_this_week: "This week",
+    stat_this_month: "This month",
+    stat_vs_hour: "vs the same hour on the previous day",
+    stat_vs_week: "vs the same length of the previous week",
+    stat_vs_month: "vs the same length of the previous month",
+    stat_flat: "flat",
+    all_day: "All day",
+    hour_suffix: ":00",
+    hour_dist: "Hourly distribution",
+    strip_hint: " (click to filter)",
+    cal_today: "Today",
+    weekdays: "Mo Tu We Th Fr Sa Su",
+    hour_peak: "Most active hour",
+    sel_prefix: "Selected",
+    sel_sum: "Total",
+    sel_clear: "Clear",
+    sel_hint: "Click keys on the keyboard to inspect their press counts; click again to deselect",
+    more_label: "More",
+    more_collapse: "Collapse",
+};
+
+/// 界面里可选的具体语言项（配置值, 显示名）；语言名用其母语书写，不随界面语言变化
+pub const LANG_CHOICES: [(&str, &str); 2] = [("zh", "中文"), ("en", "English")];
+
+pub fn strings(lang: Lang) -> &'static Strings {
+    match lang {
+        Lang::Zh => &ZH,
+        Lang::En => &EN,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_language_codes_resolve() {
+        assert_eq!(Lang::resolve("zh"), Lang::Zh);
+        assert_eq!(Lang::resolve("en"), Lang::En);
+        // 未知值按 auto 处理：不做环境判断，只要求不 panic 且落在这两种语言之一
+        let auto = Lang::resolve("nonsense");
+        assert!(auto == Lang::Zh || auto == Lang::En);
+    }
+
+    #[test]
+    fn zh_downgrades_without_cjk_font() {
+        assert_eq!(Lang::Zh.downgrade_if_no_cjk(false), Lang::En);
+        assert_eq!(Lang::Zh.downgrade_if_no_cjk(true), Lang::Zh);
+        assert_eq!(Lang::En.downgrade_if_no_cjk(false), Lang::En);
+    }
+
+    #[test]
+    fn language_choices_cover_config_values() {
+        assert_eq!(LANG_CHOICES.len(), 2);
+        for (code, name) in LANG_CHOICES {
+            assert!(!code.is_empty() && !name.is_empty());
+            assert_ne!(Lang::resolve(code), Lang::resolve(if code == "zh" { "en" } else { "zh" }));
+        }
+    }
+}

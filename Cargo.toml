@@ -1,0 +1,50 @@
+[package]
+name = "kmcounter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "KMCounter rebuilt in Rust: keyboard/mouse usage statistics with heatmap, for Windows and Linux"
+license = "GPL-3.0"
+
+[features]
+# 无 GPU 环境（CI/无显卡机器）用软件光栅化生成界面截图：见 src/softshot.rs
+softshot = []
+
+[dependencies]
+eframe = "=0.29.1"
+egui = "=0.29.1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.8"
+parking_lot = "0.12"
+chrono = "0.4"
+dirs = "5"
+ctrlc = { version = "3", features = ["termination"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+winreg = "0.52"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+inotify = "0.11"
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+nix = { version = "0.29", features = ["poll", "fs"] }
+libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

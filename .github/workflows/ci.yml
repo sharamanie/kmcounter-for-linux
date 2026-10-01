@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      # softshot 特性 = 无 GPU 的软件光栅化出图，附带界面交互测试（点击分布条/按键）
+      - name: Test (softshot feature)
+        run: cargo test --locked --features softshot
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmcounter-${{ matrix.name }}
+          path: target/release/kmcounter
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmcounter-${{ matrix.name }}
+          path: target/release/kmcounter.exe
+
+  # 打 tag（v*）时把两个平台的二进制发成 GitHub Release。
+  # 说明文字放在 .github/release-notes/<tag>.md，没有该文件时退化为只有标题。
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kmcounter-*
+          merge-multiple: true
+
+      - name: Rename assets
+        run: |
+          mv kmcounter kmcounter-linux-x86_64
+          mv kmcounter.exe kmcounter-windows-x86_64.exe
+          chmod +x kmcounter-linux-x86_64
+
+      - name: Pick release notes
+        run: |
+          NOTES=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$NOTES" ]; then
+            printf '%s\n' "$GITHUB_REF_NAME" > "$NOTES"
+          fi
+          echo "NOTES=$NOTES" >> "$GITHUB_ENV"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "KMCounter-rs ${GITHUB_REF_NAME}" \
+            --notes-file "$NOTES" \
+            kmcounter-linux-x86_64 kmcounter-windows-x86_64.exe
