@@ -114,8 +114,9 @@ jobs:
         run: |
           # 幂等：同一个 tag 重推（例如只改了发布说明）时更新正文与产物，而不是报“已存在”
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # --draft=false：删过 tag 再重推时，原发布可能被 GitHub 置为草稿，这里顺带发布出来
             gh release edit "${GITHUB_REF_NAME}" \
-              --title "KMCounter-rs ${GITHUB_REF_NAME}" --notes-file "$NOTES"
+              --title "KMCounter-rs ${GITHUB_REF_NAME}" --notes-file "$NOTES" --draft=false
             gh release upload "${GITHUB_REF_NAME}" kmcounter-linux-x86_64 kmcounter-windows-x86_64.exe --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
