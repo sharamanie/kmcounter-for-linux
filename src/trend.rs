@@ -75,6 +75,8 @@ pub struct TrendPoint {
     pub hour: Option<u8>,
     /// 键盘敲击次数
     pub keystrokes: f64,
+    /// 鼠标按键次数（左 + 右 + 中 + 侧键）
+    pub mouse_clicks: f64,
     /// 鼠标移动（米）
     pub move_meters: f64,
 }
@@ -105,6 +107,7 @@ pub fn build_trends(
     let mut points: Vec<TrendPoint> = Vec::new();
     let mut cur_start: Option<NaiveDate> = None;
     let mut cur_keys = 0f64;
+    let mut cur_clicks = 0f64;
     let mut cur_px = 0f64;
 
     let mut d = start;
@@ -119,15 +122,18 @@ pub fn build_trends(
                     date: s,
                     hour: None,
                     keystrokes: cur_keys,
+                    mouse_clicks: cur_clicks,
                     move_meters: px_to_m(cur_px),
                 });
             }
             cur_start = Some(bs);
             cur_keys = 0.0;
+            cur_clicks = 0.0;
             cur_px = 0.0;
         }
         if let Some(day) = store.days.get(&d.format("%Y%m%d").to_string()) {
             cur_keys += day.keystrokes as f64;
+            cur_clicks += day.mouse_clicks() as f64;
             cur_px += day.mouse.move_px;
         }
         d += Duration::days(1);
@@ -139,6 +145,7 @@ pub fn build_trends(
             date: s,
             hour: None,
             keystrokes: cur_keys,
+            mouse_clicks: cur_clicks,
             move_meters: px_to_m(cur_px),
         });
     }
@@ -178,17 +185,18 @@ pub fn build_hourly_trends(
         let key = t.format("%Y%m%d").to_string();
         let h = t.hour() as u8;
         // 被判作废的小时按 0 计：原始值仍留在数据里，但不该把曲线带偏
-        let (ks, px) = store
+        let (ks, clicks, px) = store
             .hour(&key, h)
             .filter(|u| !u.invalid)
-            .map(|u| (u.keystrokes as f64, u.mouse.move_px))
-            .unwrap_or((0.0, 0.0));
+            .map(|u| (u.keystrokes as f64, u.mouse_clicks() as f64, u.mouse.move_px))
+            .unwrap_or((0.0, 0.0, 0.0));
         points.push(TrendPoint {
             label: t.format("%m-%d %H").to_string(),
             full_label: format!("{} {:02}:00–{:02}:00", t.format("%Y-%m-%d"), h, (h + 1) % 24),
             date: t.date(),
             hour: Some(h),
             keystrokes: ks,
+            mouse_clicks: clicks,
             move_meters: px_to_m(px),
         });
         t += Duration::hours(1);

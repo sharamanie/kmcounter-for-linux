@@ -113,6 +113,11 @@ impl BucketStats {
         self.keys.get(idx).copied().unwrap_or(0)
     }
 
+    /// 鼠标按键次数（左 + 右 + 中 + 侧键，不含滚轮/横滚）
+    pub fn mouse_clicks(&self) -> u64 {
+        self.mouse.lb + self.mouse.rb + self.mouse.mb + self.mouse.xb
+    }
+
     /// 从本桶里减去另一个桶（用于把作废的小时从当日/总计中扣回）
     pub fn subtract(&mut self, o: &BucketStats) {
         self.keystrokes = self.keystrokes.saturating_sub(o.keystrokes);
@@ -205,6 +210,17 @@ impl std::ops::DerefMut for DayEntry {
     }
 }
 
+/// 一个小时里的三项数据（键盘上方那条分时折线图用），各自独立量程
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct HourPoint {
+    /// 键盘敲击次数
+    pub keystrokes: u64,
+    /// 鼠标按键次数（左 + 右 + 中 + 侧键）
+    pub clicks: u64,
+    /// 鼠标移动像素
+    pub move_px: f64,
+}
+
 impl DayEntry {
     /// 取某小时的桶（不存在则创建）
     pub fn hour_mut(&mut self, h: u8) -> &mut BucketStats {
@@ -228,12 +244,12 @@ impl DayEntry {
         self.hours.get(&h).map(|u| u.invalid).unwrap_or(false)
     }
 
-    /// 24 小时分时曲线（键盘敲击次数、鼠标移动像素），无数据的小时为 0
-    pub fn hour_profile(&self) -> Vec<(u64, f64)> {
-        let mut out = vec![(0u64, 0.0f64); HOURS_PER_DAY];
+    /// 24 小时分时曲线（键盘敲击、鼠标按键、鼠标移动），无数据的小时为 0
+    pub fn hour_profile(&self) -> Vec<HourPoint> {
+        let mut out = vec![HourPoint::default(); HOURS_PER_DAY];
         for (h, u) in &self.hours {
             if let Some(slot) = out.get_mut(*h as usize) {
-                *slot = (u.keystrokes, u.mouse.move_px);
+                *slot = HourPoint { keystrokes: u.keystrokes, clicks: u.mouse_clicks(), move_px: u.mouse.move_px };
             }
         }
         out
@@ -715,12 +731,25 @@ mod tests {
         s.bump_key(&d, 8, 1);
         s.bump_key(&d, 8, 2);
         s.bump_key(&d, 20, 3);
+        // 鼠标：8 时左键 3 次 + 滚轮 9 次（滚轮不算「鼠标按键」），20 时移动 500px
+        for _ in 0..3 {
+            s.bump_mouse(&d, 8, &MouseEv::LeftUp);
+        }
+        for _ in 0..9 {
+            s.bump_mouse(&d, 8, &MouseEv::Wheel);
+        }
+        s.bump_mouse(&d, 20, &MouseEv::MovePx(500.0));
         let day = s.day(&d).unwrap();
         let prof = day.hour_profile();
         assert_eq!(prof.len(), 24);
-        assert_eq!(prof[8], (2, 0.0));
-        assert_eq!(prof[20].0, 1);
-        assert_eq!(prof[21].0, 0);
+        assert_eq!((prof[8].keystrokes, prof[8].clicks, prof[8].move_px), (2, 3, 0.0));
+        assert_eq!(prof[20].keystrokes, 1);
+        assert_eq!(prof[20].move_px, 500.0);
+        assert_eq!(prof[20].clicks, 0);
+        assert_eq!(prof[21].keystrokes, 0);
+        // 滚轮不计入 mouse_clicks
+        assert_eq!(day.view(Some(8)).mouse_clicks(), 3);
+        assert_eq!(day.view(Some(8)).mouse.wheel, 9);
         // 视图：整天 / 指定小时 / 无数据小时
         assert_eq!(day.view(None).keystrokes, 3);
         assert_eq!(day.view(Some(8)).keystrokes, 2);

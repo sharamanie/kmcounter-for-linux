@@ -3,10 +3,19 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
 
+/// 一条曲线挂在哪根 y 轴上：左轴是「次数」（键盘敲击与鼠标按键共用，量级相同、可直接比较），
+/// 右轴是「距离」（鼠标移动，单位不同）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Axis {
+    Left,
+    Right,
+}
+
 pub struct Series {
     pub name: String,
     pub color: Color32,
     pub values: Vec<f64>,
+    pub axis: Axis,
 }
 
 pub struct ChartData {
@@ -37,6 +46,19 @@ pub fn fmt_y(v: f64) -> String {
     } else {
         format!("{:.1}", v)
     }
+}
+
+/// 两根轴各自的量程：左轴取所有 Left 曲线的最大值，右轴取 Right 曲线的最大值
+/// （没有曲线挂在该轴上时返回 1.0，避免除零）
+pub fn axis_maxes(series: &[Series]) -> (f64, f64) {
+    let max_of = |a: Axis| {
+        series
+            .iter()
+            .filter(|s| s.axis == a)
+            .map(|s| s.values.iter().cloned().fold(0.0f64, f64::max))
+            .fold(0.0f64, f64::max)
+    };
+    ((max_of(Axis::Left)).max(1.0), (max_of(Axis::Right)).max(1.0))
 }
 
 /// 绘图区（去掉四周留白）——绘制与点击命中共用同一份几何
@@ -70,12 +92,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
     let small = FontId::proportional(10.0);
     let dim = Color32::from_rgb(0x99, 0x99, 0x99);
 
-    // 每条曲线的最大值（用于各自 y 轴缩放）
-    let maxes: Vec<f64> = data
-        .series
-        .iter()
-        .map(|s| s.values.iter().cloned().fold(1.0f64, f64::max))
-        .collect();
+    // 两条轴各自的量程（同一根轴上的曲线可比）
+    let (left_max, right_max) = axis_maxes(&data.series);
+    let axis_max = |a: Axis| if a == Axis::Left { left_max } else { right_max };
 
     // x 位置：每个桶占一等分，点在桶中心（与点击命中用同一个换算）
     let band = plot.width() / n as f32;
@@ -88,21 +107,24 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
         let frac = k as f64 / 4.0;
         let y = plot.bottom() - (frac * plot.height() as f64) as f32;
         painter.line_segment([Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)], grid);
-        let v0 = maxes[0] * frac;
-        let v1 = maxes[1] * frac;
+        let v0 = left_max * frac;
+        let v1 = right_max * frac;
+        // 刻度颜色：取挂在该轴上的第一条曲线（左：键盘；右：鼠标移动）
+        let left_color = data.series.iter().find(|s| s.axis == Axis::Left).map(|s| s.color).unwrap_or(Color32::from_rgb(0x99, 0x99, 0x99));
+        let right_color = data.series.iter().find(|s| s.axis == Axis::Right).map(|s| s.color).unwrap_or(Color32::from_rgb(0x99, 0x99, 0x99));
         painter.text(
             Pos2::new(plot.left() - 6.0, y),
             Align2::RIGHT_CENTER,
             fmt_y(v0),
             small.clone(),
-            data.series[0].color.gamma_multiply(0.75),
+            left_color.gamma_multiply(0.75),
         );
         painter.text(
             Pos2::new(plot.right() + 6.0, y),
             Align2::LEFT_CENTER,
             fmt_y(v1),
             small.clone(),
-            data.series[1].color.gamma_multiply(0.75),
+            right_color.gamma_multiply(0.75),
         );
     }
 
@@ -119,10 +141,11 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
     }
 
     let samples = 16;
-    for (si, s) in data.series.iter().enumerate() {
+    for s in data.series.iter() {
         if s.values.is_empty() {
             continue;
         }
+        let smax = axis_max(s.axis);
         let ys = crate::trend::smooth_series(&s.values, samples);
         // n≥3 时 ys 是插值后的密集序列（每 samples 个点跨一个桶）；n<3 时 ys 就是原始点
         let denom = if s.values.len() >= 3 { samples as f64 } else { 1.0 };
@@ -132,7 +155,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
             .map(|(j, v)| {
                 let t = j as f64 / denom;
                 let x = plot.left() + ((t + 0.5) * band as f64) as f32;
-                Pos2::new(x, y_at(*v, maxes[si]))
+                Pos2::new(x, y_at(*v, smax))
             })
             .collect();
 
@@ -152,7 +175,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
 
         // 原始数据点（小圆点）
         for (i, v) in s.values.iter().enumerate() {
-            let c = Pos2::new(x_at(i), y_at(*v, maxes[si]));
+            let c = Pos2::new(x_at(i), y_at(*v, smax));
             painter.circle_filled(c, 2.5, s.color);
         }
     }
@@ -193,9 +216,9 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartDa
                     [Pos2::new(xg, plot.top()), Pos2::new(xg, plot.bottom())],
                     Stroke::new(1.0_f32, Color32::from_rgb(0xAA, 0xAA, 0xAA)),
                 );
-                for (si, s) in data.series.iter().enumerate() {
+                for s in data.series.iter() {
                     let v = s.values.get(idx).copied().unwrap_or(0.0);
-                    let c = Pos2::new(xg, y_at(v, maxes[si]));
+                    let c = Pos2::new(xg, y_at(v, axis_max(s.axis)));
                     painter.circle_filled(c, 4.0, s.color);
                     painter.circle_stroke(c, 4.0, Stroke::new(1.5_f32, Color32::WHITE));
                 }
@@ -227,11 +250,13 @@ mod tests {
                             name: "键盘".into(),
                             color: Color32::BLUE,
                             values: (0..30).map(|i| ((i * 37) % 100) as f64).collect(),
+                            axis: Axis::Left,
                         },
                         Series {
                             name: "鼠标".into(),
                             color: Color32::RED,
                             values: (0..30).map(|i| ((i * 11) % 50) as f64).collect(),
+                            axis: Axis::Right,
                         },
                     ],
                 };
@@ -241,6 +266,25 @@ mod tests {
                 }
             });
         });
+    }
+
+    /// 双轴量程：左轴取所有「次数」曲线的最大值（键盘与鼠标按键共用一根轴才能互相比较）
+    #[test]
+    fn axis_maxes_share_left_axis() {
+        let mk = |v: Vec<f64>, axis| Series { name: "x".into(), color: Color32::BLUE, values: v, axis };
+        let series = vec![
+            mk(vec![100.0, 50.0], Axis::Left),
+            mk(vec![10.0, 20.0], Axis::Left),
+            mk(vec![3.0, 9.0], Axis::Right),
+        ];
+        let (l, r) = axis_maxes(&series);
+        assert_eq!(l, 100.0, "左轴应是两条次数曲线的最大值");
+        assert_eq!(r, 9.0, "右轴只看距离曲线");
+        // 空数据时给 1.0，避免除零
+        assert_eq!(axis_maxes(&[]), (1.0, 1.0));
+        // 只有右轴曲线时，左轴仍是 1.0
+        let only_right = vec![mk(vec![5.0], Axis::Right)];
+        assert_eq!(axis_maxes(&only_right), (1.0, 5.0));
     }
 
     #[test]
@@ -264,8 +308,8 @@ mod tests {
                     let data = ChartData {
                         labels: (0..n).map(|i| format!("d{i}")).collect(),
                         series: vec![
-                            Series { name: "a".into(), color: Color32::BLUE, values: vec![3.0; n] },
-                            Series { name: "b".into(), color: Color32::RED, values: vec![7.0; n] },
+                            Series { name: "a".into(), color: Color32::BLUE, values: vec![3.0; n], axis: Axis::Left },
+                            Series { name: "b".into(), color: Color32::RED, values: vec![7.0; n], axis: Axis::Right },
                         ],
                     };
                     let _ = draw(ui, rect, &resp, &data);

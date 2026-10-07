@@ -6,7 +6,7 @@ use crate::chart;
 use crate::config::Config;
 use crate::keys::{KEYS, MAIN_UNITS, NAV_UNITS, NUM_UNITS, MAIN_ROWS};
 use crate::lang::{strings, Lang, Strings};
-use crate::stats::{BucketStats, DayEntry, Shared, Store};
+use crate::stats::{BucketStats, DayEntry, HourPoint, MouseStats, Shared, Store};
 use crate::tray::Tray;
 use crate::trend::{self, Granularity};
 use chrono::{Datelike, NaiveDate, Timelike};
@@ -22,8 +22,11 @@ const TEXT: Color32 = Color32::from_rgb(0x57, 0x57, 0x57);
 const HEAT_FROM: (u8, u8, u8) = (0xEE, 0xEE, 0xEE);
 const HEAT_TO: (u8, u8, u8) = (0xB2, 0x6C, 0x65);
 /// 趋势曲线配色：键盘（蓝灰）、鼠标移动距离（莫兰迪红）
-const KEY_COLOR: Color32 = Color32::from_rgb(0x6B, 0x8B, 0xA4);
-const MOUSE_COLOR: Color32 = Color32::from_rgb(0xB2, 0x6C, 0x65);
+/// 三条曲线的配色：键盘敲击=红系，鼠标按键=绿系，鼠标移动=蓝系
+/// （键盘热力图与「键盘敲击」曲线同属红系，鼠标五键与「鼠标按键」曲线同属绿系）
+pub(crate) const KEY_COLOR: Color32 = Color32::from_rgb(0xB2, 0x6C, 0x65); // 键盘：红系
+pub(crate) const CLICK_COLOR: Color32 = Color32::from_rgb(0x6F, 0x8F, 0x62); // 鼠标按键：绿系
+pub(crate) const MOUSE_COLOR: Color32 = Color32::from_rgb(0x6B, 0x8B, 0xA4); // 鼠标移动：蓝系
 /// 环比涨跌配色（莫兰迪绿/红）
 const DELTA_UP: Color32 = Color32::from_rgb(0x7F, 0xA3, 0x7A);
 const DELTA_DOWN: Color32 = Color32::from_rgb(0xC0, 0x77, 0x6E);
@@ -35,6 +38,182 @@ const SEL_COLOR: Color32 = Color32::from_rgb(0x3F, 0x6B, 0xA8);
 enum Page {
     Heatmap,
     Trends,
+    /// 排行：某区间内各按键的排行榜
+    Ranking,
+}
+
+/// 排行页的统计区间（锚定日期 = 导航行选中的那天；全部 = 从最早的数据日到锚定日期）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RankRange {
+    Day,
+    Week,
+    Month,
+    Year,
+    All,
+}
+
+/// 排行页的键位范围筛选（可多选：例如同时看主键区 + 控制键区）
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum RankScope {
+    Main,
+    Function,
+    Control,
+    Numpad,
+    /// 鼠标五键（左/中/右/滚轮/侧键）
+    Mouse,
+    /// 布局之外的按键（多媒体键等）
+    Other,
+}
+
+/// 全部键位范围（默认状态）
+pub(crate) const ALL_SCOPES: [RankScope; 6] = [
+    RankScope::Main,
+    RankScope::Function,
+    RankScope::Control,
+    RankScope::Numpad,
+    RankScope::Mouse,
+    RankScope::Other,
+];
+
+/// 布局键的分区 → 排行页的键位范围
+fn scope_of_zone(z: crate::keys::Zone) -> RankScope {
+    use crate::keys::Zone;
+    match z {
+        Zone::Main => RankScope::Main,
+        Zone::Function => RankScope::Function,
+        Zone::Control => RankScope::Control,
+        Zone::Numpad => RankScope::Numpad,
+    }
+}
+
+/// 排行页的排序/展示指标
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RankMetric {
+    Count,
+    Share,
+    PerDay,
+}
+
+/// 排行里的一行
+#[derive(Clone, Debug, PartialEq)]
+struct RankRow {
+    /// 显示名（布局键用 label，布局外按键用 other_key_label）
+    pub label: String,
+    /// 区间内计数
+    pub count: u64,
+    /// 占该区间全部计数的比例（0..1）
+    pub share: f64,
+    /// 日均次数（区间天数 > 0）
+    pub per_day: f64,
+    /// 布局键的下标（鼠标行 / 布局外为 None）——点击行时用来跳到热力图并选中
+    pub key_idx: Option<usize>,
+    /// 是否鼠标行（配色用绿色系，与键盘的红系区分）
+    pub mouse: bool,
+}
+
+/// 排行：把 [from, to] 区间内（可只看某个钟点）各按键的计数汇总出来。
+/// `only_selected` 为 Some 时只统计其中的布局键（「只看已选按键」）。
+/// 作废的小时按 0 计（与界面其他地方一致）。
+fn rank_rows(
+    store: &Store,
+    from: NaiveDate,
+    to: NaiveDate,
+    hour: Option<u8>,
+    scopes: &std::collections::BTreeSet<RankScope>,
+    only_selected: Option<&std::collections::BTreeSet<usize>>,
+    s: &Strings,
+) -> Vec<RankRow> {
+    use crate::keys::zone_of;
+    let mut counts: Vec<u64> = vec![0; crate::keys::N_KEYS];
+    let mut mouse = [0u64; 5]; // 左/中/右/滚轮/侧键
+    let mut other: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut days = 0u32;
+
+    let mut d = from;
+    while d <= to {
+        if let Some(day) = store.days.get(&d.format("%Y%m%d").to_string()) {
+            days += 1;
+            // 取整天的桶，或只看某个钟点（作废的小时算 0）
+            let unit: Option<&BucketStats> = match hour {
+                None => Some(&day.bucket),
+                Some(h) => day.hours.get(&h).filter(|u| !u.invalid),
+            };
+            if let Some(u) = unit {
+                for (i, c) in u.keys.iter().enumerate() {
+                    if let Some(slot) = counts.get_mut(i) {
+                        *slot += *c;
+                    }
+                }
+                mouse[0] += u.mouse.lb;
+                mouse[1] += u.mouse.mb;
+                mouse[2] += u.mouse.rb;
+                mouse[3] += u.mouse.wheel;
+                mouse[4] += u.mouse.xb;
+                for (id, n) in &u.other {
+                    *other.entry(id.clone()).or_insert(0) += *n;
+                }
+            }
+        }
+        d += chrono::Duration::days(1);
+    }
+
+    // 布局键：所属分区在选中的范围里（可同时勾多个分区）
+    let zone_ok = |i: usize| scopes.contains(&scope_of_zone(zone_of(i)));
+
+    let mut rows: Vec<RankRow> = Vec::new();
+    {
+        for (i, k) in KEYS.iter().enumerate() {
+            if !zone_ok(i) {
+                continue;
+            }
+            if let Some(sel) = only_selected {
+                if !sel.contains(&i) {
+                    continue;
+                }
+            }
+            let c = counts.get(i).copied().unwrap_or(0);
+            rows.push(RankRow { label: rank_key_label(k).to_string(), count: c, share: 0.0, per_day: 0.0, key_idx: Some(i), mouse: false });
+        }
+    }
+    if scopes.contains(&RankScope::Mouse) && only_selected.is_none() {
+        // 与键盘上那 5 个鼠标键一致：左 / 中 / 右 / 滚轮 / 侧键
+        let names = [s.mkey_l, s.mkey_m, s.mkey_r, s.mkey_wheel, s.mkey_side];
+        for (i, label) in names.iter().enumerate() {
+            rows.push(RankRow { label: label.to_string(), count: mouse[i], share: 0.0, per_day: 0.0, key_idx: None, mouse: true });
+        }
+    }
+    if scopes.contains(&RankScope::Other) && only_selected.is_none() {
+        for (id, n) in other {
+            rows.push(RankRow { label: crate::stats::other_key_label(&id), count: n, share: 0.0, per_day: 0.0, key_idx: None, mouse: false });
+        }
+    }
+
+    // 占比与日均（合计含所有被选中的行）
+    let total: u64 = rows.iter().map(|r| r.count).sum();
+    for r in rows.iter_mut() {
+        r.share = if total > 0 { r.count as f64 / total as f64 } else { 0.0 };
+        r.per_day = if days > 0 { r.count as f64 / days as f64 } else { 0.0 };
+    }
+    rows
+}
+
+/// 排行列表里的按键名：标签唯一时用标签，重名时退回内部名（D1 / Num1 都显示 "1"，LShift / RShift 都显示 "Shift"）
+fn rank_key_label(k: &crate::keys::KeyDef) -> &'static str {
+    let label = if k.label.is_empty() { k.name } else { k.label };
+    if KEYS.iter().filter(|o| o.label == k.label && !k.label.is_empty()).count() > 1 {
+        k.name
+    } else {
+        label
+    }
+}
+
+/// 按指标取值（排序与显示共用）
+fn rank_value(r: &RankRow, m: RankMetric) -> f64 {
+    match m {
+        RankMetric::Count => r.count as f64,
+        RankMetric::Share => r.share,
+        RankMetric::PerDay => r.per_day,
+    }
 }
 
 
@@ -51,6 +230,47 @@ fn heat_color(count: f64, maxcount: f64) -> Color32 {
     };
     let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
     Color32::from_rgb(l(HEAT_FROM.0, HEAT_TO.0), l(HEAT_FROM.1, HEAT_TO.1), l(HEAT_FROM.2, HEAT_TO.2))
+}
+
+/// 鼠标「五键」热力的渐变端点（绿色系，与键盘的 #EEEEEE→#B26C65 同亮度基准）
+const MHEAT_FROM: (u8, u8, u8) = (0xEE, 0xEE, 0xEE);
+const MHEAT_TO: (u8, u8, u8) = (0x6F, 0x8F, 0x62);
+
+/// 鼠标五键的独立热力色：量程是「这五个值里的最大值」，与键盘的计数池互不影响
+fn mouse_heat_color(count: f64, maxcount: f64) -> Color32 {
+    let t = if maxcount <= 0.0 {
+        0.0
+    } else if count >= maxcount {
+        1.0
+    } else if count < maxcount / 100.0 {
+        0.0
+    } else {
+        (count / maxcount) as f32
+    };
+    let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    Color32::from_rgb(l(MHEAT_FROM.0, MHEAT_TO.0), l(MHEAT_FROM.1, MHEAT_TO.1), l(MHEAT_FROM.2, MHEAT_TO.2))
+}
+
+/// 方向键上方的 5 个格子：鼠标左/中/右键（上一行）与滚轮/侧键（下一行，中间留出 ↑ 键）。
+/// 它们**不参与键盘热力**：颜色取自「鼠标五键」这个独立计数池（绿色系）。
+struct MouseKeyDef {
+    x: f32,
+    y: f32,
+    label: fn(&Strings) -> &'static str,
+    value: fn(&MouseStats) -> f64,
+}
+
+const MOUSE_KEYS: [MouseKeyDef; 5] = [
+    MouseKeyDef { x: 0.0, y: 3.0, label: |s| s.mkey_l, value: |m| m.lb as f64 },
+    MouseKeyDef { x: 1.0, y: 3.0, label: |s| s.mkey_m, value: |m| m.mb as f64 },
+    MouseKeyDef { x: 2.0, y: 3.0, label: |s| s.mkey_r, value: |m| m.rb as f64 },
+    MouseKeyDef { x: 0.0, y: 4.0, label: |s| s.mkey_wheel, value: |m| m.wheel as f64 },
+    MouseKeyDef { x: 2.0, y: 4.0, label: |s| s.mkey_side, value: |m| m.xb as f64 },
+];
+
+/// 鼠标五键的计数池量程（五个值里的最大值）
+fn mouse_key_pool(m: &MouseStats) -> f64 {
+    MOUSE_KEYS.iter().map(|k| (k.value)(m)).fold(0.0_f64, f64::max)
 }
 
 pub struct App {
@@ -106,6 +326,13 @@ pub struct App {
     title_dirty: bool,
     page: Page,
     granularity: Granularity,
+    /// 排行页：区间 / 键位范围 / 指标 / 排序方向 / 只看已选
+    rank_range: RankRange,
+    rank_scopes: std::collections::BTreeSet<RankScope>,
+    rank_metric: RankMetric,
+    /// true = 多到少（默认），false = 少到多
+    rank_desc: bool,
+    rank_only_selected: bool,
     /// 分时视图：None = 整天/总计，Some(h) = 只看 0-23 时
     hour_sel: Option<u8>,
     /// 上次刷新快照的时间（带小时明细后 store 更大，按需节流克隆）
@@ -114,6 +341,14 @@ pub struct App {
     strip_rect: Rect,
     /// 趋势图区域（点击跳转日期时用来换算桶位置，测试也会读）
     chart_rect: Rect,
+    /// 键盘区域（测试按坐标定位鼠标五键）
+    kbd_rect: Rect,
+    /// 排行列表区域（指针在里面时滚轮用来滚动列表，不翻日期）
+    rank_rect: Rect,
+    /// 上一帧的视图下标：用来捕捉「刚切到总计」这个动作（此时排行页区间跟着变成全部）
+    last_view_idx: usize,
+    /// 排行页右上角分时折线图的矩形（测试用）
+    rank_chart_rect: Rect,
     /// 视图日期列表缓存：[None=总计, 今日, 有数据的天…]（快照刷新时重建）
     view_days: Vec<Option<String>>,
     /// 日历弹窗是否展开
@@ -140,6 +375,12 @@ const HOUR_TITLE_W: f32 = 76.0;
 const PANEL_BOTTOM_PAD: f32 = 12.0;
 /// 小时视图下“按键较少”的判定阈值（一小时天然比一天少）
 const HOUR_ENOUGH_KEYS: u64 = 20;
+/// 排行页每一行的高度
+pub(crate) const RANK_ROW_H: f32 = 22.0;
+/// 排行表三列（右对齐）距右边的偏移：占比 / 日均 / 次数
+const RANK_COL_SHARE: f32 = 210.0;
+const RANK_COL_DAY: f32 = 110.0;
+const RANK_COL_COUNT: f32 = 8.0;
 /// 统计表里细分项（键盘分区）的缩进
 const SUB_ROW_INDENT: f32 = 10.0;
 /// 一天的小时数（与 stats::HOURS_PER_DAY 一致，供分布条使用）
@@ -228,7 +469,13 @@ impl App {
         // 调试用：启动时预展开底部面板 / 指定页（KMCOUNTER_START_PANELS=stats|settings|both|trend）
         let start_panels = std::env::var("KMCOUNTER_START_PANELS").unwrap_or_default().to_lowercase();
         let more_open = start_panels.contains("stats") || start_panels.contains("settings") || start_panels.contains("both");
-        let start_page = if start_panels.contains("trend") { Page::Trends } else { Page::Heatmap };
+        let start_page = if start_panels.contains("trend") {
+            Page::Trends
+        } else if start_panels.contains("rank") {
+            Page::Ranking
+        } else {
+            Page::Heatmap
+        };
         let start_minimized = start_panels.contains("min");
         let snap = (*shared.store.lock()).clone();
         let snap_today = shared.today.lock().clone();
@@ -262,6 +509,11 @@ impl App {
             title_dirty: true,
             page: start_page,
             // 调试：KMCOUNTER_GRAN=hour|day|week|month|year 指定趋势页起始粒度（截图用）
+            rank_range: RankRange::Week,
+            rank_scopes: ALL_SCOPES.iter().copied().collect(),
+            rank_metric: RankMetric::Count,
+            rank_desc: true,
+            rank_only_selected: false,
             granularity: match std::env::var("KMCOUNTER_GRAN").unwrap_or_default().to_lowercase().as_str() {
                 "hour" | "hourly" => Granularity::Hourly,
                 "week" | "weekly" => Granularity::Weekly,
@@ -273,7 +525,11 @@ impl App {
             hour_sel: std::env::var("KMCOUNTER_HOUR").ok().and_then(|v| v.trim().parse::<u8>().ok()).filter(|h| *h < 24),
             last_snapshot: Instant::now(),
             strip_rect: Rect::NOTHING,
+            last_view_idx: 1,
+            rank_chart_rect: Rect::NOTHING,
             chart_rect: Rect::NOTHING,
+            kbd_rect: Rect::NOTHING,
+            rank_rect: Rect::NOTHING,
             view_days,
             cal_open: std::env::var("KMCOUNTER_CAL").map(|v| v == "1").unwrap_or(false),
             cal_month: (chrono::Local::now().year(), chrono::Local::now().month()),
@@ -374,19 +630,136 @@ impl App {
         self.title_dirty = true;
     }
 
+    /// 当前页面的显示区间（当周/当月/当年、排行页的当周/当月/当年/全部这类「一段」）。
+    /// 返回 None 表示这里就是一个单日（照旧只显示那一天）。
+    /// 当前这一段还没走完时，止日期截到今天 —— 未来没有数据，显示出来只会让人误以为在统计未来。
+    fn nav_range(&self) -> Option<(NaiveDate, NaiveDate)> {
+        if self.view_idx == 0 {
+            return None; // 总计：标题就是「总计」
+        }
+        let anchor = self.anchor_date();
+        let today = NaiveDate::parse_from_str(&self.snap_today, "%Y%m%d").unwrap_or(anchor);
+        let (f, t) = match self.page {
+            Page::Trends => {
+                let g = match self.granularity {
+                    Granularity::Weekly => Granularity::Weekly,
+                    Granularity::Monthly => Granularity::Monthly,
+                    Granularity::Yearly => Granularity::Yearly,
+                    _ => return None, // 每小时 / 每日：就是那一天
+                };
+                bucket_range(g.bucket_start(anchor), g)
+            }
+            Page::Ranking => match self.rank_range {
+                RankRange::Day => return None,
+                _ => self.rank_window(),
+            },
+            Page::Heatmap => return None,
+        };
+        let t = t.min(today);
+        if f >= t {
+            None // 区间退化成一天（例如当月第一天）：照旧显示单日
+        } else {
+            Some((f, t))
+        }
+    }
+
+    /// 小时选择（全天 / 整点）此刻是否可用：
+    /// - 趋势页：只有「每小时」粒度才按小时看，每日/每周/每月/每年都置灰；
+    /// - 排行页：只有「当日」区间用得上钟点筛选，当周/当月/当年/全部都是跨天范围，置灰；
+    /// - 热力图页：始终可用（分时就是它的主要视图之一）。
+    fn hour_controls_enabled(&self) -> bool {
+        match self.page {
+            // 趋势页：只有「每小时」粒度才按小时看
+            Page::Trends => self.granularity == Granularity::Hourly,
+            // 排行页：保留「看某个钟点」的功能（钟点栏只有导航行那一个）
+            Page::Ranking | Page::Heatmap => true,
+        }
+    }
+
+    /// 导航行里显示的「当前显示数据」：区间形态显示起止日期，否则还是单日/总计
+    fn nav_display_label(&self) -> String {
+        match self.nav_range() {
+            Some((f, t)) => format!("{}~{}", f.format("%Y%m%d"), t.format("%Y%m%d")),
+            None => self.view_label(),
+        }
+    }
+
+    /// 排行页的统计区间：锚定日期（导航行选中的那天）+ 区间长度
+    fn rank_window(&self) -> (NaiveDate, NaiveDate) {
+        let anchor = self.anchor_date();
+        let g = match self.rank_range {
+            RankRange::Day => Granularity::Daily,
+            RankRange::Week => Granularity::Weekly,
+            RankRange::Month => Granularity::Monthly,
+            RankRange::Year => Granularity::Yearly,
+            // 全部：从最早的数据日到锚定日期
+            RankRange::All => {
+                let first = self
+                    .snap
+                    .days
+                    .keys()
+                    .next()
+                    .and_then(|k| NaiveDate::parse_from_str(k, "%Y%m%d").ok())
+                    .unwrap_or(anchor);
+                return (first.min(anchor), anchor);
+            }
+        };
+        // 先对齐到桶的起点再取整桶：当周 = 所在那一周（周一到周日）、当月 = 那个自然月、当年 = 那个自然年。
+        // 之前直接用锚点当起点，窗口落到了「锚点 → 未来」，过去的数据全被排除，看上去像是没生效。
+        bucket_range(g.bucket_start(anchor), g)
+    }
+
     /// 翻页（◀ ▶ / 上下键 / 滚轮共用）：
     /// 趋势页在周/月/年粒度下按对应单位滚动（滚一格 = 一周/一月/一年），其余情况仍按天翻。
     fn nav_step(&mut self, newer: bool) {
-        let target = match (self.page, self.granularity) {
-            (Page::Trends, Granularity::Weekly) => Some(shift_days(self.anchor_date(), if newer { 7 } else { -7 })),
-            (Page::Trends, Granularity::Monthly) => Some(shift_months(self.anchor_date(), 1, newer)),
-            (Page::Trends, Granularity::Yearly) => Some(shift_months(self.anchor_date(), 12, newer)),
+        // 小时粒度：一次滚一格就是一小时（跨天自动进位），与周/月/年那套一致
+        if self.page == Page::Trends && self.granularity == Granularity::Hourly {
+            self.nav_hour_step(newer);
+            return;
+        }
+        let target = match self.page {
+            // 趋势页：跟着粒度走
+            Page::Trends => match self.granularity {
+                Granularity::Weekly => Some(shift_days(self.anchor_date(), if newer { 7 } else { -7 })),
+                Granularity::Monthly => Some(shift_months(self.anchor_date(), 1, newer)),
+                Granularity::Yearly => Some(shift_months(self.anchor_date(), 12, newer)),
+                _ => None,
+            },
+            // 排行页：跟着区间走（当日/全部时按天翻）
+            Page::Ranking => match self.rank_range {
+                RankRange::Week => Some(shift_days(self.anchor_date(), if newer { 7 } else { -7 })),
+                RankRange::Month => Some(shift_months(self.anchor_date(), 1, newer)),
+                RankRange::Year => Some(shift_months(self.anchor_date(), 12, newer)),
+                _ => None,
+            },
             _ => None,
         };
         match target {
             Some(t) => self.jump_anchor(t, newer),
             None => self.nav_history(newer),
         }
+    }
+
+    /// 小时粒度下前进/后退一小时（跨天自动进位；跨天时按有数据的日期就近落点）
+    fn nav_hour_step(&mut self, newer: bool) {
+        let date = self.anchor_date();
+        let h = self.anchor_hour() as i32;
+        let (nd, nh) = if newer {
+            if h >= 23 {
+                (shift_days(date, 1), 0)
+            } else {
+                (date, h + 1)
+            }
+        } else if h <= 0 {
+            (shift_days(date, -1), 23)
+        } else {
+            (date, h - 1)
+        };
+        if nd != date {
+            self.jump_anchor(nd, newer);
+        }
+        self.hour_sel = Some(nh as u8);
+        self.title_dirty = true;
     }
 
     /// 把显示日期挪到 `target` 附近有数据的那天（该天没有数据就取最接近的一天）
@@ -517,6 +890,16 @@ impl App {
             crate::keys::Block::Control => nav_x,
             crate::keys::Block::Numpad => nav_x + NAV_UNITS * u + gap,
         }
+    }
+
+    /// 鼠标五键（方向键上方那 5 个格子）的矩形
+    fn mouse_key_rect(&self, rect: Rect, u: f32, pitch: f32, gap: f32, mk: &MouseKeyDef) -> Rect {
+        let spacing = self.cfg.layout.key_spacing as f32;
+        let nav_x = MAIN_UNITS * u + gap;
+        Rect::from_min_size(
+            Pos2::new(rect.left() + nav_x + mk.x * u, rect.top() + mk.y * pitch),
+            Vec2::new(u - spacing, pitch - spacing),
+        )
     }
 
     fn key_rect(&self, i: usize, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
@@ -726,6 +1109,12 @@ impl App {
             }
         }
 
+        // 切到「总计」时，排行页的区间自动变成「全部」（用户之后仍可自己改成当周/当月…）
+        if self.last_view_idx != 0 && self.view_idx == 0 {
+            self.rank_range = RankRange::All;
+        }
+        self.last_view_idx = self.view_idx;
+
         // ---- 历史翻页：翻页键/上下键/滚轮（仅统计窗口激活时）----
         let focused = ctx.input(|i| i.focused);
         let (up, down, wheel_y) = ctx.input(|i| {
@@ -736,10 +1125,17 @@ impl App {
             )
         });
         // 指针悬停在底部区域（按钮行/展开面板）时不翻日期，避免与设置控件冲突
+        // 排行列表里滚轮用来滚动列表（egui 的 ScrollArea 自己处理），不翻日期。
+        // 注意必须加上「当前就在排行页」这个条件：rank_rect 是上一帧榜单的位置，
+        // 离开排行页后它还在原处（正好压着趋势图那块），会让趋势页的滚轮翻页整个失效。
+        let pointer_in_rank_list = self.page == Page::Ranking
+            && ctx
+                .input(|i| i.pointer.hover_pos())
+                .map_or(false, |p| self.rank_rect.contains(p));
         let pointer_in_bottom = ctx
             .input(|i| i.pointer.hover_pos())
             .map_or(false, |p| p.y >= self.bottom_region_top);
-        if focused && !pointer_in_bottom && !self.cal_open {
+        if focused && !pointer_in_bottom && !pointer_in_rank_list && !self.cal_open {
             if up {
                 self.nav_step(true);
             }
@@ -768,6 +1164,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.page, Page::Heatmap, s.tab_heatmap);
                     ui.selectable_value(&mut self.page, Page::Trends, s.tab_trend);
+                    ui.selectable_value(&mut self.page, Page::Ranking, s.tab_rank);
                 });
 
                 // 日期/分时导航（热力图页与趋势页共用）
@@ -871,6 +1268,9 @@ impl App {
                     Page::Trends => {
                         self.show_trend_page(ui, s, content_top);
                     }
+                    Page::Ranking => {
+                        self.show_rank_page(ui, s, content_top);
+                    }
                 }
 
                 // 把底部按钮行推到「收起高度」的底部：布局与当前窗口实际高度无关，
@@ -896,9 +1296,7 @@ impl App {
                             self.edit = self.cfg.clone();
                         }
                     }
-                    if ui.button(s.menu_exit).clicked() {
-                        self.exiting = true;
-                    }
+                    // 「退出」已移进设置面板（放这儿容易误触）
                 });
 
                 // ---- 按钮下方的展开面板（窗口向下生长，按钮位置不变）----
@@ -980,12 +1378,15 @@ impl App {
     /// 日期 + 分时导航行（热力图页与趋势页共用，选择状态也是共用的）
     fn nav_row(&mut self, ui: &mut egui::Ui, s: &'static Strings) {
         ui.horizontal(|ui| {
+            // 「当前显示数据」和后面的「钟点」一样：小字标签放在箭头前面
+            ui.label(egui::RichText::new(s.view_date_prefix).small().color(Color32::from_rgb(0x99, 0x99, 0x99)));
             if ui.button("◀").clicked() {
                 self.nav_step(true);
             }
             ui.add_space(4.0);
-            // 固定宽度的日期标题：右箭头位置不随文字长度变化；点击打开日历
-            let title = format!("{} - {}", s.view_date_prefix, self.view_label());
+            // 固定宽度的日期标题：右箭头位置不随文字长度变化；点击打开日历。
+            // 单日与区间共用同一个宽度（区间文字实测约 215px，235 够放），容器长度始终一致。
+            let title = self.nav_display_label();
             let title_resp = ui
                 .add_sized(
                     [NAV_TITLE_W, 20.0],
@@ -1006,20 +1407,26 @@ impl App {
             if ui.button("▶").clicked() {
                 self.nav_step(false);
             }
-            // 分时选择：全天 / 0-23 时（循环）
+            // 分时选择：全天 / 0-23 时（循环）。
+            // 趋势页在每日/每周/每月/每年粒度下用不到它（只有每小时粒度才按小时看），置灰不让改。
+            let hour_enabled = self.hour_controls_enabled();
             ui.separator();
-            if ui.button("◀").clicked() {
-                self.nav_hour(true);
-            }
-            ui.add_space(2.0);
-            let htitle = self.hour_title(s);
-            ui.add_sized(
-                [HOUR_TITLE_W, 20.0],
-                egui::Label::new(egui::RichText::new(htitle).strong()).truncate(),
-            );
-            if ui.button("▶").clicked() {
-                self.nav_hour(false);
-            }
+            // 页面上只有一个钟点栏（就是这里）：加个小标签说明它的用途（三个页面都显示）
+            ui.label(egui::RichText::new(s.hour_sel_label).small().color(Color32::from_rgb(0x99, 0x99, 0x99)));
+            ui.add_enabled_ui(hour_enabled, |ui| {
+                if ui.button("◀").clicked() {
+                    self.nav_hour(true);
+                }
+                ui.add_space(2.0);
+                let htitle = self.hour_title(s);
+                ui.add_sized(
+                    [HOUR_TITLE_W, 20.0],
+                    egui::Label::new(egui::RichText::new(htitle).strong()).truncate(),
+                );
+                if ui.button("▶").clicked() {
+                    self.nav_hour(false);
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.page == Page::Heatmap && !self.selected.is_empty() && ui.button(s.sel_clear).clicked() {
                     self.selected.clear();
@@ -1265,6 +1672,107 @@ impl App {
         self.strip_rect
     }
 
+    /// 排行页：切页与筛选（测试用，不走环境变量）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_set_rank(&mut self, range: RankRange, scopes: &[RankScope], metric: RankMetric, desc: bool) {
+        self.rank_range = range;
+        self.rank_scopes = scopes.iter().copied().collect();
+        self.rank_metric = metric;
+        self.rank_desc = desc;
+    }
+
+    /// 全部键位范围（测试里 debug_set_rank 传这个）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_all_scopes(&self) -> Vec<RankScope> {
+        ALL_SCOPES.to_vec()
+    }
+
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_open_rank_page(&mut self) {
+        self.page = Page::Ranking;
+    }
+
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_page_is_rank(&self) -> bool {
+        self.page == Page::Ranking
+    }
+
+    /// 导航行日期标题的固定宽度（测试核对区间文字放得下）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_nav_title_w(&self) -> f32 {
+        NAV_TITLE_W
+    }
+
+    /// 导航行现在显示的文案（区间 / 单日 / 总计）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_nav_label(&self) -> String {
+        self.nav_display_label()
+    }
+
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_hour_controls_enabled(&self) -> bool {
+        self.hour_controls_enabled()
+    }
+
+    /// 排行页当前算出来的统计区间
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_rank_window(&self) -> (NaiveDate, NaiveDate) {
+        self.rank_window()
+    }
+
+    /// 排行页右上角分时折线图的矩形
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_rank_chart_rect(&self) -> Rect {
+        self.rank_chart_rect
+    }
+
+    /// 排行列表的可见矩形（测试按行高算某一行位置）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_rank_rect(&self) -> Rect {
+        self.rank_rect
+    }
+
+    /// 当前筛选下算出来的排行（测试直接核对数值与顺序）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_rank_rows(&self) -> Vec<(String, u64, Option<usize>, bool)> {
+        let (from, to) = self.rank_window();
+        let only = self.rank_only_selected.then_some(&self.selected);
+        let mut rows = rank_rows(&self.snap, from, to, self.hour_sel, &self.rank_scopes, only, self.s());
+        let m = self.rank_metric;
+        rows.sort_by(|a, b| {
+            let (va, vb) = (rank_value(a, m), rank_value(b, m));
+            let ord = vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal);
+            let ord = if self.rank_desc { ord } else { ord.reverse() };
+            ord.then_with(|| a.label.cmp(&b.label))
+        });
+        rows.into_iter().map(|r| (r.label, r.count, r.key_idx, r.mouse)).collect()
+    }
+
+    /// 键盘区域矩形与布局步长（测试定位鼠标五键）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_kbd_rect(&self) -> Rect {
+        self.kbd_rect
+    }
+
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_metrics(&self) -> (f32, f32, f32) {
+        let (u, pitch, gap, _) = self.current_metrics();
+        (u, pitch, gap)
+    }
+
     /// 趋势图矩形（测试按桶中心点击）
     #[cfg(feature = "softshot")]
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1352,6 +1860,281 @@ impl App {
     }
 
     /// 趋势页：时/日/周/月/年粒度切换 + 双轴平滑曲线（键盘次数 / 鼠标移动距离）
+    /// 排行页：区间 / 键位范围 / 钟点 / 指标 / 排序 筛选，下面是名次列表
+    fn show_rank_page(&mut self, ui: &mut egui::Ui, s: &'static Strings, content_top: f32) {
+        let dim = Color32::from_rgb(0x99, 0x99, 0x99);
+        let (from, to) = self.rank_window();
+
+        // ---- 筛选行 1：区间 + 键位范围 ----
+        let row1 = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.rank_range).small().color(dim));
+            ui.selectable_value(&mut self.rank_range, RankRange::Day, s.rank_r_day);
+            ui.selectable_value(&mut self.rank_range, RankRange::Week, s.rank_r_week);
+            ui.selectable_value(&mut self.rank_range, RankRange::Month, s.rank_r_month);
+            ui.selectable_value(&mut self.rank_range, RankRange::Year, s.rank_r_year);
+            ui.selectable_value(&mut self.rank_range, RankRange::All, s.rank_r_all);
+            ui.separator();
+            ui.label(egui::RichText::new(s.rank_scope).small().color(dim));
+            // 多选：全部 = 全勾上；其它按钮各自开关（可同时看主键盘区 + 控制键区…）
+            let all_on = ALL_SCOPES.iter().all(|z| self.rank_scopes.contains(z));
+            if ui.selectable_label(all_on, s.rank_scope_all).clicked() {
+                if all_on {
+                    self.rank_scopes.clear();
+                } else {
+                    self.rank_scopes = ALL_SCOPES.iter().copied().collect();
+                }
+            }
+            for (scope, label) in [
+                (RankScope::Main, s.zone_main),
+                (RankScope::Function, s.zone_function),
+                (RankScope::Control, s.zone_control),
+                (RankScope::Numpad, s.zone_numpad),
+                (RankScope::Mouse, s.rank_scope_mouse),
+                (RankScope::Other, s.rank_scope_other),
+            ] {
+                let on = self.rank_scopes.contains(&scope);
+                if ui.selectable_label(on, label).clicked() {
+                    if on {
+                        self.rank_scopes.remove(&scope);
+                    } else {
+                        self.rank_scopes.insert(scope);
+                    }
+                }
+            }
+        });
+        geo_log("rank filters 1", row1.response.rect);
+        ui.add_space(2.0);
+
+        // ---- 右上角：与热力图同款的 24 小时分时折线（悬停看三项数值，点某一小时即按该小时筛选）----
+        {
+            let right_edge = ui.max_rect().right();
+            let chart = Rect::from_min_max(
+                Pos2::new((right_edge - 400.0).max(row1.response.rect.right() + 16.0), row1.response.rect.top()),
+                Pos2::new(right_edge, row1.response.rect.top() + 46.0),
+            );
+            let entry = self.day_for_view();
+            let prof = entry.hour_profile();
+            let invalid: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
+            let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
+                .then(|| chrono::Local::now().hour().min(23) as u8);
+            let painter = ui.painter().clone();
+            paint_hour_lines(&painter, chart, &prof, self.hour_sel, now_hour, &invalid);
+            let resp = ui.interact(chart, ui.id().with("rank_hour_chart"), Sense::click());
+            if let Some(pos) = resp.hover_pos() {
+                if let Some(idx) = hour_bar_index(chart, pos.x) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let p = prof.get(idx).copied().unwrap_or_default();
+                    let unit = s.unit_times.trim();
+                    let mark = if invalid.get(idx).copied().unwrap_or(false) { s.invalid_mark } else { "" };
+                    let text = format!(
+                        "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
+                        idx,
+                        s.hour_suffix,
+                        s.keystrokes,
+                        p.keystrokes,
+                        unit,
+                        s.mouse_clicks,
+                        p.clicks,
+                        unit,
+                        s.mouse_move,
+                        self.shared.px_to_meters(p.move_px),
+                        s.unit_m,
+                        mark,
+                        s.strip_hint
+                    );
+                    paint_tooltip(&painter, ui, pos, &text);
+                }
+            }
+            if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    if let Some(idx) = hour_bar_index(chart, pos.x) {
+                        let h = idx as u8;
+                        self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
+                    }
+                }
+            }
+            self.rank_chart_rect = chart;
+        }
+
+        // ---- 筛选行 2：钟点 + 排序 + 指标 + 只看已选 ----
+        // 钟点筛选就用导航行那一个（这里不再重复放一份，免得一个页面两个钟点栏）
+        let row2 = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.rank_sort).small().color(dim));
+            ui.selectable_value(&mut self.rank_desc, true, s.rank_desc);
+            ui.selectable_value(&mut self.rank_desc, false, s.rank_asc);
+            ui.separator();
+            ui.checkbox(&mut self.rank_only_selected, s.rank_only_selected);
+        });
+        geo_log("rank filters 2", row2.response.rect);
+        ui.add_space(2.0);
+
+        // ---- 汇总 + 列表 ----
+        let only = self.rank_only_selected.then_some(&self.selected);
+        let mut rows = rank_rows(&self.snap, from, to, self.hour_sel, &self.rank_scopes, only, s);
+        let metric = self.rank_metric;
+        rows.sort_by(|a, b| {
+            let (va, vb) = (rank_value(a, metric), rank_value(b, metric));
+            let ord = vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal);
+            let ord = if self.rank_desc { ord } else { ord.reverse() };
+            ord.then_with(|| a.label.cmp(&b.label))
+        });
+
+        let days = (to - from).num_days() + 1;
+        let total: u64 = rows.iter().map(|r| r.count).sum();
+        // 区间已经写在导航行的「当前显示数据」里了，这里不重复，只给天数与合计
+        let sum_line = format!("{} {} · {} {}", days, s.rank_days, s.rank_total, fmt_thousands(total as f64));
+        ui.label(egui::RichText::new(sum_line).small().color(dim));
+        ui.add_space(2.0);
+
+        // 表头：按键 + 占比/日均/次数 三列（点某一列即按它排序；当前排序列加深）
+        let (hrect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), Sense::hover());
+        {
+            let painter = ui.painter();
+            painter.text(
+                Pos2::new(hrect.left() + 40.0, hrect.center().y),
+                Align2::LEFT_CENTER,
+                s.rank_col_key,
+                FontId::proportional(11.0),
+                dim,
+            );
+            for (m, name, off) in [
+                (RankMetric::Share, s.rank_metric_share, RANK_COL_SHARE),
+                (RankMetric::PerDay, s.rank_metric_day, RANK_COL_DAY),
+                (RankMetric::Count, s.rank_metric_count, RANK_COL_COUNT),
+            ] {
+                let x = hrect.right() - off;
+                let col = if self.rank_metric == m { TEXT } else { dim };
+                painter.text(
+                    Pos2::new(x, hrect.center().y),
+                    Align2::RIGHT_CENTER,
+                    name,
+                    FontId::proportional(11.0),
+                    col,
+                );
+                // 点表头切换排序指标（不用再单独放一排选项）
+                let hit = Rect::from_min_max(
+                    Pos2::new(x - 46.0, hrect.top()),
+                    Pos2::new(x + 4.0, hrect.bottom()),
+                );
+                let resp = ui.interact(hit, ui.id().with(("rank_head", off as i32)), Sense::click());
+                if resp.clicked() {
+                    self.rank_metric = m;
+                }
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+        }
+
+        let used_above = ui.cursor().min.y - content_top;
+        let list_h = (self.base_h - CONTROLS_H - used_above - 8.0).max(120.0);
+        let maxv = rows.iter().map(|r| rank_value(r, metric)).fold(0.0_f64, f64::max);
+        let font = FontId::proportional(12.0);
+        let small = FontId::proportional(11.0);
+
+        let out = egui::ScrollArea::vertical()
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // 行距归零：行高就是 RANK_ROW_H（列表更紧凑，测试按行高定位也精确）
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if rows.is_empty() || total == 0 {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(s.trend_no_data).color(dim));
+                    });
+                }
+                let w = ui.available_width();
+                let mut jump: Option<usize> = None;
+                for (i, r) in rows.iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, RANK_ROW_H), Sense::click());
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let painter = ui.painter();
+                    // 斑马纹 + 悬停高亮
+                    if resp.hovered() {
+                        painter.rect_filled(rect, 2.0, Color32::from_rgb(0xEC, 0xEF, 0xF3));
+                    } else if i % 2 == 1 {
+                        painter.rect_filled(rect, 2.0, Color32::from_rgb(0xFA, 0xFA, 0xFA));
+                    }
+                    // 名次
+                    painter.text(
+                        Pos2::new(rect.left() + 6.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{}", i + 1),
+                        small.clone(),
+                        dim,
+                    );
+                    // 键名
+                    painter.text(
+                        Pos2::new(rect.left() + 40.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        r.label.clone(),
+                        font.clone(),
+                        TEXT,
+                    );
+                    // 三列数值：占比 / 日均 / 次数（都右对齐；宽窗口下也能对齐成表）
+                    for (text, off, is_metric) in [
+                        (format!("{:.1}%", r.share * 100.0), RANK_COL_SHARE, metric == RankMetric::Share),
+                        (format!("{:.1} {}", r.per_day, s.rank_per_day), RANK_COL_DAY, metric == RankMetric::PerDay),
+                        (fmt_thousands(r.count as f64), RANK_COL_COUNT, metric == RankMetric::Count),
+                    ] {
+                        painter.text(
+                            Pos2::new(rect.right() - off, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            text,
+                            font.clone(),
+                            if is_metric { TEXT } else { Color32::from_rgb(0x77, 0x77, 0x77) },
+                        );
+                    }
+                    // 条形（按当前排序指标的最大值归一化）
+                    let frac = if maxv > 0.0 { (rank_value(r, metric) / maxv) as f32 } else { 0.0 };
+                    let bar_x0 = rect.left() + 130.0;
+                    let bar_x1 = rect.right() - RANK_COL_SHARE - 56.0;
+                    if bar_x1 > bar_x0 + 4.0 {
+                        let bar = Rect::from_min_size(
+                            Pos2::new(bar_x0, rect.top() + 5.0),
+                            Vec2::new((bar_x1 - bar_x0) * frac.clamp(0.0, 1.0), RANK_ROW_H - 10.0),
+                        );
+                        let color = if r.mouse { CLICK_COLOR } else { KEY_COLOR };
+                        painter.rect_filled(bar, 2.0, color.gamma_multiply(0.85));
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        if r.key_idx.is_some() {
+                            let tip = format!(
+                                "{}: {} {} · {:.1}% · {:.1} {}{}",
+                                r.label,
+                                r.count,
+                                s.unit_times.trim(),
+                                r.share * 100.0,
+                                r.per_day,
+                                s.rank_per_day,
+                                s.rank_click_hint
+                            );
+                            resp.clone().on_hover_text(tip);
+                        }
+                    }
+                    if resp.clicked() {
+                        if let Some(idx) = r.key_idx {
+                            jump = Some(idx);
+                        }
+                    }
+                }
+                if let Some(idx) = jump {
+                    // 点某一行 → 跳到热力图页并选中该键
+                    self.selected.clear();
+                    self.selected.insert(idx);
+                    self.page = Page::Heatmap;
+                    self.hour_sel = None;
+                }
+            });
+        self.rank_rect = out.inner_rect;
+        geo_log("rank list", out.inner_rect);
+    }
+
     fn show_trend_page(&mut self, ui: &mut egui::Ui, s: &'static Strings, content_top: f32) {
         let now = chrono::Local::now();
         let today = NaiveDate::parse_from_str(&self.snap_today, "%Y%m%d").unwrap_or_else(|_| now.date_naive());
@@ -1384,26 +2167,22 @@ impl App {
         //  · 其余粒度：窗口末端对齐锚定日期
         let px_to_m = |px: f64| self.shared.px_to_meters(px);
         let pts = if self.granularity == Granularity::Hourly {
-            if is_today {
-                trend::build_hourly_trends(
-                    &self.snap,
-                    chrono::NaiveDateTime::new(today, now.time()),
-                    trend::HOURLY_WINDOW,
-                    px_to_m,
-                )
-            } else {
-                let end_hour = if anchor == today { now.hour().min(23) as u32 } else { 23 };
-                let end = anchor
-                    .and_hms_opt(end_hour, 0, 0)
-                    .unwrap_or_else(|| anchor.and_hms_opt(23, 0, 0).unwrap());
-                trend::build_hourly_trends(&self.snap, end, end_hour + 1, px_to_m)
-            }
+            // 小时粒度统一都是「以锚点结尾的最近 72 小时」：末端 = 锚点那天的「该小时」。
+            // anchor_hour() = 选中小时，没选就是当前钟点 —— 今天与历史某天都走这一条，
+            // 否则「今日」视图下滚轮改了钟点、曲线却锁在当前钟点不动（以前就是这么错的）。
+            let end_hour = self.anchor_hour() as u32;
+            let end = anchor
+                .and_hms_opt(end_hour, 0, 0)
+                .unwrap_or_else(|| anchor.and_hms_opt(23, 0, 0).unwrap());
+            trend::build_hourly_trends(&self.snap, end, trend::HOURLY_WINDOW, px_to_m)
         } else {
             trend::build_trends(&self.snap, anchor, self.granularity, px_to_m)
         };
 
         let key_name = s.keystrokes.to_string();
+        let click_name = s.mouse_clicks.to_string();
         let mouse_name = format!("{} ({})", s.trend_mouse_distance, s.unit_m);
+        // 三条曲线：键盘敲击与鼠标按键同为「次数」共用左轴，鼠标移动的距离走右轴
         let data = chart::ChartData {
             labels: pts.iter().map(|p| p.label.clone()).collect(),
             series: vec![
@@ -1411,11 +2190,19 @@ impl App {
                     name: key_name.clone(),
                     color: KEY_COLOR,
                     values: pts.iter().map(|p| p.keystrokes).collect(),
+                    axis: chart::Axis::Left,
+                },
+                chart::Series {
+                    name: click_name.clone(),
+                    color: CLICK_COLOR,
+                    values: pts.iter().map(|p| p.mouse_clicks).collect(),
+                    axis: chart::Axis::Left,
                 },
                 chart::Series {
                     name: mouse_name.clone(),
                     color: MOUSE_COLOR,
                     values: pts.iter().map(|p| p.move_meters).collect(),
+                    axis: chart::Axis::Right,
                 },
             ],
         };
@@ -1467,10 +2254,16 @@ impl App {
             } else {
                 format!("{}: {:.0} {}", key_name, pts[h.index].keystrokes, unit)
             };
+            let line_click = if unit.is_empty() {
+                format!("{click_name}: {:.0}", pts[h.index].mouse_clicks)
+            } else {
+                format!("{click_name}: {:.0} {}", pts[h.index].mouse_clicks, unit)
+            };
             let line2 = format!("{}: {:.2} {}", mouse_name, pts[h.index].move_meters, s.unit_m);
             let lines: Vec<(String, Color32)> = vec![
                 (full, Color32::from_rgb(0x88, 0x88, 0x88)),
                 (line1, KEY_COLOR),
+                (line_click, CLICK_COLOR),
                 (line2, MOUSE_COLOR),
             ];
             let font = FontId::proportional(12.0);
@@ -1501,6 +2294,7 @@ impl App {
 
     fn paint_heatmap(&mut self, ui: &mut egui::Ui, rect: Rect, resp: egui::Response, u: f32, pitch: f32, gap: f32) {
         let painter = ui.painter().clone();
+        self.kbd_rect = rect;
         let entry = self.day_for_view();
         let day = entry.view(self.hour_sel);
         let maxcount = (day.keystrokes as f64) / 10.0;
@@ -1529,7 +2323,18 @@ impl App {
             }
         }
 
-        // ---- 键盘右上角空白处：24 小时分布（点击柱子只看该小时）----
+        // ---- 方向键上方那 5 个格子：鼠标左/中/右键 + 滚轮/侧键（独立计数池，绿色系）----
+        let pool = mouse_key_pool(&day.mouse);
+        for mk in MOUSE_KEYS.iter() {
+            let r = self.mouse_key_rect(rect, u, pitch, gap, mk);
+            let v = (mk.value)(&day.mouse);
+            let fill = if enough && v > 0.0 { mouse_heat_color(v, pool) } else { BG };
+            painter.rect_filled(r, 2.0, fill);
+            painter.rect_stroke(r, 2.0, egui::Stroke::new(1.0_f32, Color32::WHITE));
+            painter.text(r.center(), Align2::CENTER_CENTER, (mk.label)(self.s()), key_font.clone(), TEXT);
+        }
+
+        // ---- 键盘右上角空白处：24 小时分时折线（点击只看该小时）----
         let strip = self.hour_strip_rect(rect, u, pitch, gap);
         self.strip_rect = strip;
         let prof = entry.hour_profile();
@@ -1539,7 +2344,7 @@ impl App {
         let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
             .then(|| chrono::Local::now().hour().min(23) as u8);
         let invalid_hours: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
-        paint_hour_strip(&painter, strip, &prof, hstrip_sel, now_hour, &invalid_hours);
+        paint_hour_lines(&painter, strip, &prof, hstrip_sel, now_hour, &invalid_hours);
 
         // ---- 点击：分布条优先，其次是按键（选中/取消，查看按压次数）----
         if resp.clicked() {
@@ -1567,18 +2372,21 @@ impl App {
             if strip.contains(pos) {
                 if let Some(idx) = hour_bar_index(strip, pos.x) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    let (ks, px) = prof[idx];
+                    let p = prof.get(idx).copied().unwrap_or_default();
                     let unit = self.s().unit_times.trim();
                     let mark = if invalid_hours.get(idx).copied().unwrap_or(false) { self.s().invalid_mark } else { "" };
                     let text = format!(
-                        "{}{} · {} {}{} · {} {:.2} {}{}{}",
+                        "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
                         idx,
                         self.s().hour_suffix,
                         self.s().keystrokes,
-                        ks,
+                        p.keystrokes,
+                        unit,
+                        self.s().mouse_clicks,
+                        p.clicks,
                         unit,
                         self.s().mouse_move,
-                        self.shared.px_to_meters(px),
+                        self.shared.px_to_meters(p.move_px),
                         self.s().unit_m,
                         mark,
                         self.s().strip_hint
@@ -1586,7 +2394,28 @@ impl App {
                     paint_tooltip(&painter, ui, pos, &text);
                 }
             } else {
+                // 鼠标五键（方向键上方）优先：显示各自的计数
+                let mut hit_mouse_key = false;
+                for mk in MOUSE_KEYS.iter() {
+                    if self.mouse_key_rect(rect, u, pitch, gap, mk).contains(pos) {
+                        let v = (mk.value)(&day.mouse) as u64;
+                        if v > 0 {
+                            let unit = self.s().unit_times.trim();
+                            let text = if unit.is_empty() {
+                                format!("{}: {v}", (mk.label)(self.s()))
+                            } else {
+                                format!("{}: {v} {unit}", (mk.label)(self.s()))
+                            };
+                            paint_tooltip(&painter, ui, pos, &text);
+                        }
+                        hit_mouse_key = true;
+                        break;
+                    }
+                }
                 for (i, k) in KEYS.iter().enumerate() {
+                    if hit_mouse_key {
+                        break;
+                    }
                     let r = self.key_rect(i, rect, u, pitch, gap);
                     if r.contains(pos) {
                         let count = day.key_count(i);
@@ -1869,6 +2698,10 @@ impl App {
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
+                        // 退出放在设置里（左下角，离保存/取消远一些，避免误触）
+                        if ui.button(s.menu_exit).clicked() {
+                            self.exiting = true;
+                        }
                         // 按钮靠右：宽窗口下也在容器右下角
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(s.settings_save).clicked() {
@@ -1904,77 +2737,91 @@ impl App {
     }
 }
 
-/// 在键盘右上角空白处绘制 24 小时分布条（当前小时浅底、选中小时强调描边、每 3 小时标刻度）
-fn paint_hour_strip(
+/// 在键盘右上角空白处绘制 24 小时分时折线图：三条曲线（键盘敲击=红 / 鼠标按键=绿 / 鼠标移动=蓝），
+/// 每条各自按自己的量程归一化（三者的量级差很多，共用一根轴会互相压平），共用下面的小时刻度。
+/// 当前小时有浅色底、选中小时有强调描边、作废的小时压一条浅灰并按 0 画。
+fn paint_hour_lines(
     painter: &egui::Painter,
     area: Rect,
-    prof: &[(u64, f64)],
+    prof: &[HourPoint],
     selected: Option<u8>,
     now_hour: Option<u8>,
     invalid: &[bool],
 ) {
     let label_h = 10.0;
-    let bars = Rect::from_min_max(area.min, Pos2::new(area.right(), area.bottom() - label_h));
-    let slot = bars.width() / HOURS as f32;
-    // 量程只按“有效”小时算，否则一个作废的巨大值会把其他柱子压成一条线
-    let max = prof
-        .iter()
-        .enumerate()
-        .filter(|(h, _)| !invalid.get(*h).copied().unwrap_or(false))
-        .map(|(_, (k, _))| *k)
-        .max()
-        .unwrap_or(0);
-    let dim = Color32::from_rgb(0x99, 0x99, 0x99);
+    let plot = Rect::from_min_max(area.min, Pos2::new(area.right(), area.bottom() - label_h));
+    let slot = plot.width() / HOURS as f32;
+    let colors = [KEY_COLOR, CLICK_COLOR, MOUSE_COLOR];
 
+    // 作废的小时按 0 画（与趋势图一致），也不参与量程计算
+    let values = |h: usize| -> [f64; 3] {
+        let p = prof.get(h).copied().unwrap_or_default();
+        if invalid.get(h).copied().unwrap_or(false) {
+            [0.0, 0.0, 0.0]
+        } else {
+            [p.keystrokes as f64, p.clicks as f64, p.move_px]
+        }
+    };
+    let mut maxes = [0.0f64; 3];
     for h in 0..HOURS {
-        let x0 = bars.left() + h as f32 * slot;
+        let v = values(h);
+        for i in 0..3 {
+            maxes[i] = maxes[i].max(v[i]);
+        }
+    }
+    let x_at = |h: usize| plot.left() + (h as f32 + 0.5) * slot;
+    // 上下各留 2px，避免贴边
+    let y_at = |v: f64, max: f64| {
+        if max <= 0.0 {
+            plot.bottom() - 2.0
+        } else {
+            plot.bottom() - 2.0 - (v / max).min(1.0) as f32 * (plot.height() - 4.0)
+        }
+    };
+
+    // 背景：当前小时浅底 / 选中小时强调描边 / 作废小时浅灰条
+    for h in 0..HOURS {
+        let x0 = plot.left() + h as f32 * slot;
+        let band = Rect::from_min_size(Pos2::new(x0, area.top()), Vec2::new(slot, area.height()));
         if now_hour == Some(h as u8) {
+            painter.rect_filled(band, 2.0, Color32::from_rgb(0xE4, 0xE4, 0xE4));
+        }
+        if invalid.get(h).copied().unwrap_or(false) {
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x0, area.top()), Vec2::new(slot, area.height())),
-                2.0,
-                Color32::from_rgb(0xE4, 0xE4, 0xE4),
+                Rect::from_min_size(Pos2::new(x0 + slot * 0.3, plot.top()), Vec2::new(slot * 0.4, plot.height())),
+                1.0,
+                Color32::from_rgb(0xDA, 0xDA, 0xDA),
             );
         }
-        let ks = prof.get(h).map(|(k, _)| *k).unwrap_or(0);
-        let bad = invalid.get(h).copied().unwrap_or(false);
-        // 作废的小时画满高度，表示“超出量程、已作废”
-        let frac = if bad {
-            1.0
-        } else if max == 0 {
-            0.0
-        } else {
-            ks as f32 / max as f32
-        };
-        let bh = (2.0 + frac * (bars.height() - 3.0)).min(bars.height());
-        let bw = (slot * 0.64).max(2.0);
-        let bar = Rect::from_min_size(
-            Pos2::new(x0 + (slot - bw) / 2.0, bars.bottom() - bh),
-            Vec2::new(bw, bh),
-        );
-        let fill = if bad {
-            Color32::from_rgb(0xCF, 0xCF, 0xCF) // 已作废的小时：灰
-        } else if ks == 0 {
-            Color32::from_rgb(0xE8, 0xE8, 0xE8)
-        } else {
-            heat_color(ks as f64, max as f64)
-        };
-        painter.rect_filled(bar, 1.5, fill);
         if selected == Some(h as u8) {
-            painter.rect_stroke(bar.expand(1.5), 2.0, egui::Stroke::new(2.0_f32, SEL_COLOR));
+            painter.rect_stroke(band.shrink(0.5), 2.0, egui::Stroke::new(2.0_f32, SEL_COLOR));
         }
-        if h % 3 == 0 {
-            painter.text(
-                Pos2::new(x0 + slot / 2.0, area.bottom() - label_h / 2.0),
-                Align2::CENTER_CENTER,
-                h.to_string(),
-                FontId::proportional(9.0),
-                dim,
-            );
+    }
+
+    // 三条折线 + 每个小时的点
+    for si in 0..3 {
+        let max = maxes[si];
+        let pts: Vec<Pos2> = (0..HOURS)
+            .map(|h| Pos2::new(x_at(h), y_at(values(h)[si], max)))
+            .collect();
+        painter.add(Shape::line(pts.clone(), egui::Stroke::new(1.4_f32, colors[si])));
+        for p in &pts {
+            painter.circle_filled(*p, 1.6, colors[si]);
         }
+    }
+
+    let dim = Color32::from_rgb(0x99, 0x99, 0x99);
+    for h in (0..HOURS).step_by(3) {
+        painter.text(
+            Pos2::new(x_at(h), area.bottom() - label_h / 2.0),
+            Align2::CENTER_CENTER,
+            h.to_string(),
+            FontId::proportional(9.0),
+            dim,
+        );
     }
 }
 
-/// 分组框（统计/设置/卡片）的左右内边距之和：用于把外框宽度算准
 fn group_pad(ui: &egui::Ui) -> Vec2 {
     egui::Frame::group(ui.style()).inner_margin.sum()
 }
@@ -1985,7 +2832,6 @@ fn geo_log(tag: &str, r: Rect) {
     }
 }
 
-/// 环比卡片：标题（指标 · 时间窗）+ 当前值 + 涨跌幅（悬停显示对比口径）
 fn delta_card(ui: &mut egui::Ui, s: &Strings, title: &str, value: &str, d: crate::trend::PeriodDelta, vs: &'static str, card_w: f32) {
     // 单行紧凑排版（标题 · 数值 · 涨跌同一行），把纵向空间让给“切换日期”
     let pad = 12.0; // inner_margin 左右各 6
@@ -2025,24 +2871,20 @@ fn delta_card(ui: &mut egui::Ui, s: &Strings, title: &str, value: &str, d: crate
         .on_hover_text(vs);
 }
 
-/// 小时列标题（“14 时” / “14:00”）
 fn hour_label(h: u8, s: &Strings) -> String {
     format!("{h}{}", s.hour_suffix)
 }
 
-/// 日期 ± n 天
 fn shift_days(d: NaiveDate, days: i64) -> NaiveDate {
     d + chrono::Duration::days(days)
 }
 
-/// 日期 ± n 个月（n = 12 即一年）。月末按当月天数收敛：3-31 减一月 = 2-28。
 fn shift_months(d: NaiveDate, months: u32, newer: bool) -> NaiveDate {
     let m = chrono::Months::new(months);
     let r = if newer { d.checked_add_months(m) } else { d.checked_sub_months(m) };
     r.unwrap_or(d)
 }
 
-/// 一个趋势桶覆盖的日期闭区间（点击图表时用来找该桶里有数据的那天）
 fn bucket_range(start: NaiveDate, g: Granularity) -> (NaiveDate, NaiveDate) {
     let next = match g {
         Granularity::Hourly | Granularity::Daily => shift_days(start, 1),
@@ -2053,7 +2895,6 @@ fn bucket_range(start: NaiveDate, g: Granularity) -> (NaiveDate, NaiveDate) {
     (start, next - chrono::Duration::days(1))
 }
 
-/// 键盘分区的显示名
 fn zone_label(z: crate::keys::Zone, s: &Strings) -> &'static str {
     use crate::keys::Zone;
     match z {
@@ -2409,6 +3250,141 @@ mod tests {
         let mut bad = std::collections::BTreeSet::new();
         bad.insert(usize::MAX);
         assert_eq!(sum_selected(&day, &bad), 0);
+    }
+
+    /// 排行聚合：区间 / 钟点 / 键位范围 / 只看已选 都要生效
+    #[test]
+    fn rank_rows_filter_and_sum() {
+        use crate::keys::idx_by_name;
+        let mut store = Store::default();
+        // 三天数据：Space 每天 10 次；F1 第一天 5 次；Num1 第二天 7 次；鼠标左键第三天 3 次
+        for (day, name, n) in [
+            ("20260601", "Space", 10u64),
+            ("20260602", "Space", 10),
+            ("20260603", "Space", 10),
+            ("20260601", "F1", 5),
+            ("20260602", "Num1", 7),
+        ] {
+            for _ in 0..n {
+                store.bump_key(day, 12, idx_by_name(name).unwrap());
+            }
+        }
+        for _ in 0..3 {
+            store.bump_mouse("20260603", 12, &crate::stats::MouseEv::LeftUp);
+        }
+
+        let s = crate::lang::LANG_CHOICES; // 只是占位，下面用中文表
+        let _ = s;
+        let strings = crate::lang::strings(crate::lang::Lang::Zh);
+        let d = |x: &str| chrono::NaiveDate::parse_from_str(x, "%Y%m%d").unwrap();
+        // 键位范围现在是多选集合
+        let all: std::collections::BTreeSet<RankScope> = ALL_SCOPES.iter().copied().collect();
+        let only = |z: RankScope| -> std::collections::BTreeSet<RankScope> { [z].into_iter().collect() };
+
+        // ① 三天全看：Space 30 排第一，合计 30 + 5 + 7 = 42（+ 鼠标左键 3）
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &all, None, strings);
+        let space = rows.iter().find(|r| r.label == "Space").unwrap();
+        assert_eq!(space.count, 30);
+        assert_eq!(space.key_idx, Some(idx_by_name("Space").unwrap()));
+        let total: u64 = rows.iter().map(|r| r.count).sum();
+        assert_eq!(total, 45, "30 键盘(Space) + 5(F1) + 7(Num1) + 3(鼠标左键)");
+        assert!((space.share - 30.0 / 45.0).abs() < 1e-9, "占比按合计算");
+        assert!((space.per_day - 10.0).abs() < 1e-9, "均价按区间天数算");
+        // 鼠标行在，且标了 mouse 标志（配色用绿系）
+        let lb = rows.iter().find(|r| r.mouse && r.count == 3).expect("应有鼠标左键行");
+        assert_eq!(lb.key_idx, None, "鼠标行没有布局键下标");
+
+        // ② 只第一天
+        let rows = rank_rows(&store, d("20260601"), d("20260601"), None, &all, None, strings);
+        assert_eq!(rows.iter().find(|r| r.label == "Space").unwrap().count, 10);
+        assert_eq!(rows.iter().find(|r| r.label == "F1").unwrap().count, 5);
+        assert_eq!(rows.iter().find(|r| r.label == "Num1").unwrap().count, 0);
+
+        // ③ 只看钟点：12 时有数据、13 时没有
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), Some(12), &all, None, strings);
+        assert_eq!(rows.iter().find(|r| r.label == "Space").unwrap().count, 30);
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), Some(13), &all, None, strings);
+        assert_eq!(rows.iter().map(|r| r.count).sum::<u64>(), 0, "13 时没有数据");
+
+        // ④ 键位范围：功能键区只有 F 行；数字键区只有 Num*；鼠标只要鼠标行
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &only(RankScope::Function), None, strings);
+        assert_eq!(rows.len(), 13, "功能键区 = Esc + F1~F12");
+        assert!(rows.iter().any(|r| r.label == "Esc") && rows.iter().any(|r| r.label == "F12"));
+        assert_eq!(rows.iter().find(|r| r.label == "F1").unwrap().count, 5);
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &only(RankScope::Numpad), None, strings);
+        // 数字键区的 1 与主键盘的 1 标签相同，排行里要用内部名区分开
+        assert_eq!(rows.iter().find(|r| r.label == "Num1").map(|r| r.count), Some(7));
+        assert!(rows.iter().all(|r| r.label != "D1"), "数字键区不含主键盘的 1");
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &only(RankScope::Mouse), None, strings);
+        assert_eq!(rows.len(), 5, "鼠标范围 = 左/中/右/滚轮/侧键 5 行");
+        assert!(rows.iter().all(|r| r.mouse));
+
+        // ⑤ 多选：主键盘区 + 控制键区一起
+        let two: std::collections::BTreeSet<RankScope> = [RankScope::Main, RankScope::Control].into_iter().collect();
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &two, None, strings);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"Space"), "主键盘区应包含 Space：{labels:?}");
+        assert!(labels.contains(&"Insert") || labels.contains(&"Delete"), "控制键区应包含导航键：{labels:?}");
+        assert!(!labels.contains(&"Num1"), "没选数字键区就不该有 Num1");
+        assert!(!labels.contains(&"F1"), "没选功能键区就不该有 F1");
+        assert!(rows.iter().all(|r| !r.mouse), "没选鼠标就不该有鼠标行");
+
+        // ⑥ 只看已选：只剩选中的那个键
+        let sel: std::collections::BTreeSet<usize> = [idx_by_name("F1").unwrap()].into_iter().collect();
+        let rows = rank_rows(&store, d("20260601"), d("20260603"), None, &all, Some(&sel), strings);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "F1");
+        assert_eq!(rows[0].count, 5);
+    }
+
+    /// 区间要对齐到自然周期：当周 = 所在那一周（周一到周日）、当月 = 自然月、当年 = 自然年。
+    /// （之前的写法把锚点当起点，窗口落到了「锚点 → 未来」，所以当周/当月/当年看起来没效果）
+    #[test]
+    fn rank_bucket_range_is_calendar_aligned() {
+        let d = |x: &str| chrono::NaiveDate::parse_from_str(x, "%Y%m%d").unwrap();
+        // 2026-10-06 是周二
+        let anchor = d("20261006");
+        let (f, t) = bucket_range(Granularity::Weekly.bucket_start(anchor), Granularity::Weekly);
+        assert_eq!((f, t), (d("20261005"), d("20261011")), "当周应是 10-05(周一)~10-11(周日)");
+        let (f, t) = bucket_range(Granularity::Monthly.bucket_start(anchor), Granularity::Monthly);
+        assert_eq!((f, t), (d("20261001"), d("20261031")), "当月应是整个自然月");
+        let (f, t) = bucket_range(Granularity::Yearly.bucket_start(anchor), Granularity::Yearly);
+        assert_eq!((f, t), (d("20260101"), d("20261231")), "当年应是整个自然年");
+        let (f, t) = bucket_range(Granularity::Daily.bucket_start(anchor), Granularity::Daily);
+        assert_eq!((f, t), (anchor, anchor), "当日就是那一天");
+    }
+
+    /// 配色规格：键盘=红系、鼠标按键=绿系、鼠标移动=蓝系
+    #[test]
+    fn series_colors_match_spec() {
+        assert!(KEY_COLOR.r() > KEY_COLOR.g() && KEY_COLOR.r() > KEY_COLOR.b(), "键盘应是红系");
+        assert!(CLICK_COLOR.g() > CLICK_COLOR.r() && CLICK_COLOR.g() > CLICK_COLOR.b(), "鼠标按键应是绿系");
+        assert!(MOUSE_COLOR.b() > MOUSE_COLOR.r() && MOUSE_COLOR.b() > MOUSE_COLOR.g(), "鼠标移动应是蓝系");
+    }
+
+    /// 鼠标五键是独立计数池：量程只看这五个键；热力色用绿色系，与键盘的红系区分
+    #[test]
+    fn mouse_keys_use_own_green_pool() {
+        let m = crate::stats::MouseStats { lb: 10, rb: 20, mb: 30, xb: 40, wheel: 50, hwheel: 999, move_px: 0.0 };
+        // 取值顺序：左 / 中 / 右 / 滚轮 / 侧键（横滚不参与）
+        let vals: Vec<f64> = MOUSE_KEYS.iter().map(|k| (k.value)(&m)).collect();
+        assert_eq!(vals, vec![10.0, 30.0, 20.0, 50.0, 40.0]);
+        assert_eq!(mouse_key_pool(&m), 50.0, "池子取五个键的最大值（横滚 999 不算）");
+
+        // 绿色系（最深）与键盘的红色系（最深）互不相同
+        let deep_mouse = mouse_heat_color(50.0, 50.0);
+        let deep_kb = heat_color(100.0, 100.0);
+        assert!(deep_mouse.g() > deep_mouse.r(), "鼠标键最深色应是绿色系");
+        assert!(deep_kb.r() > deep_kb.g(), "键盘最深色应是红色系");
+        // 池子独立：键盘最多 100、滚轮 5000 时，各自都能到自己的最深色
+        assert_eq!(mouse_heat_color(5000.0, 5000.0), deep_mouse);
+        assert_eq!(heat_color(100.0, 100.0), deep_kb);
+        // 0 值 → 最浅底色；颜色随计数变深
+        assert_eq!(mouse_heat_color(0.0, 50.0), Color32::from_rgb(0xEE, 0xEE, 0xEE));
+        let mid = mouse_heat_color(25.0, 50.0);
+        // 渐变是「浅底色 → 深绿」，所以量程一半的颜色应比最深色浅（各通道更亮）
+        assert!(mid.g() > deep_mouse.g() && mid.r() > deep_mouse.r(), "半量应比最深色浅");
+        assert_ne!(mid, Color32::from_rgb(0xEE, 0xEE, 0xEE), "半量不该还是底色");
     }
 
     #[test]

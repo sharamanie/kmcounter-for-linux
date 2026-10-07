@@ -748,6 +748,91 @@ mod tests {
         }
     }
 
+    /// 指定颜色、落在 `area` 内的折线点位（核对折线是否真有起伏）
+    fn frame_path_points_of(
+        ctx: &egui::Context,
+        app: &mut App,
+        width: f32,
+        height: f32,
+        area: Rect,
+        want: Color32,
+    ) -> Vec<Pos2> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
+        raw.time = Some(next_time());
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+        let mut pts: Vec<Pos2> = Vec::new();
+        let mut push = |sh: &egui::Shape| {
+            if let egui::Shape::Path(p) = sh {
+                if let egui::epaint::ColorMode::Solid(c) = p.stroke.color {
+                    if c == want && p.points.iter().any(|q| area.contains(*q)) {
+                        pts.extend(p.points.iter().copied());
+                    }
+                }
+            }
+        };
+        for cs in &out.shapes {
+            push(&cs.shape);
+            if let egui::Shape::Vec(v) = &cs.shape {
+                for s in v {
+                    push(s);
+                }
+            }
+        }
+        pts
+    }
+
+    /// 一帧里所有矩形的 (位置, 填充色)——用来核对热力配色
+    fn frame_rect_fills(ctx: &egui::Context, app: &mut App, width: f32, height: f32) -> Vec<(Rect, Color32)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
+        raw.time = Some(next_time());
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+        let mut out_rects: Vec<(Rect, Color32)> = Vec::new();
+        let mut push = |sh: &egui::Shape| {
+            if let egui::Shape::Rect(r) = sh {
+                out_rects.push((r.rect, r.fill));
+            }
+        };
+        for cs in &out.shapes {
+            push(&cs.shape);
+            if let egui::Shape::Vec(v) = &cs.shape {
+                for s in v {
+                    push(s);
+                }
+            }
+        }
+        out_rects
+    }
+
+    /// 一帧里落在 `area` 内的折线颜色（趋势图三条曲线用）
+    fn frame_path_colors(ctx: &egui::Context, app: &mut App, width: f32, height: f32, area: Rect) -> Vec<Color32> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height)));
+        raw.time = Some(next_time());
+        let out = ctx.run(raw, |ctx| app.draw(ctx));
+        let mut colors: Vec<Color32> = Vec::new();
+        let mut push = |sh: &egui::Shape| {
+            if let egui::Shape::Path(p) = sh {
+                // egui 0.29 的描边颜色是 ColorMode（通常为 Solid）
+                if let egui::epaint::ColorMode::Solid(c) = p.stroke.color {
+                    if p.points.iter().any(|q| area.contains(*q)) && c != Color32::TRANSPARENT {
+                        colors.push(c);
+                    }
+                }
+            }
+        };
+        for cs in &out.shapes {
+            push(&cs.shape);
+            if let egui::Shape::Vec(v) = &cs.shape {
+                for s in v {
+                    push(s);
+                }
+            }
+        }
+        colors
+    }
+
     /// 一帧里所有文字及其**视觉**位置（排查“标签 - 数值”对应关系用）。
     /// 返回 `(行中心 y, 左边缘 x, 宽度, 文字)`：右对齐的标签 `TextShape.pos.x` 是右边缘，
     /// 直接用 `pos` 会算错，所以这里取 galley 的 mesh_bounds。
@@ -824,6 +909,16 @@ mod tests {
                 .next()
         };
         let s = app.debug_strings();
+        // 「退出」只在设置面板里出现（底部按钮行不再放，避免误触）
+        let items2 = frame_texts_pos(&ctx, &mut app, 1260.0, 1400.0);
+        let exits: Vec<f32> = items2
+            .iter()
+            .filter(|(_, _, _, t)| t == s.menu_exit)
+            .map(|(_, x, _, _)| *x)
+            .collect();
+        assert_eq!(exits.len(), 1, "「退出」应只出现一次（设置面板里）：{items2:?}");
+        // 统计列宽 468.7（x 8..476.7），设置面板在它右边；旧的底部按钮行在 x≈98
+        assert!(exits[0] > 480.0, "「退出」应在设置面板里（不是底部按钮行），实际 x={}", exits[0]);
         assert_eq!(value_of(s.zone_main), Some(5), "主键盘区应为 Space 的 5 次");
         assert_eq!(value_of(s.zone_function), Some(3), "功能键区应为 F1 的 3 次");
         assert_eq!(value_of(s.zone_control), Some(9), "控制键区应为 Insert + PrtScr = 9 次");
@@ -837,6 +932,538 @@ mod tests {
         for z in [s.zone_main, s.zone_function, s.zone_control, s.zone_numpad] {
             assert!(y_of(z) > ks_y, "「{z}」应排在「{}」下方", s.keystrokes);
             assert!(x_of(z) > x_of(s.keystrokes), "「{z}」应缩进显示");
+        }
+    }
+
+    /// 方向键上方那 5 个鼠标热力键：画得出来、悬停有数值；分时折线悬停显示三个数据
+    #[test]
+    fn mouse_keys_and_hour_lines_render() {
+        let d = crate::stats::today_string();
+        let mut store = Store::default();
+        for h in [3u8, 9, 15] {
+            for _ in 0..120 {
+                store.bump_key(&d, h, 5);
+            }
+            store.bump_mouse(&d, h, &MouseEv::LeftUp);
+            store.bump_mouse(&d, h, &MouseEv::RightUp);
+            store.bump_mouse(&d, h, &MouseEv::Wheel);
+            store.bump_mouse(&d, h, &MouseEv::MovePx(4_000.0));
+        }
+        let (mut app, ctx) = headless_app(store);
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+
+        // ① 5 个鼠标键的短标签都画出来了
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let s = app.debug_strings();
+        for want in [s.mkey_l, s.mkey_m, s.mkey_r, s.mkey_wheel, s.mkey_side] {
+            assert!(texts.iter().any(|t| t == want), "键盘上应画出鼠标键「{want}」：{texts:?}");
+        }
+
+        // ② 悬停分时折线：提示里同时有三个数据（键盘 / 鼠标按键 / 鼠标移动）
+        let strip = app.debug_strip_rect();
+        let p = Pos2::new(strip.left() + strip.width() * (15.5 / 24.0), strip.center().y);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![egui::Event::PointerMoved(p)]);
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let tip = texts.iter().find(|t| {
+            t.contains(s.keystrokes) && t.contains(s.mouse_clicks) && t.contains(s.mouse_move)
+        });
+        assert!(tip.is_some(), "悬停小时应同时显示三个数值：{texts:?}");
+        let tip = tip.unwrap();
+        // 三个数值按「键盘 / 鼠标按键 / 鼠标移动」的顺序出现，且各带着自己的数字与单位
+        let after_keys = tip.split(s.keystrokes).nth(1).unwrap_or("");
+        assert!(after_keys.trim_start().starts_with("120"), "键盘敲击应为 120：{tip}");
+        let after_clicks = tip.split(s.mouse_clicks).nth(1).unwrap_or("");
+        assert!(after_clicks.trim_start().starts_with('2'), "鼠标按键应为 2（左+右，滚轮不算）：{tip}");
+        let after_move = tip.split(s.mouse_move).nth(1).unwrap_or("");
+        assert!(after_move.contains(s.unit_m.trim()), "鼠标移动应带单位：{tip}");
+
+        // ③ 悬停鼠标键（滚轮那一格）：显示该键的计数
+        let rect = app.debug_kbd_rect();
+        let (u, pitch, gap) = app.debug_metrics();
+        let mk = Pos2::new(rect.left() + (crate::keys::MAIN_UNITS * u + gap) + 0.5 * u, rect.top() + 4.5 * pitch);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![egui::Event::PointerMoved(mk)]);
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        assert!(texts.iter().any(|t| t.contains(s.mkey_wheel) && t.contains('3')), "滚轮键悬停应显示计数：{texts:?}");
+
+        // ④ 配色：分时折线三条线都在（红/绿/蓝）
+        let strip = app.debug_strip_rect();
+        let colors = frame_path_colors(&ctx, &mut app, 1260.0, 900.0, strip);
+        for (name, c) in [
+            ("键盘(红)", crate::gui::KEY_COLOR),
+            ("鼠标按键(绿)", crate::gui::CLICK_COLOR),
+            ("鼠标移动(蓝)", crate::gui::MOUSE_COLOR),
+        ] {
+            assert!(colors.contains(&c), "分时折线缺少{name}：{colors:?}");
+            // 折线要有起伏：说明确实画的是这一天各小时的数据，而不是一条压平的直线
+            let pts = frame_path_points_of(&ctx, &mut app, 1260.0, 900.0, strip, c);
+            let ys: Vec<f32> = pts.iter().map(|p| p.y).collect();
+            let span = ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(span > 4.0, "{name} 折线应随小时变化（实际高度差 {span:.1}px）");
+        }
+
+        // ⑤ 鼠标五键用绿色系、键盘用红色系（同一帧里各自的热力色）
+        let fills = frame_rect_fills(&ctx, &mut app, 1260.0, 900.0);
+        let fill_of = |r: Rect| fills.iter().find(|(rr, _)| *rr == r).map(|(_, c)| *c);
+        let kbd = app.debug_kbd_rect();
+        let (u, pitch, gap) = app.debug_metrics();
+        let nav_x = crate::keys::MAIN_UNITS * u + gap;
+        let spacing = 2.0_f32; // 测试用默认配置（key_spacing = 2）
+        let key_rect_at = |x: f32, y: f32| {
+            Rect::from_min_size(
+                Pos2::new(kbd.left() + nav_x + x * u, kbd.top() + y * pitch),
+                egui::vec2(u - spacing, pitch - spacing),
+            )
+        };
+        let m_l = fill_of(key_rect_at(0.0, 3.0)).expect("左键那一格应有底色");
+        assert!(m_l.g() >= m_l.r(), "鼠标左键热力应是绿色系：{m_l:?}");
+        let m_wheel = fill_of(key_rect_at(0.0, 4.0)).expect("滚轮那一格应有底色");
+        assert!(m_wheel.g() >= m_wheel.r(), "滚轮热力应是绿色系：{m_wheel:?}");
+        // 键盘里最常按的键（演示数据里是 Space 附近）应是红色系：取键盘区里颜色最深的一格
+        // 只看主键区（导航区那 5 格是鼠标键，属于绿色池）
+        let main_right = kbd.left() + crate::keys::MAIN_UNITS * u;
+        let kbd_keys: Vec<Color32> = fills
+            .iter()
+            .filter(|(r, c)| {
+                kbd.contains(r.center())
+                    && r.center().x < main_right
+                    && r.width() > 20.0
+                    && r.height() > 20.0
+                    && c.a() == 255
+            })
+            .map(|(_, c)| *c)
+            .collect();
+        let deepest = kbd_keys
+            .into_iter()
+            .min_by_key(|c| (c.r() as u32 + c.g() as u32 + c.b() as u32))
+            .expect("键盘区应有按键底色");
+        assert!(deepest.r() > deepest.g(), "键盘最深的一格应是红色系：{deepest:?}");
+    }
+
+    /// 排行页：列出名次、点某一行跳到热力图并选中该键
+    #[test]
+    fn rank_page_lists_and_jumps() {
+        let d = crate::stats::today_string();
+        let mut store = Store::default();
+        let space = crate::keys::idx_by_name("Space").unwrap();
+        let f1 = crate::keys::idx_by_name("F1").unwrap();
+        for _ in 0..30 {
+            store.bump_key(&d, 12, space);
+        }
+        for _ in 0..10 {
+            store.bump_key(&d, 12, f1);
+        }
+        let (mut app, ctx) = headless_app(store);
+        app.debug_open_rank_page();
+        app.debug_set_rank(
+            crate::gui::RankRange::Day,
+            &crate::gui::ALL_SCOPES,
+            crate::gui::RankMetric::Count,
+            true,
+        );
+        drive(&mut app, &ctx, 1260.0, 900.0, 4, vec![]);
+
+        // 聚合结果：Space 30 第一、F1 10 第二
+        let rows = app.debug_rank_rows();
+        assert_eq!(rows[0].0, "Space");
+        assert_eq!(rows[0].1, 30);
+        assert_eq!(rows[1].0, "F1");
+        assert_eq!(rows[1].1, 10);
+
+        // 界面：页签、键名、次数都在
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let s = app.debug_strings();
+        assert!(texts.iter().any(|t| t == s.tab_rank), "应有「排行」页签：{texts:?}");
+        assert!(texts.iter().any(|t| t == "Space"), "列表里应有 Space");
+        assert!(texts.iter().any(|t| t == "30"), "应显示次数 30");
+
+        // 点第二行（F1）→ 跳到热力图并选中 F1
+        let list = app.debug_rank_rect();
+        assert!(list.height() > 20.0, "排行列表应有可见高度: {list:?}");
+        let p = Pos2::new(list.left() + 60.0, list.top() + crate::gui::RANK_ROW_H * 1.5);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![egui::Event::PointerMoved(p), click_at(p, true)]);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![click_at(p, false)]);
+        assert!(!app.debug_page_is_rank(), "点行后应跳到热力图页");
+        assert_eq!(app.debug_selected(), vec![f1], "应选中被点击的那一行对应的键");
+    }
+
+    /// 「当前显示数据」在当周/当月/当年（以及排行页的非单日区间）下显示成起止区间
+    #[test]
+    fn nav_label_shows_range_for_periods() {
+        use chrono::Datelike;
+        let today = chrono::Local::now().date_naive();
+        let (mut app, ctx) = headless_app(store_with_days(400));
+        app.debug_set_trend_page();
+        app.debug_goto_day(&today.format("%Y%m%d").to_string());
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+
+        // 每小时 / 每日：还是单日
+        for g in [crate::trend::Granularity::Hourly, crate::trend::Granularity::Daily] {
+            app.debug_set_granularity(g);
+            drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+            let label = app.debug_nav_label();
+            assert!(!label.contains('~'), "{g:?} 应显示单日：{label}");
+            assert_eq!(label, today.format("%Y%m%d").to_string());
+        }
+        // 每周：本周周一到今天
+        app.debug_set_granularity(crate::trend::Granularity::Weekly);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let label = app.debug_nav_label();
+        let parts: Vec<&str> = label.split('~').collect();
+        assert_eq!(parts.len(), 2, "当周应显示区间：{label}");
+        assert_eq!(parts[0].len(), 8);
+        let f = chrono::NaiveDate::parse_from_str(parts[0], "%Y%m%d").unwrap();
+        let t = chrono::NaiveDate::parse_from_str(parts[1], "%Y%m%d").unwrap();
+        assert_eq!(f.weekday().num_days_from_monday(), 0, "区间应从周一开始：{label}");
+        assert_eq!(t, today, "止日期应截到今天：{label}");
+        // 每月：本月 1 号到今天
+        app.debug_set_granularity(crate::trend::Granularity::Monthly);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let label = app.debug_nav_label();
+        let parts: Vec<&str> = label.split('~').collect();
+        assert_eq!(parts[0], format!("{}{:02}01", today.year(), today.month()), "当月应从 1 号开始：{label}");
+        assert!(label.ends_with(&today.format("%Y%m%d").to_string()), "止日期应是今天：{label}");
+        // 每年：今年 1 月 1 日到今天
+        app.debug_set_granularity(crate::trend::Granularity::Yearly);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let label = app.debug_nav_label();
+        assert!(label.starts_with(&format!("{}0101", today.year())), "当年应从 1 月 1 日开始：{label}");
+
+        // 排行页同理：当周显示区间、当日显示单日
+        app.debug_open_rank_page();
+        app.debug_set_rank(crate::gui::RankRange::Week, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert!(app.debug_nav_label().contains('~'), "排行页当周也应显示区间：{}", app.debug_nav_label());
+        app.debug_set_rank(crate::gui::RankRange::Day, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert!(!app.debug_nav_label().contains('~'), "排行页当日还是单日：{}", app.debug_nav_label());
+    }
+
+    /// 小时选择：趋势页在每日/每周/每月/每年粒度下置灰；每小时粒度、热力图页、排行页都能用
+    #[test]
+    fn hour_controls_disabled_on_non_hourly_trends() {
+        let (mut app, ctx) = headless_app(store_with_days(30));
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert!(app.debug_hour_controls_enabled(), "热力图页应能用小时选择");
+        app.debug_set_trend_page();
+        for (g, want) in [
+            (crate::trend::Granularity::Hourly, true),
+            (crate::trend::Granularity::Daily, false),
+            (crate::trend::Granularity::Weekly, false),
+            (crate::trend::Granularity::Monthly, false),
+            (crate::trend::Granularity::Yearly, false),
+        ] {
+            app.debug_set_granularity(g);
+            drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+            assert_eq!(app.debug_hour_controls_enabled(), want, "{g:?} 粒度下小时选择可用性不对");
+        }
+        // 排行页：保留「看某个钟点」的功能，任何区间都能用（钟点栏只有导航行那一个）
+        app.debug_open_rank_page();
+        for (r, want) in [
+            (crate::gui::RankRange::Day, true),
+            (crate::gui::RankRange::Week, true),
+            (crate::gui::RankRange::Month, true),
+            (crate::gui::RankRange::Year, true),
+            (crate::gui::RankRange::All, true),
+        ] {
+            app.debug_set_rank(r, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+            drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+            assert_eq!(app.debug_hour_controls_enabled(), want, "排行页 {r:?} 区间下小时选择可用性不对");
+        }
+    }
+
+    /// 导航标题宽度固定：单日与区间两种形态都用同一个容器宽度，且区间文字放得下
+    #[test]
+    fn nav_title_width_is_fixed() {
+        let today = chrono::Local::now().date_naive();
+        let (mut app, ctx) = headless_app(store_with_days(400));
+        app.debug_set_trend_page();
+        app.debug_goto_day(&today.format("%Y%m%d").to_string());
+        let w = app.debug_nav_title_w();
+        let s = app.debug_strings();
+        let key = today.format("%Y%m%d").to_string();
+
+        // 单日形态（每日粒度）：标题就是那一天的日期，「当前显示数据」单独作为前面的小标签
+        app.debug_set_granularity(crate::trend::Granularity::Daily);
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        let items = frame_texts_pos(&ctx, &mut app, 1260.0, 900.0);
+        assert!(
+            items.iter().any(|(_, _, _, t)| t == s.view_date_prefix),
+            "「{}」应作为独立小标签出现：{items:?}",
+            s.view_date_prefix
+        );
+        let single = items
+            .iter()
+            .find(|(_, _, _, t)| *t == key)
+            .map(|(_, _, tw, _)| *tw)
+            .expect("应有单日标题");
+        assert!(single < w, "单日标题应放得下：{single:.0} < {w:.0}");
+
+        // 区间形态（每周粒度）：同一个宽度，也要放得下
+        app.debug_set_granularity(crate::trend::Granularity::Weekly);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let items = frame_texts_pos(&ctx, &mut app, 1260.0, 900.0);
+        let range = items
+            .iter()
+            .find(|(_, _, _, t)| t.contains('~'))
+            .map(|(_, _, tw, _)| *tw)
+            .expect("区间形态应有起止日期");
+        assert!(range < w, "区间标题也要放得下（容器宽度 {w:.0}）：{range:.0}");
+        assert!(range > single, "区间文字本来就比单日长（说明两者确实不同形态）");
+    }
+
+    /// 去过排行页之后，趋势页的滚轮翻页不能失效（rank_rect 是上一帧榜单的位置，别把它当成全局禁区）
+    #[test]
+    fn wheel_still_works_on_trends_after_visiting_rank() {
+        let today = chrono::Local::now().date_naive();
+        let (mut app, ctx) = headless_app(store_with_days(30));
+        // 先去排行页逛一圈（此时会记下榜单矩形）
+        app.debug_open_rank_page();
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        let list = app.debug_rank_rect();
+        assert!(list.height() > 50.0, "排行列表应有高度: {list:?}");
+
+        // 切到趋势页，把指针放在趋势图正中（正好落在旧榜单矩形里）
+        app.debug_set_trend_page();
+        app.debug_goto_day(&today.format("%Y%m%d").to_string());
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        let before = app.debug_view_label();
+        let pos = Pos2::new(list.center().x, list.center().y);
+        assert!(list.contains(pos));
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -40.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert_ne!(app.debug_view_label(), before, "趋势页滚轮应仍然能翻页（旧榜单矩形不该挡）");
+    }
+
+    /// 排行页：区间跟着「当日/当周/当月/当年/全部」走，且对齐到自然周期
+    #[test]
+    fn rank_ranges_and_total_coupling() {
+        let today = chrono::Local::now().date_naive();
+        let (mut app, ctx) = headless_app(store_with_days(400));
+        app.debug_open_rank_page();
+        app.debug_goto_day(&today.format("%Y%m%d").to_string());
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+
+        use chrono::Datelike;
+        let expect = |f: chrono::NaiveDate, t: chrono::NaiveDate| (f, t);
+        app.debug_set_rank(crate::gui::RankRange::Day, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert_eq!(app.debug_rank_window(), expect(today, today), "当日 = 那一天");
+
+        app.debug_set_rank(crate::gui::RankRange::Week, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let (f, t) = app.debug_rank_window();
+        assert_eq!(t.weekday().num_days_from_monday(), 6, "当周应到周日为止：{f}~{t}");
+        assert_eq!((t - f).num_days(), 6, "当周应是 7 天：{f}~{t}");
+
+        app.debug_set_rank(crate::gui::RankRange::Month, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let (f, t) = app.debug_rank_window();
+        assert_eq!((f.day(), t.day()), (1, 31), "当月应是整个 10 月：{f}~{t}");
+
+        app.debug_set_rank(crate::gui::RankRange::Year, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let (f, t) = app.debug_rank_window();
+        assert_eq!((f.month(), f.day(), t.month()), (1, 1, 12), "当年应是整个自然年：{f}~{t}");
+
+        // 切到「总计」时区间自动变成全部
+        app.debug_set_rank(crate::gui::RankRange::Day, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        // 注意：指针要放在排行列表之外——列表里的滚轮按设计用来滚动列表，不翻日期
+        let in_filters = Pos2::new(200.0, 70.0);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![
+            egui::Event::PointerMoved(in_filters),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 40.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert_eq!(app.debug_view_label(), app.debug_strings().total_label, "向上滚应到总计");
+        let (f, t) = app.debug_rank_window();
+        assert!(f.year() <= 2024 || (t - f).num_days() > 30, "总计视图下区间应变成「全部」：{f}~{t}");
+    }
+
+    /// 排行页：右侧三列（占比/日均/次数）都在，右上角有分时折线图且能点选小时
+    #[test]
+    fn rank_columns_and_hour_chart() {
+        let d = crate::stats::today_string();
+        let mut store = Store::default();
+        let space = crate::keys::idx_by_name("Space").unwrap(); // 主键盘区，配合下面的 Main 范围
+        for h in [3u8, 15] {
+            for _ in 0..50 {
+                store.bump_key(&d, h, space);
+            }
+            store.bump_mouse(&d, h, &MouseEv::LeftUp);
+        }
+        let (mut app, ctx) = headless_app(store);
+        app.debug_open_rank_page();
+        app.debug_set_rank(crate::gui::RankRange::Day, &[crate::gui::RankScope::Main], crate::gui::RankMetric::Count, true);
+        drive(&mut app, &ctx, 1260.0, 900.0, 4, vec![]);
+
+        // 三列数值都在（占比带 %、日均带单位）
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let s = app.debug_strings();
+        assert!(texts.iter().any(|t| t.ends_with('%')), "应有占比列：{texts:?}");
+        assert!(texts.iter().any(|t| t.contains(s.rank_per_day)), "应有日均列：{texts:?}");
+        assert!(texts.iter().any(|t| t == "100"), "应有次数列 100（3 时 + 15 时 各 50）");
+        // 指标不再占一行选项：行里只有 降序/升序 两个排序按钮
+        assert!(texts.iter().any(|t| t == s.rank_desc) && texts.iter().any(|t| t == s.rank_asc));
+        assert_eq!(
+            texts.iter().filter(|t| *t == s.rank_metric_count || *t == s.rank_metric_share || *t == s.rank_metric_day).count(),
+            3,
+            "三个指标名只应出现在表头（各一次）"
+        );
+
+        // 页面上只有一个钟点栏（导航行那一个），筛选行里不再重复
+        assert_eq!(
+            texts.iter().filter(|t| *t == s.all_day).count(),
+            1,
+            "排行页只应有一个钟点栏：{texts:?}"
+        );
+
+        // 右上角分时折线图：非空，点某个小时会选中该小时
+        let chart = app.debug_rank_chart_rect();
+        assert!(chart.width() > 200.0 && chart.height() > 30.0, "排行页右上角应有分时折线图: {chart:?}");
+        let p = Pos2::new(chart.left() + chart.width() * (15.5 / 24.0), chart.center().y);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![egui::Event::PointerMoved(p), click_at(p, true)]);
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![click_at(p, false)]);
+        assert_eq!(app.debug_hour_sel(), Some(15), "点折线图的第 15 小时应筛选该小时");
+    }
+
+    /// 趋势页：小时粒度下，历史某天也画「以该天结尾的最近 72 小时」（与今天一致）
+    #[test]
+    fn trend_hourly_window_is_consistent() {
+        let today = chrono::Local::now().date_naive();
+        let past = (today - chrono::Duration::days(3)).format("%Y%m%d").to_string();
+        let (mut app, ctx) = headless_app(store_with_days(10));
+        app.debug_set_trend_page();
+        app.debug_set_granularity(crate::trend::Granularity::Hourly);
+        app.debug_set_hour(Some(12));
+        app.debug_goto_day(&past);
+        drive(&mut app, &ctx, 1260.0, 900.0, 4, vec![]);
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        // 横轴标签形如「10-03 12」，统计出现的不同日期数
+        let mut dates: Vec<&str> = texts
+            .iter()
+            .filter(|t| t.len() == 8 && t.as_bytes()[2] == b'-' && t.as_bytes()[5] == b' ')
+            .map(|t| &t[..5])
+            .collect();
+        dates.sort();
+        dates.dedup();
+        assert!(dates.len() >= 3, "历史某天的小时粒度也应跨 3 天（72 小时），实际标签日期：{dates:?}");
+    }
+
+    /// 趋势页「今日」视图下，小时粒度滚轮必须让曲线跟着走（以前曲线锁在当前钟点不动）
+    #[test]
+    fn trend_hourly_follows_hour_on_today() {
+        let today = chrono::Local::now().date_naive();
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        app.debug_set_trend_page();
+        app.debug_set_granularity(crate::trend::Granularity::Hourly);
+        app.debug_goto_day(&today.format("%Y%m%d").to_string()); // 明确停在「今日」
+        app.debug_set_hour(Some(12));
+        drive(&mut app, &ctx, 1260.0, 900.0, 4, vec![]);
+
+        // 悬停最后一个时间桶，工具提示的第一行是「YYYY-MM-DD HH:00–HH:00」
+        let hover_last = |app: &mut App, ctx: &egui::Context| -> String {
+            let rect = app.debug_chart_rect();
+            let n = crate::trend::HOURLY_WINDOW as usize;
+            let p = Pos2::new(crate::chart::bucket_center_x(rect, n, n - 1), rect.center().y);
+            drive(app, ctx, 1260.0, 900.0, 1, vec![egui::Event::PointerMoved(p)]);
+            let texts = frame_texts(ctx, app, 1260.0, 900.0);
+            texts
+                .iter()
+                .find(|t| t.contains(":00–"))
+                .cloned()
+                .unwrap_or_else(|| panic!("悬停最后一个桶应显示完整标签：{texts:?}"))
+        };
+        let day = today.format("%Y-%m-%d").to_string();
+        let t = hover_last(&mut app, &ctx);
+        assert!(t.contains(&format!("{day} 12:00–13:00")), "末端应是 12 点：{t}");
+
+        // 滚轮退一格 → 末端变 11 点（曲线跟着动）
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![
+            egui::Event::PointerMoved(Pos2::new(600.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -40.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert_eq!(app.debug_hour_sel(), Some(11));
+        let t = hover_last(&mut app, &ctx);
+        assert!(t.contains(&format!("{day} 11:00–12:00")), "滚轮后末端应变成 11 点：{t}");
+    }
+
+    /// 趋势页：小时粒度下滚轮一次走一小时
+    #[test]
+    fn trend_wheel_steps_one_hour() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        app.debug_set_trend_page();
+        app.debug_set_granularity(crate::trend::Granularity::Hourly);
+        app.debug_set_hour(Some(12));
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        assert_eq!(app.debug_hour_sel(), Some(12));
+
+        let wheel = |dy: f32| {
+            vec![
+                egui::Event::PointerMoved(Pos2::new(600.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]
+        };
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, wheel(-40.0));
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![]);
+        assert_eq!(app.debug_hour_sel(), Some(11), "向下滚一格应退到 11 时");
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, wheel(40.0));
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, vec![]);
+        assert_eq!(app.debug_hour_sel(), Some(12), "向上滚一格应回到 12 时");
+
+        // 0 时再往前 → 23 时，并且日期退一天
+        app.debug_set_hour(Some(0));
+        let before = app.debug_view_label();
+        drive(&mut app, &ctx, 1260.0, 900.0, 1, wheel(-40.0));
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        assert_eq!(app.debug_hour_sel(), Some(23), "0 时退一格应到前一天 23 时");
+        assert_ne!(app.debug_view_label(), before, "跨天时显示日期应退一天");
+    }
+
+    /// 趋势页：三条曲线（键盘敲击红 / 鼠标按键绿 / 鼠标移动蓝）都在，图例与配色正确
+    #[test]
+    fn trend_has_three_series() {
+        let (mut app, ctx) = headless_app(store_with_days(30));
+        app.debug_set_trend_page();
+        drive(&mut app, &ctx, 1260.0, 900.0, 4, vec![]);
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let s = app.debug_strings();
+        assert!(texts.iter().any(|t| t == s.keystrokes), "图例应有键盘敲击：{texts:?}");
+        assert!(texts.iter().any(|t| t == s.mouse_clicks), "图例应有鼠标按键：{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.starts_with(s.trend_mouse_distance)),
+            "图例应有鼠标移动距离：{texts:?}"
+        );
+
+        // 图表区域里三条曲线的颜色都要出现
+        let rect = app.debug_chart_rect();
+        let colors = frame_path_colors(&ctx, &mut app, 1260.0, 900.0, rect);
+        for (name, c) in [
+            ("键盘(红)", crate::gui::KEY_COLOR),
+            ("鼠标按键(绿)", crate::gui::CLICK_COLOR),
+            ("鼠标移动(蓝)", crate::gui::MOUSE_COLOR),
+        ] {
+            assert!(colors.contains(&c), "图表里缺少{name}曲线：{colors:?}");
         }
     }
 
@@ -1022,6 +1649,7 @@ mod tests {
             ("shot-trend", vec![("KMCOUNTER_START_PANELS", "trend".into())]),
             ("shot-trend-panel", vec![("KMCOUNTER_START_PANELS", "trend,stats".into())]),
             ("shot-trend-hour", vec![("KMCOUNTER_START_PANELS", "trend".into()), ("KMCOUNTER_GRAN", "hour".into())]),
+            ("shot-rank", vec![("KMCOUNTER_START_PANELS", "rank".into())]),
         ];
         for (name, envs) in shots {
             for (k, v) in &envs {
