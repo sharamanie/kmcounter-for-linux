@@ -1,6 +1,7 @@
 //! Linux 输入捕获：直接读取 /dev/input/event*（evdev 层），
 //! 在 X11 与 Wayland 下都可用。需要用户在 input 组中。
-//! - 虚拟设备（uinput 注入，BUS_VIRTUAL）被跳过，实现“区分真实模拟”
+//! - 虚拟设备（uinput 注入，BUS_VIRTUAL + 名字像 uinput/ydotool）被跳过，实现“区分真实模拟”
+//!   （不能只看总线类型：虚拟机里的 virtio 键鼠也是 BUS_VIRTUAL）
 //! - inotify 监视 /dev/input 实现热插拔
 //! - 键盘计“按下”，鼠标按键计“按下”，滚轮按刻度计 1，移动按像素累计距离
 
@@ -18,6 +19,8 @@ use std::time::Duration;
 
 use evdev::{BusType, Device, RelativeAxisCode};
 
+const EV_SYN: u16 = 0x00;
+const SYN_REPORT: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 
@@ -40,7 +43,7 @@ struct Dev {
     wheel_via_hires: bool,
     wheel_frac: f64,
     hwheel_frac: f64,
-    /// 本批次累计的相对位移
+    /// 当前帧（上一个 SYN_REPORT 之后）累计的相对位移
     batch_dx: f64,
     batch_dy: f64,
 }
@@ -48,9 +51,15 @@ struct Dev {
 impl Dev {
     fn open(path: &Path) -> std::io::Result<Dev> {
         let device = Device::open(path)?;
-        // 注入设备（uinput）不计入
+        // 注入设备（uinput，如 ydotool/dotool）不计入。
+        // 但**不能只按 BUS_VIRTUAL 过滤**：虚拟机里的 virtio 键鼠总线类型也是 BUS_VIRTUAL，
+        // 那样会让 VM 里显示“未找到任何输入设备”、统计恒为 0，所以结合设备名判断。
         if device.input_id().bus_type() == BusType::BUS_VIRTUAL {
-            return Err(ErrorKind::Unsupported.into());
+            let name = device.name().unwrap_or_default().to_lowercase();
+            if ["uinput", "ydotool", "dotool", "wtype"].iter().any(|s| name.contains(s)) {
+                return Err(ErrorKind::Unsupported.into());
+            }
+            log::debug!("虚拟总线设备（{name}）不像注入设备，仍计入统计");
         }
         let is_keyboard = device
             .supported_keys()
@@ -242,18 +251,22 @@ pub fn start(shared: Arc<Shared>) {
 
                 for i in ready {
                     let (_, dev) = &mut devs[i];
-                    // 先把事件收下来再处理，避免借用冲突
-                    let events: Vec<evdev::InputEvent> = match dev.device.fetch_events() {
-                        Ok(iter) => iter.collect(),
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => Vec::new(),
-                        Err(_) => {
+                    // 先把事件收下来再处理：fetch_events 借用了设备，
+                    // 借用要在后面的 flush_motion（&mut dev）之前结束
+                    let mut events: Vec<evdev::InputEvent> = Vec::new();
+                    if let Err(e) = dev.device.fetch_events().map(|it| events.extend(it)) {
+                        if e.kind() == ErrorKind::WouldBlock {
+                            events = Vec::new();
+                        } else {
+                            dev.flush_motion(&sink); // 掉线前最后一段位移别丢
                             dead.push(i);
                             continue;
                         }
-                    };
+                    }
                     for ev in events {
                         handle_event(dev, ev, &sink);
                     }
+                    // 兜底：批次的最后一帧可能没有 SYN_REPORT 收尾
                     dev.flush_motion(&sink);
                 }
 
@@ -279,6 +292,14 @@ pub fn start(shared: Arc<Shared>) {
 
 fn handle_event(dev: &mut Dev, ev: evdev::InputEvent, sink: &Sender<InEvent>) {
     let (ty, code, value) = (ev.event_type().0, ev.code(), ev.value());
+    if ty == EV_SYN {
+        // 一个 SYN_REPORT 就是一段完整的相对位移：分帧求模长再累加。
+        // 把整批（多个 SYN 帧）的 dx/dy 相加后只取一次模长，会让批次内反向的移动互相抵消（系统性少计）
+        if code == SYN_REPORT {
+            dev.flush_motion(sink);
+        }
+        return;
+    }
     if ty == EV_KEY {
         if value != 1 {
             return; // 只计按下（value==2 是自动重复）
