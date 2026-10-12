@@ -2676,10 +2676,6 @@ impl App {
                         ui.add(egui::DragValue::new(&mut self.edit.layout.h_spacing).range(0..=60).speed(1.0));
                         label(ui, s.settings_px);
                         ui.end_row();
-                        label(ui, s.settings_v_spacing);
-                        ui.add(egui::DragValue::new(&mut self.edit.layout.v_spacing).range(0..=60).speed(1.0));
-                        label(ui, s.settings_px);
-                        ui.end_row();
                     });
 
                     // 右栏：窗口行为 + 数据校验

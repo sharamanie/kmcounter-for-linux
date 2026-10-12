@@ -1,4 +1,5 @@
-//! TOML 配置文件。默认值与原版 KMCounter 一致（存储 30 天、键宽 52/键高 45/键间距 2/区域间距 10）。
+//! TOML 配置文件。布局默认值与原版 KMCounter 一致（键宽 52 / 键高 45 / 键间距 2 / 区域水平间距 10）；
+//! 历史保留天数默认 365 天（原版默认 9999，见 `history_days_clamped`）。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -14,13 +15,11 @@ pub struct LayoutCfg {
     pub key_spacing: u32,
     /// 区域水平间距（像素）
     pub h_spacing: u32,
-    /// 区域垂直间距（像素）
-    pub v_spacing: u32,
 }
 
 impl Default for LayoutCfg {
     fn default() -> Self {
-        LayoutCfg { key_w: 52, key_h: 45, key_spacing: 2, h_spacing: 10, v_spacing: 10 }
+        LayoutCfg { key_w: 52, key_h: 45, key_spacing: 2, h_spacing: 10 }
     }
 }
 
