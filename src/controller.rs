@@ -91,10 +91,16 @@ pub fn spawn(ctl: Controller, rx: Receiver<TrayCmd>, ctx: egui::Context, show_re
                         let new_state = {
                             let mut cfg = ctl.cfg.lock();
                             let s = !cfg.autostart;
-                            crate::autostart::set(s);
-                            cfg.autostart = s;
-                            let _ = cfg.save(&ctl.cfg_path);
-                            s
+                            // 写系统（注册表 / .desktop）失败时保持原状态：
+                            // 不然用户看到勾选和配置都是 true，系统里其实没设置
+                            match crate::autostart::set(s) {
+                                Ok(_) => {
+                                    cfg.autostart = s;
+                                    let _ = cfg.save(&ctl.cfg_path);
+                                    s
+                                }
+                                Err(_) => cfg.autostart,
+                            }
                         };
                         ctl.autostart.store(new_state, Ordering::Relaxed);
                         if let Some(tx) = &ctl.tray_ctl {

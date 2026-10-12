@@ -17,12 +17,14 @@ pub fn is_enabled() -> bool {
     }
 }
 
-/// 设置开机启动状态
-pub fn set(enable: bool) {
+/// 设置开机启动状态。失败时返回错误，调用方必须据此回滚状态
+/// （否则配置/托盘勾选与系统真实状态不一致）
+pub fn set(enable: bool) -> std::io::Result<()> {
     let result = if enable { enable_it() } else { disable_it() };
-    if let Err(e) = result {
+    if let Err(e) = &result {
         log::error!("设置开机启动失败: {e}");
     }
+    result
 }
 
 #[cfg(windows)]

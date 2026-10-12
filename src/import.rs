@@ -105,7 +105,13 @@ fn parse(text: &str) -> Result<Ini, String> {
                 ini.total.insert(k, v);
             }
             day => {
-                ini.days.entry(day.to_string()).or_default().insert(k, v);
+                // 只把合法的 YYYYMMDD 节当成一天：原版文件里可能混有 [Log]/[Settings] 之类的节，
+                // 手改/损坏的文件也可能出现非法日期；放进去会污染日期列表、总计和趋势起点
+                if is_date_section(day) {
+                    ini.days.entry(day.to_string()).or_default().insert(k, v);
+                } else {
+                    log::debug!("导入：忽略非日期节 [{day}]");
+                }
             }
         }
     }
@@ -113,6 +119,13 @@ fn parse(text: &str) -> Result<Ini, String> {
         return Err("文件里没有找到按天数据（既没有 [YYYYMMDD] 节也没有 [total]）".into());
     }
     Ok(ini)
+}
+
+/// 节名是否是合法的一天（`YYYYMMDD` 且能按日期解析）
+fn is_date_section(name: &str) -> bool {
+    name.len() == 8
+        && name.bytes().all(|b| b.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(name, "%Y%m%d").is_ok()
 }
 
 /// 导入结果（用于终端汇报）
@@ -349,6 +362,21 @@ mod tests {
         assert_eq!(rep.days_skipped, vec!["20240929".to_string()]);
         assert_eq!(store.days["20240929"].keystrokes, 42, "已存在的天不应被覆盖");
         assert_eq!(store.total.keystrokes, 0, "跳过的天不并入总计");
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn ignores_non_date_sections() {
+        // 非日期节（[Log]）与非法日期（[20249999]）都不能被当成一天
+        let text = "[20250101]\r\nkeystrokes=3\r\nsc30=3\r\n[Log]\r\nfoo=1\r\n[20249999]\r\nkeystrokes=9\r\nsc30=9\r\n";
+        let p = write_tmp("badsection", text);
+        let ini = read_ini(&p).unwrap();
+        assert_eq!(ini.days.len(), 1, "只应留下合法的 [20250101]：{:?}", ini.days.keys().collect::<Vec<_>>());
+        let mut store = Store::default();
+        let rep = import(&ini, &mut store, 1000.0);
+        assert_eq!(rep.days_imported, 1);
+        assert_eq!(store.days.len(), 1);
+        assert_eq!(store.total.keystrokes, 3, "非法节的数据不应并入总计");
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 

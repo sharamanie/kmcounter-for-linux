@@ -1,4 +1,5 @@
-//! 自绘趋势图表：双 Y 轴（左右各一条曲线）、单调三次平滑、面积填充、图例、悬停定位。
+//! 自绘趋势图表：双 Y 轴（左轴「次数」、右轴「距离」，任意条曲线挂到对应轴上）、
+//! 单调三次平滑、面积填充、图例、悬停定位。
 //! x 轴为等距时间桶（日/周/月/年），y 轴两个指标各自独立缩放。
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
@@ -21,7 +22,7 @@ pub struct Series {
 pub struct ChartData {
     /// x 轴每个桶的短标签
     pub labels: Vec<String>,
-    /// 左轴一条 + 右轴一条
+    /// 曲线（数量不限；按各自的 `axis` 分别用左/右轴的量程）
     pub series: Vec<Series>,
 }
 
@@ -61,11 +62,15 @@ pub fn axis_maxes(series: &[Series]) -> (f64, f64) {
     ((max_of(Axis::Left)).max(1.0), (max_of(Axis::Right)).max(1.0))
 }
 
-/// 绘图区（去掉四周留白）——绘制与点击命中共用同一份几何
+/// 绘图区（去掉四周留白）——绘制与点击命中共用同一份几何。
+/// 对可用宽高做下限钳制：控件过小时（宽 < 2×PAD_SIDE 或高 < PAD_TOP+PAD_BOTTOM）
+/// `Rect::from_min_max` 会得到 min > max 的非法矩形，导致曲线反向、命中失效。
 fn plot_rect(rect: Rect) -> Rect {
+    let left = rect.left() + PAD_SIDE;
+    let top = rect.top() + PAD_TOP;
     Rect::from_min_max(
-        Pos2::new(rect.left() + PAD_SIDE, rect.top() + PAD_TOP),
-        Pos2::new(rect.right() - PAD_SIDE, rect.bottom() - PAD_BOTTOM),
+        Pos2::new(left, top),
+        Pos2::new((rect.right() - PAD_SIDE).max(left), (rect.bottom() - PAD_BOTTOM).max(top)),
     )
 }
 
@@ -76,7 +81,7 @@ pub fn bucket_center_x(rect: Rect, n: usize, i: usize) -> f32 {
 }
 
 /// 绘制图表，返回悬停命中的桶下标。
-/// `rect`/`resp` 由调用方通过 `allocate_exact_size` 提供；要求恰好 2 条曲线（左轴、右轴）。
+/// `rect`/`resp` 由调用方通过 `allocate_exact_size` 提供；曲线数量不限（按 `Series::axis` 分轴）。
 pub fn draw(ui: &mut egui::Ui, rect: Rect, resp: &egui::Response, data: &ChartData) -> Option<ChartHover> {
     let painter = ui.painter();
     let n = data.labels.len();

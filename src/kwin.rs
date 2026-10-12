@@ -280,15 +280,17 @@ fn run_script(tag: &str, body: &str) -> bool {
         .map_err(|e| e.to_string())?;
         conn.call_method(Some("org.kde.KWin"), "/Scripting", Some("org.kde.kwin.Scripting"), "start", &())
             .map_err(|e| e.to_string())?;
-        static PREV: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        if let Some(prev) = PREV.lock().unwrap().replace(name.clone()) {
+        static PREV: std::sync::Mutex<Option<(String, std::path::PathBuf)>> = std::sync::Mutex::new(None);
+        if let Some((prev_name, prev_path)) = PREV.lock().unwrap().replace((name.clone(), path.clone())) {
             let _ = conn.call_method(
                 Some("org.kde.KWin"),
                 "/Scripting",
                 Some("org.kde.kwin.Scripting"),
                 "unloadScript",
-                &(prev.as_str(),),
+                &(prev_name.as_str(),),
             );
+            // 上一次的脚本已卸载（必然执行完了），临时文件一起清掉，避免反复呼出窗口持续堆积
+            let _ = std::fs::remove_file(&prev_path);
         }
         Ok(())
     })();

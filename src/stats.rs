@@ -342,8 +342,10 @@ fn migrate_other_system_keys(b: &mut BucketStats) {
         ("lin:119", "Pause"),
     ];
     for (id, name) in MOVES {
-        if let Some(n) = b.other.remove(id) {
-            if let Some(i) = crate::keys::idx_by_name(name) {
+        // 只有确实存在目标槽位时才搬走计数；找不到槽位就留在 other 里，
+        // 不能白白删掉（布局再变时这条计数还能显示出来）
+        if let Some(i) = crate::keys::idx_by_name(name) {
+            if let Some(n) = b.other.remove(id) {
                 b.keys[i] = b.keys[i].saturating_add(n);
             }
         }
