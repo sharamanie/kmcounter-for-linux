@@ -231,11 +231,12 @@ impl DayEntry {
         self.hours.get(&h)
     }
 
-    /// 视图取值：None = 整天/总计，Some(h) = 该小时（无数据时返回空桶）
+    /// 视图取值：None = 整天/总计，Some(h) = 该小时（无数据时返回空桶）。
+    /// 作废的小时按 0 计（原始数值仍留在桶里，只有明确要看证据时才直接读 `hour()`）。
     pub fn view(&self, hour: Option<u8>) -> BucketStats {
         match hour {
             None => self.bucket.clone(),
-            Some(h) => self.hours.get(&h).cloned().unwrap_or_default(),
+            Some(h) => self.hours.get(&h).filter(|u| !u.invalid).cloned().unwrap_or_default(),
         }
     }
 
@@ -364,6 +365,9 @@ impl Store {
                     normalize(&mut s.total.bucket);
                     for h in s.total.hours.values_mut() {
                         normalize(h);
+                        // 旧版本把「某天某小时作废」的标记误打在了跨天累计桶上，
+                        // 读进来时清掉，否则总计视图里该小时会被永久画成作废
+                        h.invalid = false;
                     }
                     s
                 }
@@ -494,8 +498,12 @@ impl Store {
             }
         }
         self.total.bucket.subtract(&hour_bucket);
+        // total.hours 是「所有天该小时的累计」，作废的是「某天的某小时」：
+        // 只把这一份从累计里扣掉，不能给累计桶打 invalid —— 否则其它天同一小时的有效数据
+        // 会被永久隐藏（标记没有任何地方会复位）。
         if let Some(h) = self.total.hours.get_mut(&hour) {
-            h.invalid = true;
+            h.subtract(&hour_bucket);
+            h.invalid = false; // 兼容旧文件里被误打在累计桶上的标记
         }
         log::warn!(
             "{} {hour} 时{reason}超过阈值，该小时已作废（原始数值保留，不计入当日/总计）",
@@ -700,6 +708,20 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// 旧文件把作废标记打在跨天累计桶 `total.hours` 上：读取时清掉，
+    /// 否则总计视图里该小时会被永久画成作废（标记没有任何地方会复位）
+    #[test]
+    fn legacy_total_hour_invalid_flag_is_cleared_on_load() {
+        let json = "{\"version\":1,\"days\":{},\"total\":{\"hours\":{\"10\":{\"keystrokes\":5,\"invalid\":true}}}}";
+        let dir = tmp_dir("legacy_total_invalid");
+        let path = dir.join("stats.json");
+        std::fs::write(&path, json).unwrap();
+        let s = Store::load(&path);
+        assert!(!s.total.hours[&10].invalid, "累计桶上的旧作废标记应被清掉");
+        assert_eq!(s.total.hours[&10].keystrokes, 5, "数值本身保留");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn loads_legacy_day_without_hours() {
         // 旧版（无 hours、keys 缩进展开）文件必须能读
@@ -790,12 +812,19 @@ mod tests {
         assert_eq!(h10.mouse.move_px, 1200.0, "原始数值应保留在案");
         assert_eq!(s.days[&d].mouse.move_px, 800.0, "作废小时不计入当日");
         assert_eq!(s.total.mouse.move_px, 800.0, "作废小时不计入总计");
+        // 总计分时桶：要扣掉作废的这一份，但不能被标记作废
+        //（它是跨天累计，打了标记就再也不会复位，其它天同一小时会被永久隐藏）
+        assert_eq!(s.total.hour(10).unwrap().mouse.move_px, 0.0, "作废小时从总计分时里扣回");
+        assert!(!s.total.hour(10).unwrap().invalid, "跨天累计桶不应带作废标记");
+        assert_eq!(s.total.hour(9).unwrap().mouse.move_px, 800.0);
+        assert_eq!(s.day(&d).unwrap().view(Some(10)).mouse.move_px, 0.0, "视图里作废小时按 0 显示");
 
         // 之后再动鼠标：只进该小时自己的桶（继续留证据），不再影响当日/总计
         s.bump_mouse(&d, 10, &MouseEv::MovePx(500.0));
         assert_eq!(s.hour(&d, 10).unwrap().mouse.move_px, 1700.0);
         assert_eq!(s.days[&d].mouse.move_px, 800.0);
         assert_eq!(s.total.mouse.move_px, 800.0);
+        assert_eq!(s.total.hour(10).unwrap().mouse.move_px, 0.0, "作废后不再累加进总计分时");
 
         // 键盘越限（100 次/小时）
         for i in 0..101 {

@@ -204,14 +204,17 @@ pub fn build_hourly_trends(
     points
 }
 
-/// 本小时（当前整点）对比昨日同一小时：等长窗口（各 1 小时），避免“本小时才过一半”的误导
+/// 本小时（当前整点）对比昨日同一小时：等长窗口（各 1 小时），避免“本小时才过一半”的误导。
+/// 作废的小时与日/周/月口径一致，按 0 计（原始值仍在数据里，但不该把环比带偏）。
 pub fn hour_compare(store: &Store, today: NaiveDate, hour: u8, metric: impl Fn(&BucketStats) -> f64) -> PeriodDelta {
     let cur = store
         .hour(&today.format("%Y%m%d").to_string(), hour)
+        .filter(|u| !u.invalid)
         .map(&metric)
         .unwrap_or(0.0);
     let prev = store
         .hour(&(today - Duration::days(1)).format("%Y%m%d").to_string(), hour)
+        .filter(|u| !u.invalid)
         .map(&metric)
         .unwrap_or(0.0);
     delta(cur, prev)

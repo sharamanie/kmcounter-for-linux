@@ -1183,7 +1183,9 @@ impl App {
                     let unit = self.unit_for_view();
                     let unit_t = s.unit_times.trim();
                     let mut head = String::new();
-                    if unit.invalid {
+                    // 作废判定要读原始桶：view() 已把作废小时按 0 返回（与统计表/趋势图一致）
+                    let sel_invalid = self.hour_sel.filter(|h| self.day_for_view().hour_invalid(*h));
+                    if sel_invalid.is_some() {
                         head = s.hour_invalid.to_string();
                     } else if let Some(h) = self.hour_sel {
                         head = format!(
@@ -1602,6 +1604,15 @@ impl App {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn debug_open_panel(&mut self) {
         self.more_open = true;
+    }
+
+    /// 指定「当前显示数据」的视图（0 = 总计，1 = 今日，2 = 昨天…），截图用
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_set_view_idx(&mut self, idx: usize) {
+        self.view_idx = idx;
+        self.rebuild_view_days();
+        self.title_dirty = true;
     }
 
     #[cfg(feature = "softshot")]

@@ -429,6 +429,8 @@ mod tests {
         assert!(!store.hour(&date, 9).unwrap().invalid);
 
         let (mut app, ctx) = headless_app(store);
+        // 作废是「某天的某小时」的属性：要在当天视图里看（总计视图里该小时是跨天的有效累计，没有作废一说）
+        app.debug_set_view_idx(1);
         app.debug_set_hour(Some(10));
         drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
         let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
@@ -448,6 +450,7 @@ mod tests {
             s.bump_mouse(&d, 9, &MouseEv::MovePx(500.0));
             s
         });
+        app9.debug_set_view_idx(1);
         app9.debug_set_hour(Some(9));
         drive(&mut app9, &ctx9, 1260.0, 900.0, 3, vec![]);
         let texts9 = frame_texts(&ctx9, &mut app9, 1260.0, 900.0);
