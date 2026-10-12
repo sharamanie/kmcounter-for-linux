@@ -21,8 +21,11 @@ impl Lang {
         }
         #[cfg(windows)]
         {
-            // Windows 下看系统 UI 语言
-            if std::env::var("SYSTEM_LANGUAGE").map(|v| v.starts_with("zh")).unwrap_or(false) {
+            // Windows 下看系统 UI 语言（GetUserDefaultUILanguage）。
+            // 注意：Windows 没有 SYSTEM_LANGUAGE 这个环境变量，之前读它等于永远落到英文。
+            // LANGID 的低 10 位是主语言 ID，0x04 = 中文（含简繁、港澳、新加坡）
+            let langid = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+            if langid & 0x03ff == 0x04 {
                 return Lang::Zh;
             }
         }

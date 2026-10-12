@@ -443,6 +443,10 @@ mod imp {
         LANG_CODE.store(if lang == Lang::Zh { 0 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
         let _ = CTL_RX.set(Mutex::new(ctl_rx));
 
+        // 初始化握手：只有托盘线程真正把图标加上了才算可用。
+        // 否则 GUI 会以为托盘在，把窗口收进一个不存在的托盘里（图标没了、线程也退了，再也叫不回来）
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+
         std::thread::Builder::new()
             .name("kmcounter-tray".into())
             .spawn(move || unsafe {
@@ -465,6 +469,7 @@ mod imp {
                 };
                 if RegisterClassW(&wc) == 0 {
                     log::warn!("托盘窗口类注册失败");
+                    let _ = init_tx.send(false);
                     return;
                 }
                 let hwnd = CreateWindowExW(
@@ -483,6 +488,7 @@ mod imp {
                 );
                 if hwnd.is_null() {
                     log::warn!("托盘窗口创建失败");
+                    let _ = init_tx.send(false);
                     return;
                 }
 
@@ -494,6 +500,8 @@ mod imp {
                 TRAY_ICON.store(icon as usize, std::sync::atomic::Ordering::Relaxed);
                 TRAY_HWND.store(hwnd as usize, std::sync::atomic::Ordering::Relaxed);
                 if !add_icon(hwnd) {
+                    log::warn!("托盘图标添加失败（Explorer 可能尚未就绪）");
+                    let _ = init_tx.send(false);
                     return;
                 }
 
@@ -501,6 +509,7 @@ mod imp {
                 SetTimer(hwnd, 1, 200, None);
 
                 build_menu();
+                let _ = init_tx.send(true);
 
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -510,7 +519,13 @@ mod imp {
             })
             .ok();
 
-        Some(Tray { rx: cmd_rx, tx: ctl_tx, cmd_tx })
+        match init_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(true) => Some(Tray { rx: cmd_rx, tx: ctl_tx, cmd_tx }),
+            _ => {
+                log::warn!("托盘初始化失败，托盘不可用（关闭窗口将直接退出）");
+                None
+            }
+        }
     }
 }
 
