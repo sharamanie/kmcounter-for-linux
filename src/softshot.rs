@@ -1034,7 +1034,7 @@ mod tests {
             .collect();
         let deepest = kbd_keys
             .into_iter()
-            .min_by_key(|c| (c.r() as u32 + c.g() as u32 + c.b() as u32))
+            .min_by_key(|c| c.r() as u32 + c.g() as u32 + c.b() as u32)
             .expect("键盘区应有按键底色");
         assert!(deepest.r() > deepest.g(), "键盘最深的一格应是红色系：{deepest:?}");
     }

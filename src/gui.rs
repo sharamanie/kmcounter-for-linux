@@ -1682,13 +1682,6 @@ impl App {
         self.rank_desc = desc;
     }
 
-    /// 全部键位范围（测试里 debug_set_rank 传这个）
-    #[cfg(feature = "softshot")]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn debug_all_scopes(&self) -> Vec<RankScope> {
-        ALL_SCOPES.to_vec()
-    }
-
     #[cfg(feature = "softshot")]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn debug_open_rank_page(&mut self) {
