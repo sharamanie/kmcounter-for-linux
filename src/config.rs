@@ -89,8 +89,15 @@ impl Config {
             Ok(text) => match toml::from_str(&text) {
                 Ok(c) => (c, false),
                 Err(e) => {
-                    log::warn!("配置解析失败({e})，使用默认配置");
-                    (Config::default(), true)
+                    // 解析失败：先把原文件备份下来再退回默认配置。
+                    // 不能当成“首次运行”（否则欢迎横幅重弹，且退出时会把默认配置写回去、
+                    // 用户那处笔误就被静默吞掉了）。
+                    let bak = path.with_extension("toml.bak");
+                    match std::fs::copy(path, &bak) {
+                        Ok(_) => log::warn!("配置解析失败({e})，原文件已备份为 {}，本次使用默认配置", bak.display()),
+                        Err(cp) => log::warn!("配置解析失败({e})，使用默认配置（备份失败: {cp}）"),
+                    }
+                    (Config::default(), false)
                 }
             },
             Err(_) => {
@@ -101,10 +108,16 @@ impl Config {
         }
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+    /// 只读加载（命令行 `--stats`/`--export` 用）：不创建文件、解析失败用默认值。
+    /// 避免只读命令在数据目录里留下副作用文件。
+    pub fn load_readonly(path: &Path) -> Config {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).unwrap_or_default(),
+            Err(_) => Config::default(),
         }
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let body = toml::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let header = "\
 # KMCounter-rs 配置文件
@@ -336,5 +349,33 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.history_days, 365);
         assert_eq!(back.layout, c.layout);
+    }
+
+    /// 配置解析失败：不当成首次运行，且原文件先备份（不被静默吞掉）
+    #[test]
+    fn broken_config_is_backed_up_not_treated_as_first_run() {
+        let dir = std::env::temp_dir().join(format!("kmc_cfg_broken_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "language = \"zh\"\nthis is not toml =\n").unwrap();
+        let (cfg, first_run) = Config::load(&path);
+        assert!(!first_run, "解析失败不应被当成首次运行");
+        assert_eq!(cfg.language, "auto", "退回默认配置");
+        let bak = dir.join("config.toml.bak");
+        assert!(bak.exists(), "原文件应备份为 config.toml.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "language = \"zh\"\nthis is not toml =\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 只读加载不创建文件（命令行 --stats/--export 不该有副作用）
+    #[test]
+    fn readonly_load_does_not_create_file() {
+        let dir = std::env::temp_dir().join(format!("kmc_cfg_readonly_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = Config::load_readonly(&path);
+        assert_eq!(cfg.history_days, 365);
+        assert!(!path.exists(), "只读加载不应写出 config.toml");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

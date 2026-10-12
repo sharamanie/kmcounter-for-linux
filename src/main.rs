@@ -36,20 +36,24 @@ fn main() {
     let mut export_path: Option<Option<PathBuf>> = None;
     let mut import_path: Option<PathBuf> = None;
     let mut rest: Vec<String> = Vec::new();
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" | "-c" => {
-                config_path = args.next().map(PathBuf::from);
+                config_path = Some(take_value(&mut args, "--config"));
             }
             "--export" => {
-                // 可跟路径；不带路径则导出到当前目录 kmcounter_export_日期.csv
-                let p = args.next().filter(|s| !s.starts_with('-')).map(PathBuf::from);
+                // 可跟路径；不带路径则导出到当前目录 kmcounter_export_日期.csv。
+                // 用 peek 而不是 next+filter：`--export --stats` 里的 --stats 要留给主循环处理
+                let p = match args.peek() {
+                    Some(v) if !v.starts_with('-') => Some(PathBuf::from(args.next().unwrap())),
+                    _ => None,
+                };
                 export_path = Some(p);
             }
             "--import" => {
                 // 导入原版 KMCounter.ini
-                import_path = args.next().map(PathBuf::from);
+                import_path = Some(take_value(&mut args, "--import"));
             }
             _ => rest.push(a),
         }
@@ -74,7 +78,7 @@ fn main() {
                 return;
             }
             "--stats" => {
-                cmd_stats(&stats_path);
+                cmd_stats(&stats_path, &cfg_path);
                 return;
             }
             "--reset" => {
@@ -100,6 +104,18 @@ fn main() {
     }
 
     run_app(cfg_path, stats_path);
+}
+
+/// 取一个选项值：缺参或下一个参数又是选项时报错退出（而不是静默忽略、直接启动 GUI）
+fn take_value(args: &mut std::iter::Peekable<impl Iterator<Item = String>>, opt: &str) -> PathBuf {
+    match args.peek() {
+        Some(v) if !v.starts_with('-') => PathBuf::from(args.next().unwrap()),
+        _ => {
+            eprintln!("{opt} 缺少路径参数\n");
+            print_help();
+            std::process::exit(2);
+        }
+    }
 }
 
 fn print_help() {
@@ -132,7 +148,7 @@ fn cmd_export(stats_path: &Path, cfg_path: &Path, out: Option<PathBuf>) {
     }
 
     // 与 --stats 相同的换算参数
-    let cfg = Config::load(&cfg_path.with_file_name("config.toml")).0;
+    let cfg = Config::load_readonly(cfg_path);
     let mm_w = resolve_screen_mm(&cfg).0 as f64;
     let px_w = resolve_screen_px_w(&cfg) as f64;
     let px_to_m = |px: f64| px * mm_w / px_w / 1000.0;
@@ -218,8 +234,7 @@ fn cmd_import(stats_path: &Path, cfg_path: &Path, ini_path: PathBuf) {
     let before_days = store.days.len();
 
     // 鼠标“米 → 像素”换算：用本机屏幕的比例，这样界面显示的距离与原版一致
-    let cfg_file = &cfg_path.with_file_name("config.toml");
-    let (cfg, _) = Config::load(cfg_file);
+    let cfg = Config::load_readonly(cfg_path);
     let mm_w = resolve_screen_mm(&cfg).0;
     let px_w = resolve_screen_px_w(&cfg);
     let px_per_meter = if mm_w > 0 { 1000.0 * px_w as f64 / mm_w as f64 } else { 0.0 };
@@ -264,11 +279,11 @@ fn cmd_import(stats_path: &Path, cfg_path: &Path, ini_path: PathBuf) {
 
     // 导入的历史可能早于 history_days：不改大一点，程序启动时会把它们清理掉
     if let Some(storage) = rep.ini_history_days {
-        let (mut cfg, _) = Config::load(cfg_file);
+        let mut cfg = Config::load_readonly(cfg_path);
         if storage > cfg.history_days {
             let old = cfg.history_days;
             cfg.history_days = storage;
-            if let Err(e) = cfg.save(cfg_file) {
+            if let Err(e) = cfg.save(cfg_path) {
                 eprintln!("更新 history_days 失败: {e}");
             } else {
                 println!("历史保留天数 {} → {}（原版设置为 {storage}，否则旧数据会被自动清理）", old, storage);
@@ -301,11 +316,11 @@ fn cmd_reset(stats_path: &Path) {
     }
 }
 
-fn cmd_stats(stats_path: &Path) {
+fn cmd_stats(stats_path: &Path, cfg_path: &Path) {
     let lang = strings(Lang::resolve("auto"));
     let store = Store::load(stats_path);
     let today = stats::today_string();
-    let cfg = Config::load(&stats_path.with_file_name("config.toml")).0;
+    let cfg = Config::load_readonly(cfg_path);
     let mm_w = crate::resolve_screen_mm(&cfg).0 as f64;
     let px_w = resolve_screen_px_w(&cfg) as f64;
 
