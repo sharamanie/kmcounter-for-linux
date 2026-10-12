@@ -1621,6 +1621,13 @@ impl App {
         self.title_dirty = true;
     }
 
+    /// 直接设置已选按键（截图用：高亮几个真实高频键）
+    #[cfg(feature = "softshot")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn debug_set_select(&mut self, keys: &[usize]) {
+        self.selected = keys.iter().copied().collect();
+    }
+
     #[cfg(feature = "softshot")]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn debug_set_trend_page(&mut self) {

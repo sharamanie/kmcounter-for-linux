@@ -97,6 +97,11 @@ struct Tex {
 
 impl Tex {
     fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        // 空纹理（egui 正常不会产生，但尺寸来自外部数据）直接返回透明：
+        // 否则下面的 clamp(0.0, w-1) 在 w/h 为 0 时 min > max 会 panic
+        if self.w == 0 || self.h == 0 {
+            return [0.0; 4];
+        }
         // 双线性采样（图集边缘做钳制）
         let x = u * self.w as f32 - 0.5;
         let y = v * self.h as f32 - 0.5;
@@ -231,6 +236,8 @@ fn draw_mesh(canvas: &mut Canvas, tex: Option<&Tex>, mesh: &egui::Mesh, clip: Re
 
 /// 离屏渲染 App：先跑 `settle` 帧让布局稳定，再参考布局锚点确定画布高度，
 /// 最后把目标帧光栅化到 PPM。
+/// `setup` 在建好 App 后立即调用：截图的各种状态（展开面板/指定页/选中小时…）
+/// 走 debug 入口配置，不再依赖进程级环境变量（并行测试会互相串）。
 pub struct Shot {
     pub ppm: PathBuf,
     pub w: usize,
@@ -238,7 +245,15 @@ pub struct Shot {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render(store: Store, cfg: Config, cfg_dir: &Path, out_prefix: &str, width: f32, ppp: f32) -> std::io::Result<Vec<Shot>> {
+pub fn render(
+    store: Store,
+    cfg: Config,
+    cfg_dir: &Path,
+    out_prefix: &str,
+    width: f32,
+    ppp: f32,
+    setup: impl FnOnce(&mut App),
+) -> std::io::Result<Vec<Shot>> {
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(ppp);
     let shared = Shared::new(store, cfg.screen_w_mm.max(527), cfg.screen_h_mm.max(296));
@@ -257,6 +272,7 @@ pub fn render(store: Store, cfg: Config, cfg_dir: &Path, out_prefix: &str, width
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
+    setup(&mut app);
 
     let mut textures: HashMap<TextureId, Tex> = HashMap::new();
     let mut last: Option<Vec<egui::ClippedPrimitive>> = None;
@@ -380,13 +396,15 @@ mod tests {
     }
 
     fn headless_app(store: Store) -> (App, egui::Context) {
+        headless_app_with_cfg(store, Config::default())
+    }
+
+    /// 指定配置构造离屏 App。刻意不读环境变量：进程级环境变量在并行测试里会互相串
+    /// （调用方需要演示配置时自己加载好传进来）。
+    fn headless_app_with_cfg(store: Store, cfg: Config) -> (App, egui::Context) {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
-        // 与真实程序一致：配置里的屏幕参数（tests 用默认配置）
-        let cfg = match std::env::var("KMCOUNTER_SHOT_STATS") {
-            Ok(p) => Config::load(&Path::new(&p).with_file_name("config.toml")).0,
-            Err(_) => Config::default(),
-        };
+        // 与真实程序一致：配置里的屏幕参数
         let (mm_w, mm_h) = crate::resolve_screen_mm(&cfg);
         let shared = Shared::new(store, mm_w, mm_h);
         shared.set_input_status(true, String::new());
@@ -710,17 +728,24 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_frame_texts() {
-        std::env::set_var(
-            "KMCOUNTER_START_PANELS",
-            std::env::var("KMCOUNTER_DUMP_PANELS").unwrap_or_else(|_| "both".into()),
-        );
         // 有 KMCOUNTER_SHOT_STATS 时用真实/演示数据，便于核对界面数字
-        let store = match std::env::var("KMCOUNTER_SHOT_STATS") {
-            Ok(p) => Store::load(Path::new(&p)),
-            Err(_) => Store::default(),
-        };
-        let (mut app, ctx) = headless_app(store);
-        std::env::remove_var("KMCOUNTER_START_PANELS");
+        let stats = std::env::var("KMCOUNTER_SHOT_STATS").ok();
+        let store = stats.as_ref().map(|p| Store::load(Path::new(p))).unwrap_or_default();
+        let cfg = stats
+            .as_ref()
+            .map(|p| Config::load(&Path::new(p).with_file_name("config.toml")).0)
+            .unwrap_or_default();
+        let (mut app, ctx) = headless_app_with_cfg(store, cfg);
+        // 面板/页面走 debug 入口，不设置进程级环境变量（并行测试会互相串）
+        let panels = std::env::var("KMCOUNTER_DUMP_PANELS").unwrap_or_else(|_| "both".into());
+        if panels.contains("stats") || panels.contains("settings") || panels.contains("both") {
+            app.debug_open_panel();
+        }
+        if panels.contains("trend") {
+            app.debug_set_trend_page();
+        } else if panels.contains("rank") {
+            app.debug_open_rank_page();
+        }
         if let Ok(code) = std::env::var("KMCOUNTER_DUMP_LANG") {
             app.debug_set_language(&code);
         }
@@ -1107,38 +1132,52 @@ mod tests {
             assert!(!label.contains('~'), "{g:?} 应显示单日：{label}");
             assert_eq!(label, today.format("%Y%m%d").to_string());
         }
+        // 起点对齐到自然周期、止于今天；但**区间退化成一天时按设计照旧显示单日**
+        // （例如周一：本周就是今天这一天；每月 1 号、1 月 1 日同理），所以期望值按同一条规则算
+        let expect_range = |first: chrono::NaiveDate| -> String {
+            if first >= today {
+                today.format("%Y%m%d").to_string()
+            } else {
+                format!("{}~{}", first.format("%Y%m%d"), today.format("%Y%m%d"))
+            }
+        };
+        let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+
         // 每周：本周周一到今天
         app.debug_set_granularity(crate::trend::Granularity::Weekly);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let label = app.debug_nav_label();
-        let parts: Vec<&str> = label.split('~').collect();
-        assert_eq!(parts.len(), 2, "当周应显示区间：{label}");
-        assert_eq!(parts[0].len(), 8);
-        let f = chrono::NaiveDate::parse_from_str(parts[0], "%Y%m%d").unwrap();
-        let t = chrono::NaiveDate::parse_from_str(parts[1], "%Y%m%d").unwrap();
-        assert_eq!(f.weekday().num_days_from_monday(), 0, "区间应从周一开始：{label}");
-        assert_eq!(t, today, "止日期应截到今天：{label}");
+        assert_eq!(label, expect_range(week_start), "当周应显示 周一~今天（退化成一天时显示单日）：{label}");
+        if label.contains('~') {
+            let parts: Vec<&str> = label.split('~').collect();
+            assert_eq!(parts.len(), 2);
+            let f = chrono::NaiveDate::parse_from_str(parts[0], "%Y%m%d").unwrap();
+            let t = chrono::NaiveDate::parse_from_str(parts[1], "%Y%m%d").unwrap();
+            assert_eq!(f.weekday().num_days_from_monday(), 0, "区间应从周一开始：{label}");
+            assert_eq!(t, today, "止日期应截到今天：{label}");
+        }
         // 每月：本月 1 号到今天
         app.debug_set_granularity(crate::trend::Granularity::Monthly);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let label = app.debug_nav_label();
-        let parts: Vec<&str> = label.split('~').collect();
-        assert_eq!(parts[0], format!("{}{:02}01", today.year(), today.month()), "当月应从 1 号开始：{label}");
-        assert!(label.ends_with(&today.format("%Y%m%d").to_string()), "止日期应是今天：{label}");
+        assert_eq!(label, expect_range(today.with_day(1).unwrap()), "当月应显示 1 号~今天：{label}");
         // 每年：今年 1 月 1 日到今天
         app.debug_set_granularity(crate::trend::Granularity::Yearly);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let label = app.debug_nav_label();
-        assert!(label.starts_with(&format!("{}0101", today.year())), "当年应从 1 月 1 日开始：{label}");
+        let jan1 = chrono::NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap();
+        assert_eq!(label, expect_range(jan1), "当年应显示 1 月 1 日~今天：{label}");
 
         // 排行页同理：当周显示区间、当日显示单日
         app.debug_open_rank_page();
         app.debug_set_rank(crate::gui::RankRange::Week, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
-        assert!(app.debug_nav_label().contains('~'), "排行页当周也应显示区间：{}", app.debug_nav_label());
+        let label = app.debug_nav_label();
+        assert_eq!(label, expect_range(week_start), "排行页当周应与趋势页同一形态：{label}");
         app.debug_set_rank(crate::gui::RankRange::Day, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
-        assert!(!app.debug_nav_label().contains('~'), "排行页当日还是单日：{}", app.debug_nav_label());
+        let label = app.debug_nav_label();
+        assert_eq!(label, today.format("%Y%m%d").to_string(), "排行页当日还是单日：{label}");
     }
 
     /// 小时选择：趋势页在每日/每周/每月/每年粒度下置灰；每小时粒度、热力图页、排行页都能用
@@ -1201,7 +1240,11 @@ mod tests {
             .expect("应有单日标题");
         assert!(single < w, "单日标题应放得下：{single:.0} < {w:.0}");
 
-        // 区间形态（每周粒度）：同一个宽度，也要放得下
+        // 区间形态（每周粒度）：同一个宽度，也要放得下。
+        // 锚点落在**上一周**：当前这一周若退化成一天（例如今天是周一），导航行按设计显示单日，
+        // 就没有区间形态可测了；上一周永远是完整的周一到周日。
+        let past = today - chrono::Duration::days(7);
+        app.debug_goto_day(&past.format("%Y%m%d").to_string());
         app.debug_set_granularity(crate::trend::Granularity::Weekly);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let items = frame_texts_pos(&ctx, &mut app, 1260.0, 900.0);
@@ -1645,60 +1688,80 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (cfg, _) = Config::load(&Path::new(&stats).with_file_name("config.toml"));
 
-        // (输出名, 环境变量组合)
         // 点选按键用真实高频键（演示数据里次数最多的三个），出图更直观
-        let top3 = {
+        let top3: Vec<usize> = {
             let store = Store::load(Path::new(&stats));
             let day = store.day(&crate::stats::today_string()).cloned().unwrap_or_default();
             let mut v: Vec<(usize, u64)> = (0..crate::keys::KEYS.len()).map(|i| (i, day.key_count(i))).collect();
             v.sort_by(|a, b| b.1.cmp(&a.1));
-            v.iter().take(3).map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")
+            v.iter().take(3).map(|(i, _)| *i).collect()
         };
-        let shots: Vec<(&str, Vec<(&str, String)>)> = vec![
-            ("shot-heatmap", vec![]),
-            ("shot-expand", vec![("KMCOUNTER_START_PANELS", "both".into())]),
-            ("shot-hour", vec![("KMCOUNTER_HOUR", "3".into())]),
+        type Setup = Box<dyn FnOnce(&mut App)>;
+        let shots: Vec<(&str, Setup)> = vec![
+            ("shot-heatmap", Box::new(|_| {})),
+            ("shot-expand", Box::new(|a: &mut App| a.debug_open_panel())),
+            ("shot-hour", Box::new(|a: &mut App| a.debug_set_hour(Some(3)))),
             (
                 "shot-hour-panel",
-                vec![("KMCOUNTER_START_PANELS".into(), "both".into()), ("KMCOUNTER_HOUR", "3".into())],
+                Box::new(|a: &mut App| {
+                    a.debug_open_panel();
+                    a.debug_set_hour(Some(3));
+                }),
             ),
-            ("shot-hour-today", vec![("KMCOUNTER_HOUR", "3".into()), ("KMCOUNTER_VIEW_IDX", "1".into()), ("KMCOUNTER_START_PANELS", "both".into())]),
-            ("shot-select", vec![("KMCOUNTER_SELECT", top3)]),
-            ("shot-calendar", vec![("KMCOUNTER_CAL", "1".into())]),
-            ("shot-trend", vec![("KMCOUNTER_START_PANELS", "trend".into())]),
-            ("shot-trend-panel", vec![("KMCOUNTER_START_PANELS", "trend,stats".into())]),
-            ("shot-trend-hour", vec![("KMCOUNTER_START_PANELS", "trend".into()), ("KMCOUNTER_GRAN", "hour".into())]),
-            ("shot-rank", vec![("KMCOUNTER_START_PANELS", "rank".into())]),
+            (
+                "shot-hour-today",
+                Box::new(|a: &mut App| {
+                    a.debug_set_hour(Some(3));
+                    a.debug_set_view_idx(1);
+                    a.debug_open_panel();
+                }),
+            ),
+            (
+                "shot-select",
+                Box::new(move |a: &mut App| {
+                    a.debug_set_select(&top3);
+                }),
+            ),
+            ("shot-calendar", Box::new(|a: &mut App| a.debug_open_calendar())),
+            ("shot-trend", Box::new(|a: &mut App| a.debug_set_trend_page())),
+            (
+                "shot-trend-panel",
+                Box::new(|a: &mut App| {
+                    a.debug_set_trend_page();
+                    a.debug_open_panel();
+                }),
+            ),
+            (
+                "shot-trend-hour",
+                Box::new(|a: &mut App| {
+                    a.debug_set_trend_page();
+                    a.debug_set_granularity(crate::trend::Granularity::Hourly);
+                }),
+            ),
+            ("shot-rank", Box::new(|a: &mut App| a.debug_open_rank_page())),
         ];
-        for (name, envs) in shots {
-            for (k, v) in &envs {
-                std::env::set_var(k, v);
-            }
+        for (name, setup) in shots {
             let store = Store::load(Path::new(&stats));
             let out = format!("{dir}/{name}");
             let dir_of_stats = Path::new(&stats).parent().unwrap_or(Path::new("."));
             let width: f32 = std::env::var("KMCOUNTER_SHOT_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1260.0);
-            let made = render(store, cfg.clone(), dir_of_stats, &out, width, 1.25).unwrap();
+            let made = render(store, cfg.clone(), dir_of_stats, &out, width, 1.25, setup).unwrap();
             for s in made {
                 println!("[softshot] {name} → {} ({}x{})", s.ppm.display(), s.w, s.h);
-            }
-            for (k, _) in &envs {
-                std::env::remove_var(k);
             }
         }
 
         // 英文界面（配置文件里 language = "en"）：展示设置里的语言选项
         {
-            std::env::set_var("KMCOUNTER_START_PANELS", "both");
             let mut cfg_en = cfg.clone();
             cfg_en.language = "en".into();
             let store = Store::load(Path::new(&stats));
             let out = format!("{dir}/shot-settings-en");
             let dir_of_stats = Path::new(&stats).parent().unwrap_or(Path::new("."));
-            for s in render(store, cfg_en, dir_of_stats, &out, 1260.0, 1.25).unwrap() {
+            let setup: Setup = Box::new(|a: &mut App| a.debug_open_panel());
+            for s in render(store, cfg_en, dir_of_stats, &out, 1260.0, 1.25, setup).unwrap() {
                 println!("[softshot] settings-en → {} ({}x{})", s.ppm.display(), s.w, s.h);
             }
-            std::env::remove_var("KMCOUNTER_START_PANELS");
         }
     }
 }
