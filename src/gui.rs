@@ -114,6 +114,7 @@ struct RankRow {
 /// 排行：把 [from, to] 区间内（可只看某个钟点）各按键的计数汇总出来。
 /// `only_selected` 为 Some 时只统计其中的布局键（「只看已选按键」）。
 /// 作废的小时按 0 计（与界面其他地方一致）。
+/// 日均按「区间天数」算，与页面上的「N 天 · 合计」同一口径。
 fn rank_rows(
     store: &Store,
     from: NaiveDate,
@@ -127,12 +128,10 @@ fn rank_rows(
     let mut counts: Vec<u64> = vec![0; crate::keys::N_KEYS];
     let mut mouse = [0u64; 5]; // 左/中/右/滚轮/侧键
     let mut other: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut days = 0u32;
 
     let mut d = from;
     while d <= to {
         if let Some(day) = store.days.get(&d.format("%Y%m%d").to_string()) {
-            days += 1;
             // 取整天的桶，或只看某个钟点（作废的小时算 0）
             let unit: Option<&BucketStats> = match hour {
                 None => Some(&day.bucket),
@@ -190,6 +189,9 @@ fn rank_rows(
 
     // 占比与日均（合计含所有被选中的行）
     let total: u64 = rows.iter().map(|r| r.count).sum();
+    // 区间天数（含没有数据的天）：与页面汇总行显示的天数一致，
+    // 否则「1000 天 · 合计 X」配「X/活跃天数」的日均，用户没法从界面反推
+    let days = (to - from).num_days() + 1;
     for r in rows.iter_mut() {
         r.share = if total > 0 { r.count as f64 / total as f64 } else { 0.0 };
         r.per_day = if days > 0 { r.count as f64 / days as f64 } else { 0.0 };
@@ -665,7 +667,7 @@ impl App {
 
     /// 小时选择（全天 / 整点）此刻是否可用：
     /// - 趋势页：只有「每小时」粒度才按小时看，每日/每周/每月/每年都置灰；
-    /// - 排行页：只有「当日」区间用得上钟点筛选，当周/当月/当年/全部都是跨天范围，置灰；
+    /// - 排行页：始终可用（rank_rows 支持跨天按钟点筛选）；
     /// - 热力图页：始终可用（分时就是它的主要视图之一）。
     fn hour_controls_enabled(&self) -> bool {
         match self.page {
@@ -684,9 +686,12 @@ impl App {
         }
     }
 
-    /// 排行页的统计区间：锚定日期（导航行选中的那天）+ 区间长度
+    /// 排行页的统计区间：锚定日期（导航行选中的那天）+ 区间长度。
+    /// 对齐到自然周期后**末尾截到今天**：未来没有数据，不截断会与导航行显示的区间
+    /// （nav_range 同样截断）自相矛盾，汇总行的「N 天」也会把未来算进去。
     fn rank_window(&self) -> (NaiveDate, NaiveDate) {
         let anchor = self.anchor_date();
+        let today = NaiveDate::parse_from_str(&self.snap_today, "%Y%m%d").unwrap_or(anchor);
         let g = match self.rank_range {
             RankRange::Day => Granularity::Daily,
             RankRange::Week => Granularity::Weekly,
@@ -701,12 +706,13 @@ impl App {
                     .next()
                     .and_then(|k| NaiveDate::parse_from_str(k, "%Y%m%d").ok())
                     .unwrap_or(anchor);
-                return (first.min(anchor), anchor);
+                return (first.min(anchor), anchor.min(today));
             }
         };
         // 先对齐到桶的起点再取整桶：当周 = 所在那一周（周一到周日）、当月 = 那个自然月、当年 = 那个自然年。
         // 之前直接用锚点当起点，窗口落到了「锚点 → 未来」，过去的数据全被排除，看上去像是没生效。
-        bucket_range(g.bucket_start(anchor), g)
+        let (f, t) = bucket_range(g.bucket_start(anchor), g);
+        (f, t.min(today).max(f))
     }
 
     /// 翻页（◀ ▶ / 上下键 / 滚轮共用）：
@@ -1215,7 +1221,7 @@ impl App {
                         } else {
                             format!("{} {} {}", s.sel_sum, sum, unit_t)
                         };
-                        let body = format!("{}：{} · {}", s.sel_prefix, parts.join(" · "), sum_text);
+                        let body = format!("{}: {} · {}", s.sel_prefix, parts.join(" · "), sum_text);
                         let text = if head.is_empty() { body } else { format!("{head} · {body}") };
                         ui.label(egui::RichText::new(text).small().color(KEY_COLOR));
                     } else {
@@ -1404,7 +1410,7 @@ impl App {
                         .sense(Sense::click()),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(s.cal_today);
+                .on_hover_text(s.cal_open_hint);
             self.nav_title_rect = title_resp.rect;
             if title_resp.clicked() {
                 self.cal_open = !self.cal_open;
@@ -2449,11 +2455,13 @@ impl App {
 
     /// 分时分布条的位置：F 行右侧、数字键盘区上方那一块空白（正好一个键位高）。
     /// 导航区顶部现在放了 PrtScr / ScrollLock / Pause，所以这块只剩数字键盘上方 4 个单位宽。
+    /// 右边界与键盘矩形对齐（num_x + 4 个单位 - 键间距）：多算一个 h_spacing 会伸出键盘右缘，
+    /// 而点击/悬停只在键盘矩形内生效，最右边一小截就点不到了。
     fn hour_strip_rect(&self, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
         let spacing = self.cfg.layout.key_spacing as f32;
         let nav_x = MAIN_UNITS * u + gap;
         let num_x = nav_x + NAV_UNITS * u + gap;
-        let right = num_x + NUM_UNITS * u + gap - spacing;
+        let right = num_x + NUM_UNITS * u - spacing;
         Rect::from_min_max(
             Pos2::new(rect.left() + num_x, rect.top()),
             Pos2::new(rect.left() + right, rect.top() + pitch - spacing),
@@ -2719,17 +2727,16 @@ impl App {
                                 }
                                 self.cfg = self.edit.clone();
                                 self.apply_language();
-                                // 阈值同步给输入线程（它按这个判定小时是否作废）
-                                {
-                                    let mm = self.shared.screen_w_mm.load(Ordering::Relaxed) as f64;
-                                    let px = self.shared.screen_px_w.load(Ordering::Relaxed) as f64;
-                                    let ppm = if mm > 0.0 && px > 0.0 { 1000.0 * px / mm } else { 0.0 };
-                                    self.shared.store.lock().limits = crate::stats::HourLimits::from_config(&self.cfg, ppm);
-                                }
-                                if self.cfg.screen_w_mm > 0 {
-                                    self.shared.screen_w_mm.store(self.cfg.screen_w_mm, Ordering::Relaxed);
-                                    self.shared.screen_h_mm.store(self.cfg.screen_h_mm, Ordering::Relaxed);
-                                }
+                                // 阈值同步给输入线程（它按这个判定小时是否作废）：
+                                // 先把新屏幕尺寸写回 shared（0 = 恢复自动检测），再用同一套比例换算公里阈值，
+                                // 否则同一次保存里改了屏幕尺寸的话，阈值会按旧尺寸算
+                                let (mm_w, mm_h) = crate::resolve_screen_mm(&self.cfg);
+                                let px_w = crate::resolve_screen_px_w(&self.cfg);
+                                self.shared.screen_w_mm.store(mm_w, Ordering::Relaxed);
+                                self.shared.screen_h_mm.store(mm_h, Ordering::Relaxed);
+                                self.shared.screen_px_w.store(px_w, Ordering::Relaxed);
+                                let ppm = if mm_w > 0 && px_w > 0 { 1000.0 * px_w as f64 / mm_w as f64 } else { 0.0 };
+                                self.shared.store.lock().limits = crate::stats::HourLimits::from_config(&self.cfg, ppm);
                                 self.more_open = false;
                             }
                             if ui.button(s.settings_cancel).clicked() {

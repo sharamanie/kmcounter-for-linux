@@ -1262,18 +1262,22 @@ mod tests {
         app.debug_set_rank(crate::gui::RankRange::Week, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let (f, t) = app.debug_rank_window();
-        assert_eq!(t.weekday().num_days_from_monday(), 6, "当周应到周日为止：{f}~{t}");
-        assert_eq!((t - f).num_days(), 6, "当周应是 7 天：{f}~{t}");
+        assert_eq!(f.weekday().num_days_from_monday(), 0, "当周应从周一开始：{f}~{t}");
+        assert_eq!(t, today, "当周应截到今天（未来没有数据，不能算进区间）：{f}~{t}");
+        assert!((t - f).num_days() <= 6, "当周区间不该超过 7 天：{f}~{t}");
 
         app.debug_set_rank(crate::gui::RankRange::Month, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let (f, t) = app.debug_rank_window();
-        assert_eq!((f.day(), t.day()), (1, 31), "当月应是整个 10 月：{f}~{t}");
+        // 不再断言“整个自然月”（那会把未来几天算进区间，且在不同月份长度不同）
+        assert_eq!((f.month(), f.day()), (today.month(), 1), "当月应从 1 号开始：{f}~{t}");
+        assert_eq!(t, today, "当月应截到今天：{f}~{t}");
 
         app.debug_set_rank(crate::gui::RankRange::Year, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
         drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
         let (f, t) = app.debug_rank_window();
-        assert_eq!((f.month(), f.day(), t.month()), (1, 1, 12), "当年应是整个自然年：{f}~{t}");
+        assert_eq!((f.month(), f.day()), (1, 1), "当年应从 1 月 1 日开始：{f}~{t}");
+        assert_eq!(t, today, "当年应截到今天：{f}~{t}");
 
         // 切到「总计」时区间自动变成全部
         app.debug_set_rank(crate::gui::RankRange::Day, &crate::gui::ALL_SCOPES, crate::gui::RankMetric::Count, true);
@@ -1617,10 +1621,22 @@ mod tests {
         drive(&mut app, &ctx, 1260.0, h, 1, vec![click_at(key_pos, false)]);
         assert_eq!(app.debug_hour_sel(), Some(15), "点击按键不应改变小时选择");
         assert_eq!(app.debug_selected().len(), 1, "点击按键应选中该键");
+
+        // 最右边的 23 时也要点得到：分布条右缘与键盘右缘对齐（多算一个区域间距会伸出键盘矩形，
+        // 而点击只在整个键盘的响应区里生效，最右边一截就点不到了）
+        let twenty_three = Pos2::new(strip.left() + 23.5 * slot, strip.center().y);
+        drive(&mut app, &ctx, 1260.0, h, 1, vec![egui::Event::PointerMoved(twenty_three), click_at(twenty_three, true)]);
+        drive(&mut app, &ctx, 1260.0, h, 1, vec![click_at(twenty_three, false)]);
+        assert_eq!(app.debug_hour_sel(), Some(23), "最右边的 23 时也应能点选");
+        // 再点一次取消，回到全天
+        drive(&mut app, &ctx, 1260.0, h, 1, vec![egui::Event::PointerMoved(twenty_three), click_at(twenty_three, true)]);
+        drive(&mut app, &ctx, 1260.0, h, 1, vec![click_at(twenty_three, false)]);
+        assert_eq!(app.debug_hour_sel(), None);
     }
 
     /// 生成 README 配图（默认 ignore；用 --ignored 跑）
     /// 环境变量：KMCOUNTER_SHOT_STATS 指定演示数据；KMCOUNTER_SHOT_DIR 指定输出目录
+    /// 各种界面状态通过 debug 入口配置（不设进程级环境变量，避免与并行测试互相串）
     #[test]
     #[ignore]
     fn render_readme_shots() {
