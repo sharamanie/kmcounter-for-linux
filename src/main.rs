@@ -6,6 +6,7 @@ mod chart;
 mod config;
 mod controller;
 mod fonts;
+mod fsutil;
 mod gui;
 mod import;
 mod input;
@@ -471,14 +472,16 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
             .name("kmcounter-saver".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(30));
-                if shared.dirty.load(Ordering::Relaxed) {
+                // 先清 dirty 再取快照：清标记与取快照之间到达的输入会包含在快照里，
+                // 快照之后到达的输入会重新置 dirty，等下一轮（不会像“先快照后清标记”那样丢）
+                if shared.dirty.swap(false, Ordering::Relaxed) {
                     let store = (*shared.store.lock()).clone();
                     match store.save(&stats_path) {
-                        Ok(_) => {
-                            shared.dirty.store(false, Ordering::Relaxed);
-                            log::debug!("后台定时保存完成");
+                        Ok(_) => log::debug!("后台定时保存完成"),
+                        Err(e) => {
+                            log::error!("后台保存失败: {e}");
+                            shared.dirty.store(true, Ordering::Relaxed); // 下一轮重试
                         }
-                        Err(e) => log::error!("后台保存失败: {e}"),
                     }
                     let _ = cfg_shared.lock().save(&cfg_path);
                 }

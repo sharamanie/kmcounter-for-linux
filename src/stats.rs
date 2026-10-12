@@ -351,6 +351,7 @@ fn migrate_other_system_keys(b: &mut BucketStats) {
 
 impl Store {
     pub fn load(path: &Path) -> Store {
+        crate::fsutil::clean_stale_tmp(path);
         match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<Store>(&bytes) {
                 Ok(mut s) => {
@@ -382,15 +383,26 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
-        {
+        // 临时名带 pid/序号：GUI、后台 saver、信号处理等多个写入方可能同时保存，
+        // 固定名会互相覆盖、落盘出无法解析的 stats.json（启动时会被当成损坏文件清空）
+        let tmp = crate::fsutil::unique_tmp(path);
+        let written = (|| -> std::io::Result<()> {
             let f = std::fs::File::create(&tmp)?;
             let mut w = std::io::BufWriter::new(f);
             serde_json::to_writer_pretty(&mut w, self)?;
             w.flush()?;
             w.get_ref().sync_all().ok();
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        std::fs::rename(&tmp, path)
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// 获取（或创建）某日数据

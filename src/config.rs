@@ -84,6 +84,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> (Config, bool) {
+        crate::fsutil::clean_stale_tmp(path);
         match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str(&text) {
                 Ok(c) => (c, false),
@@ -119,7 +120,8 @@ impl Config {
 # limit_clicks / limit_keystrokes: 某小时鼠标点击 / 键盘敲击超过该值则作废（0 = 关闭）
 # [layout]: 键盘热力图的尺寸(像素)
 ";
-        std::fs::write(path, format!("{header}{body}"))
+        // 原子写：GUI 与后台 saver 可能同时保存配置，直接截断写会互相覆盖
+        crate::fsutil::atomic_write(path, format!("{header}{body}").as_bytes())
     }
 
     pub fn history_days_clamped(&self) -> u32 {

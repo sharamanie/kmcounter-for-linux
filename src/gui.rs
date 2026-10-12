@@ -854,16 +854,23 @@ impl App {
     }
 
     fn save_all(&mut self) {
+        // 先清 dirty 再取快照：清标记与取快照之间到达的输入会包含在快照里，
+        // 快照之后到达的输入会重新置 dirty（等下一轮保存），不会像“先快照后清标记”那样被漏掉
+        self.shared.dirty.store(false, Ordering::Relaxed);
         let store = (*self.shared.store.lock()).clone();
         let stats_path = self.cfg_path.with_file_name("stats.json");
+        let mut ok = true;
         if let Err(e) = store.save(&stats_path) {
             log::error!("保存统计数据失败: {e}");
+            ok = false;
         }
         let cfg = self.cfg_shared.lock().clone();
         if let Err(e) = cfg.save(&self.cfg_path) {
             log::error!("保存配置失败: {e}");
         }
-        self.shared.dirty.store(false, Ordering::Relaxed);
+        if !ok {
+            self.shared.dirty.store(true, Ordering::Relaxed); // 保存失败：下次重试
+        }
         self.last_save = Instant::now();
     }
 
