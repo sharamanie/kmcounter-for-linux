@@ -1937,6 +1937,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_98_en_layout_save_button_not_clipped() {
+        for w in [1008.0, 1140.0] {
+            let (mut app, ctx) = headless_app(Store::default());
+            app.debug_open_panel();
+            app.debug_set_layout("98");
+            app.debug_set_language("en");
+            drive(&mut app, &ctx, w, 900.0, 3, vec![]);
+            let panel = frame_texts_pos(&ctx, &mut app, w, 900.0);
+            let save_btn = panel.iter().find(|(_, _, _, t)| t.trim() == "Save");
+            assert!(save_btn.is_some(), "宽度 {w} 下应渲染 Save 按钮");
+            let (_, save_x, save_w, _) = save_btn.unwrap();
+            assert!(*save_x + *save_w <= w - 20.0, "宽度 {w} 下 Save 按钮右侧必须留有充足呼吸留白（距离右边框 >= 20px），当前 x+w={}, max={}", *save_x + *save_w, w - 20.0);
+
+            for (y, x, text_w, t) in &panel {
+                if *y > 430.0 && !t.trim().is_empty() {
+                    assert!(*x + *text_w <= w - 16.0, "宽度 {w} 下文本 '{t}' 超出安全留白边界: x={x}, w={text_w}, right={}, max={}", *x + *text_w, w - 16.0);
+                }
+            }
+        }
+    }
+
     /// 生成 README 配图（默认 ignore；用 --ignored 跑）
     /// 环境变量：KMCOUNTER_SHOT_STATS 指定演示数据；KMCOUNTER_SHOT_DIR 指定输出目录
     /// 各种界面状态通过 debug 入口配置（不设进程级环境变量，避免与并行测试互相串）

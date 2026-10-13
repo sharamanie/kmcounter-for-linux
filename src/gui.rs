@@ -1425,15 +1425,16 @@ impl App {
                     let left_w = if panel_area_w >= 1200.0 {
                         (panel_area_w * 0.38 - 4.0).clamp(330.0, 480.0)
                     } else {
-                        (panel_area_w * 0.25).clamp(190.0, 220.0)
+                        (panel_area_w * 0.25).clamp(200.0, 240.0)
                     };
                     geo_log("panel area", Rect::from_min_size(Pos2::ZERO, Vec2::new(panel_area_w, 0.0)));
                     let item_gap = ui.spacing().item_spacing.x;
-                    let right_w = (panel_area_w - left_w - item_gap).max(200.0);
                     ui.horizontal_top(|ui| {
-                        ui.allocate_ui(Vec2::new(left_w, 0.0), |ui| {
+                        let stats_resp = ui.allocate_ui(Vec2::new(left_w, 0.0), |ui| {
                             self.show_stats_list(ui, s);
                         });
+                        let actual_left_w = stats_resp.response.rect.width().max(left_w);
+                        let right_w = (panel_area_w - actual_left_w - item_gap).max(200.0);
                         geo_log("right col alloc", Rect::from_min_size(Pos2::ZERO, Vec2::new(right_w, 0.0)));
                         ui.allocate_ui(Vec2::new(right_w, 0.0), |ui| {
                             self.show_settings_section(ui, s);
@@ -2760,9 +2761,10 @@ impl App {
                 ui.vertical(|ui| {
                 // 宽度写死（min=max）：外框宽度精确等于列宽
                 ui.set_width(inner_w);
+                let grid_spacing_x = if avail_before < 260.0 { 12.0 } else { 16.0 };
                 egui::Grid::new("stats_grid")
                     .num_columns(header.len())
-                    .spacing([20.0, 3.0])
+                    .spacing([grid_spacing_x, 3.0])
                     .show(ui, |ui| {
                         // 表头：与数据行同字号并加粗
                         for (i, h) in header.iter().enumerate() {
@@ -2801,7 +2803,7 @@ impl App {
     fn show_settings_section(&mut self, ui: &mut egui::Ui, s: &'static Strings) {
         let avail_before = ui.available_width();
         let pad = group_pad(ui);
-        let inner_w = (avail_before - pad.x - 6.0).max(200.0);
+        let inner_w = (avail_before - pad.x - 8.0).max(200.0);
         let frame = egui::Frame::group(ui.style())
             .fill(Color32::from_rgb(0xF7, 0xF7, 0xF7))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
@@ -2936,8 +2938,8 @@ impl App {
                 };
 
                 let is_compact_layout = matches!(self.cfg.layout.keyboard_layout.as_str(), "60" | "64" | "68" | "75" | "87");
-                if is_compact_layout || inner_w < 680.0 {
-                    // 紧凑小排列（60 / 64 / 87 配列）：两栏排布，宽敞舒展
+                if is_compact_layout || inner_w < 820.0 {
+                    // 紧凑小排列（60 / 64 / 68 / 75 / 87 配列）或宽度不足时：两栏排布，宽敞舒展
                     ui.columns(2, |cols| {
                         render_history(&mut cols[0]);
                         cols[0].add_space(6.0);
@@ -2952,7 +2954,7 @@ impl App {
                         render_limits(&mut cols[1]);
                     });
                 } else {
-                    // 宽窗口（如 104 配列 1260px）：三栏排布
+                    // 宽窗口（如 104 配列 1260px，或大于 820px 的大窗口）：三栏排布
                     ui.columns(3, |cols| {
                         render_history(&mut cols[0]);
                         cols[0].add_space(6.0);
@@ -2974,9 +2976,9 @@ impl App {
                         if ui.button(s.menu_exit).clicked() {
                             self.exiting = true;
                         }
-                        // 按钮靠右：宽窗口下也在容器右下角，右边缘预留呼吸空隙避免裁切
+                        // 按钮靠右：宽窗口下也在容器右下角，右边缘预留充分呼吸空隙（16px）杜绝裁切
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
+                            ui.add_space(16.0);
                             if ui.button(s.settings_save).clicked() {
                                 let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
                                 {
