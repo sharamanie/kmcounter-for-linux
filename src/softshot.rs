@@ -1127,6 +1127,16 @@ mod tests {
             "悬停 Fn 键时应提示无法捕获硬件按压: {hover_texts:?}"
         );
 
+        // 验证点击 Fn 键：选中提示行应显示「Fn」而非「Menu」
+        drive(&mut app, &ctx, w_64, 500.0, 1, vec![egui::Event::PointerMoved(fn_center), click_at(fn_center, true)]);
+        drive(&mut app, &ctx, w_64, 500.0, 1, vec![click_at(fn_center, false)]);
+        let click_texts = frame_texts(&ctx, &mut app, w_64, 500.0);
+        assert!(click_texts.iter().any(|t| t.contains("Fn") && t.contains(s.sel_prefix)), "点击 Fn 键时提示行应显示 Fn 而非 Menu: {click_texts:?}");
+        assert!(!click_texts.iter().any(|t| t.contains("Menu")), "点击 Fn 键时绝不应显示 Menu: {click_texts:?}");
+        // 再次点击取消选中
+        drive(&mut app, &ctx, w_64, 500.0, 1, vec![egui::Event::PointerMoved(fn_center), click_at(fn_center, true)]);
+        drive(&mut app, &ctx, w_64, 500.0, 1, vec![click_at(fn_center, false)]);
+
         // ④ 展开面板：紧凑配列（860px）下自适应为 2 栏，设置项全部正常渲染无截断
         app.debug_open_panel();
         drive(&mut app, &ctx, w_64, 900.0, 2, vec![]);

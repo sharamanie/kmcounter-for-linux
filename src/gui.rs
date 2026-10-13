@@ -1275,7 +1275,10 @@ impl App {
                         let mut parts: Vec<String> = Vec::new();
                         for &i in &self.selected {
                             let k = &KEYS[i];
-                            let label = if k.label.is_empty() { k.name } else { k.label };
+                            let raw_label = self.active_layout().keys.iter().find(|lk| lk.idx == i)
+                                .and_then(|lk| lk.label_override)
+                                .unwrap_or(k.label);
+                            let label = if raw_label.is_empty() { k.name } else { raw_label };
                             let n = unit.key_count(i);
                             parts.push(if unit_t.is_empty() { format!("{label} {n}") } else { format!("{label} {n} {unit_t}") });
                         }
@@ -2576,7 +2579,7 @@ impl App {
                         let count = day.key_count(i);
                         let raw_label = lk.label_override.unwrap_or(k.label);
                         let label = if raw_label.is_empty() { k.name } else { raw_label };
-                        let is_fn = label == "Fn" || k.name == "Fn";
+                        let is_fn = i == crate::keys::FN_INDEX || label == "Fn" || k.name == "Fn";
                         if is_fn {
                             let text = if count > 0 {
                                 let unit = self.s().unit_times.trim();

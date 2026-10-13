@@ -188,6 +188,8 @@ pub static KEYS: &[KeyDef] = &[
     k("PrtScr", "PrtSc", 311, 99, 0.0, 0.0, 1.0),
     k("ScrollLock", "ScrLk", 70, 70, 1.0, 0.0, 1.0),
     k("Pause", "Pause", 69, 119, 2.0, 0.0, 1.0),
+    // ---- 独立 Fn 键（紧凑配列使用，绝大多数键盘由固件处理，单独按压无扫描码；Linux evdev 键码 464 = KEY_FN）----
+    k("Fn", "Fn", 464, 464, 0.0, 0.0, 1.0),
 ];
 
 /// 布局按键总数
@@ -201,6 +203,10 @@ pub const MAIN_END: usize = 74;
 pub const NAV_END: usize = 84;
 /// 数字键盘区结束（区间 [NAV_END, NUM_END) 为数字键盘区；之后是后补的三个系统键）
 pub const NUM_END: usize = 101;
+/// 导航区顶部的系统键结束位置（PrtScr, ScrollLock, Pause）
+pub const SYS_END: usize = 104;
+/// 独立 Fn 键在 KEYS 里的索引
+pub const FN_INDEX: usize = 104;
 
 /// 统计用的键盘分区（与原版键盘图的划分一致）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,15 +225,15 @@ pub enum Zone {
 pub const ZONES: [Zone; 4] = [Zone::Main, Zone::Function, Zone::Control, Zone::Numpad];
 
 /// 控制键区在 KEYS 里的两段区间：导航区本体 [MAIN_END, NAV_END)，
-/// 以及后补的 PrtScr / ScrollLock / Pause [NUM_END, N_KEYS)（它们按控制键区管理，
+/// 以及后补的 PrtScr / ScrollLock / Pause [NUM_END, SYS_END)（它们按控制键区管理，
 /// 画在导航块顶部一行，统计也计入控制键区）。
-pub const CONTROL_RANGES: [std::ops::Range<usize>; 2] = [MAIN_END..NAV_END, NUM_END..N_KEYS];
+pub const CONTROL_RANGES: [std::ops::Range<usize>; 2] = [MAIN_END..NAV_END, NUM_END..SYS_END];
 
 /// 按键所属分区（绘制分块也以它为准，见 [`block_of`]）
 pub fn zone_of(i: usize) -> Zone {
     if i < FUNC_END {
         Zone::Function
-    } else if i < MAIN_END {
+    } else if i < MAIN_END || i == FN_INDEX {
         Zone::Main
     } else if CONTROL_RANGES.iter().any(|r| r.contains(&i)) {
         Zone::Control
@@ -714,7 +720,7 @@ pub static KEYS_64: &[LayoutKey] = &[
     lkh(68, 2.5, 4.0, 1.25, 1.0, 0), // LAlt
     lkh(69, 3.75, 4.0, 6.25, 1.0, 0), // Space
     lk(70, 10.0, 4.0, 1.0, 0), // RAlt
-    lko(72, 11.0, 4.0, 1.0, 0, "Fn"), // Menu as Fn
+    lk(FN_INDEX, 11.0, 4.0, 1.0, 0), // Fn
     lk(81, 12.0, 4.0, 1.0, 0), // Left
     lk(82, 13.0, 4.0, 1.0, 0), // Down
     lk(83, 14.0, 4.0, 1.0, 0), // Right
@@ -811,7 +817,7 @@ pub static KEYS_75: &[LayoutKey] = &[
     lkh(68, 2.5, 5.0, 1.25, 1.0, 0), // LAlt
     lkh(69, 3.75, 5.0, 6.25, 1.0, 0),// Space
     lk(70, 10.0, 5.0, 1.0, 0),       // RAlt
-    lko(72, 11.0, 5.0, 1.0, 0, "Fn"),// Fn
+    lk(FN_INDEX, 11.0, 5.0, 1.0, 0), // Fn
     lk(73, 12.0, 5.0, 1.0, 0),       // RCtrl
     lk(81, 13.0, 5.0, 1.0, 0),       // Left
     lk(82, 14.0, 5.0, 1.0, 0),       // Down
@@ -891,7 +897,7 @@ pub static KEYS_68: &[LayoutKey] = &[
     lkh(68, 2.5, 4.0, 1.25, 1.0, 0), // LAlt
     lkh(69, 3.75, 4.0, 6.25, 1.0, 0),// Space
     lk(70, 10.0, 4.0, 1.0, 0),       // RAlt
-    lko(72, 11.0, 4.0, 1.0, 0, "Fn"),// Fn
+    lk(FN_INDEX, 11.0, 4.0, 1.0, 0), // Fn
     lk(73, 12.0, 4.0, 1.0, 0),       // RCtrl
     lk(81, 13.0, 4.0, 1.0, 0),       // Left
     lk(82, 14.0, 4.0, 1.0, 0),       // Down
@@ -1001,7 +1007,7 @@ pub static KEYS_98: &[LayoutKey] = &[
     lkh(68, 2.5, 5.0, 1.25, 1.0, 0), // LAlt
     lkh(69, 3.75, 5.0, 6.25, 1.0, 0),// Space
     lk(70, 10.0, 5.0, 1.0, 0),       // RAlt
-    lko(72, 11.0, 5.0, 1.0, 0, "Fn"),// Fn
+    lk(FN_INDEX, 11.0, 5.0, 1.0, 0), // Fn
     lk(73, 12.0, 5.0, 1.0, 0),       // RCtrl
     lk(81, 13.0, 5.0, 1.0, 0),       // Left
     lk(82, 14.0, 5.0, 1.0, 0),       // Down
@@ -1172,10 +1178,12 @@ mod tests {
         let num = &KEYS[NAV_END..NUM_END];
         assert_eq!(num.len(), 17);
         assert!(num.iter().all(|k| k.x <= 3.0 && k.y >= 1.0));
-        // 后补的系统键 [NUM_END,..)：3 个，画在导航块顶部一行（x 0..2、y=0）
-        let sys = &KEYS[NUM_END..];
+        // 后补的系统键 [NUM_END, SYS_END)：3 个，画在导航块顶部一行（x 0..2、y=0）
+        let sys = &KEYS[NUM_END..SYS_END];
         assert_eq!(sys.len(), 3);
         assert!(sys.iter().all(|k| k.y == 0.0 && k.x < NAV_UNITS));
+        // Fn 键
+        assert_eq!(KEYS[FN_INDEX].name, "Fn");
     }
 
     #[test]
@@ -1189,10 +1197,10 @@ mod tests {
             }
         }
         assert!(hits.iter().all(|h| *h == 1), "分区没有恰好覆盖：{hits:?}");
-        // 分区范围：功能键区 13、主键区 61、控制键区 13（含 3 个系统键）、数字键区 17
+        // 分区范围：功能键区 13、主键区 62（含独立 Fn 键）、控制键区 13（含 3 个系统键）、数字键区 17
         let count = |z: Zone| (0..N_KEYS).filter(|i| zone_of(*i) == z).count();
         assert_eq!(count(Zone::Function), 13);
-        assert_eq!(count(Zone::Main), MAIN_END - FUNC_END);
+        assert_eq!(count(Zone::Main), MAIN_END - FUNC_END + 1);
         assert_eq!(count(Zone::Control), (NAV_END - MAIN_END) + 3);
         assert_eq!(count(Zone::Numpad), NUM_END - NAV_END);
         // 系统键归控制键区
@@ -1200,6 +1208,7 @@ mod tests {
             let i = idx_by_name(name).unwrap();
             assert_eq!(zone_of(i), Zone::Control, "{name} 应归控制键区");
         }
+        assert_eq!(zone_of(idx_by_name("Fn").unwrap()), Zone::Main);
         // 抽查：Esc/F12 属功能键区，空格属主键盘区，NumEnter 属数字键区
         assert_eq!(zone_of(idx_by_name("Esc").unwrap()), Zone::Function);
         assert_eq!(zone_of(idx_by_name("F12").unwrap()), Zone::Function);
@@ -1208,7 +1217,7 @@ mod tests {
         // zone_sum 与逐键求和一致
         let counts: Vec<u64> = (0..N_KEYS).map(|i| i as u64).collect();
         let expect: u64 = (MAIN_END..NAV_END).map(|i| i as u64).sum::<u64>()
-            + (NUM_END..N_KEYS).map(|i| i as u64).sum::<u64>();
+            + (NUM_END..SYS_END).map(|i| i as u64).sum::<u64>();
         assert_eq!(zone_sum(Zone::Control, |i| counts[i]), expect);
     }
 
@@ -1219,6 +1228,7 @@ mod tests {
         assert_eq!(block("Esc"), Block::Main);
         assert_eq!(block("F1"), Block::Main);
         assert_eq!(block("Space"), Block::Main);
+        assert_eq!(block("Fn"), Block::Main);
         for n in ["Insert", "Home", "PageUp", "Delete", "End", "PageDown", "Up", "Left", "Down", "Right"] {
             assert_eq!(block(n), Block::Control, "{n} 应在控制块");
         }
