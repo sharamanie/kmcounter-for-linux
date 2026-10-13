@@ -1510,7 +1510,7 @@ impl App {
             });
             if self.page == Page::Heatmap && self.active_layout().hour_strip == HourStripPlacement::NavRow {
                 ui.add_space(8.0);
-                let (strip, resp) = ui.allocate_exact_size(Vec2::new(214.0, 20.0), Sense::click());
+                let (strip, resp) = ui.allocate_exact_size(Vec2::new(260.0, 48.0), Sense::click());
                 self.strip_rect = strip;
                 let entry = self.day_for_view();
                 let prof = entry.hour_profile();
@@ -2045,7 +2045,7 @@ impl App {
             let right_edge = ui.max_rect().right();
             let chart = Rect::from_min_max(
                 Pos2::new((right_edge - 400.0).max(row1.response.rect.right() + 16.0), row1.response.rect.top()),
-                Pos2::new(right_edge, row1.response.rect.top() + 46.0),
+                Pos2::new(right_edge, row1.response.rect.top() + 48.0),
             );
             let entry = self.day_for_view();
             let prof = entry.hour_profile();
@@ -2574,9 +2574,22 @@ impl App {
                     let r = self.key_rect_for(lk, rect, u, pitch, gap);
                     if r.contains(pos) {
                         let count = day.key_count(i);
-                        if count > 0 {
-                            let raw_label = lk.label_override.unwrap_or(k.label);
-                            let label = if raw_label.is_empty() { k.name } else { raw_label };
+                        let raw_label = lk.label_override.unwrap_or(k.label);
+                        let label = if raw_label.is_empty() { k.name } else { raw_label };
+                        let is_fn = label == "Fn" || k.name == "Fn";
+                        if is_fn {
+                            let text = if count > 0 {
+                                let unit = self.s().unit_times.trim();
+                                if unit.is_empty() {
+                                    format!("{label}: {count} · {}", self.s().fn_key_hint)
+                                } else {
+                                    format!("{label}: {count} {unit} · {}", self.s().fn_key_hint)
+                                }
+                            } else {
+                                format!("{label}: {}", self.s().fn_key_hint)
+                            };
+                            paint_tooltip(&painter, ui, pos, &text);
+                        } else if count > 0 {
                             let unit = self.s().unit_times.trim();
                             let text = if unit.is_empty() {
                                 format!("{label}: {count}")
@@ -2974,9 +2987,13 @@ fn paint_hour_lines(
     now_hour: Option<u8>,
     invalid: &[bool],
 ) {
-    let label_h = 10.0;
+    // 浅色卡片底板与细边框
+    painter.rect_filled(area, 4.0, Color32::from_rgb(0xF5, 0xF6, 0xF8));
+    painter.rect_stroke(area, 4.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDC, 0xDF, 0xE5)));
+
+    let label_h = 11.0;
     let plot = Rect::from_min_max(area.min, Pos2::new(area.right(), area.bottom() - label_h));
-    let slot = plot.width() / HOURS as f32;
+    let slot = area.width() / HOURS as f32;
     let colors = [KEY_COLOR, CLICK_COLOR, MOUSE_COLOR];
 
     // 作废的小时按 0 画（与趋势图一致），也不参与量程计算
@@ -2995,22 +3012,22 @@ fn paint_hour_lines(
             maxes[i] = maxes[i].max(v[i]);
         }
     }
-    let x_at = |h: usize| plot.left() + (h as f32 + 0.5) * slot;
-    // 上下各留 2px，避免贴边
+    let x_at = |h: usize| area.left() + (h as f32 + 0.5) * slot;
+    // 上下各留 3px，避免贴边
     let y_at = |v: f64, max: f64| {
         if max <= 0.0 {
-            plot.bottom() - 2.0
+            plot.bottom() - 3.0
         } else {
-            plot.bottom() - 2.0 - (v / max).min(1.0) as f32 * (plot.height() - 4.0)
+            plot.bottom() - 3.0 - (v / max).min(1.0) as f32 * (plot.height() - 6.0)
         }
     };
 
     // 背景：当前小时浅底 / 选中小时强调描边 / 作废小时浅灰条
     for h in 0..HOURS {
-        let x0 = plot.left() + h as f32 * slot;
-        let band = Rect::from_min_size(Pos2::new(x0, area.top()), Vec2::new(slot, area.height()));
+        let x0 = area.left() + h as f32 * slot;
+        let band = Rect::from_min_size(Pos2::new(x0, area.top() + 1.0), Vec2::new(slot, area.height() - 2.0));
         if now_hour == Some(h as u8) {
-            painter.rect_filled(band, 2.0, Color32::from_rgb(0xE4, 0xE4, 0xE4));
+            painter.rect_filled(band, 2.0, Color32::from_rgb(0xE2, 0xE5, 0xED));
         }
         if invalid.get(h).copied().unwrap_or(false) {
             painter.rect_filled(
@@ -3030,9 +3047,9 @@ fn paint_hour_lines(
         let pts: Vec<Pos2> = (0..HOURS)
             .map(|h| Pos2::new(x_at(h), y_at(values(h)[si], max)))
             .collect();
-        painter.add(Shape::line(pts.clone(), egui::Stroke::new(1.4_f32, colors[si])));
+        painter.add(Shape::line(pts.clone(), egui::Stroke::new(1.6_f32, colors[si])));
         for p in &pts {
-            painter.circle_filled(*p, 1.6, colors[si]);
+            painter.circle_filled(*p, 1.8, colors[si]);
         }
     }
 

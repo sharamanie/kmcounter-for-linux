@@ -1104,6 +1104,29 @@ mod tests {
         let s = app.debug_strings();
         assert!(texts_64.iter().any(|t| t == s.mkey_l), "64 配列应渲染鼠标键");
 
+        // 验证 64 配列 Up 键与 RShift 键位置：Up 键应在 x=13.0 与 Down 键对齐，RShift 键在 x=12.0
+        let up_k = crate::keys::layout_profile("64").keys.iter().find(|k| k.idx == 80).expect("64 应有 Up");
+        let shift_k = crate::keys::layout_profile("64").keys.iter().find(|k| k.idx == 65).expect("64 应有 RShift");
+        let down_k = crate::keys::layout_profile("64").keys.iter().find(|k| k.idx == 82).expect("64 应有 Down");
+        assert_eq!(up_k.x, 13.0, "64 配列 Up 键 x 应为 13.0（与 Down 垂直对齐）");
+        assert_eq!(shift_k.x, 12.0, "64 配列 RShift 键 x 应为 12.0");
+        assert_eq!(up_k.x, down_k.x, "64 配列 Up 键应与 Down 键同 x 轴对齐");
+
+        // 验证导航行分时折线图高度：应达到 48px，拥有充足的纵向波形解析度
+        let strip_64 = app.debug_strip_rect();
+        assert_eq!(strip_64.height(), 48.0, "导航行分时折线图高度应为 48px: {strip_64:?}");
+
+        // 验证 Fn 键悬停提示：鼠标指针移至 Fn 键时提示硬件级功能键
+        let items_pos = frame_texts_pos(&ctx, &mut app, w_64, 500.0);
+        let fn_item = items_pos.iter().find(|(_, _, _, t)| t == "Fn").expect("64 界面应有 Fn 标签");
+        let fn_center = Pos2::new(fn_item.1 + fn_item.2 * 0.5, fn_item.0);
+        drive(&mut app, &ctx, w_64, 500.0, 1, vec![egui::Event::PointerMoved(fn_center)]);
+        let hover_texts = frame_texts(&ctx, &mut app, w_64, 500.0);
+        assert!(
+            hover_texts.iter().any(|t| t.contains(s.fn_key_hint)),
+            "悬停 Fn 键时应提示无法捕获硬件按压: {hover_texts:?}"
+        );
+
         // ④ 展开面板：紧凑配列（860px）下自适应为 2 栏，设置项全部正常渲染无截断
         app.debug_open_panel();
         drive(&mut app, &ctx, w_64, 900.0, 2, vec![]);

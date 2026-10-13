@@ -174,6 +174,7 @@ pub struct Strings {
     pub hour_suffix: &'static str,
     pub hour_dist: &'static str,
     pub strip_hint: &'static str,
+    pub fn_key_hint: &'static str,
     /// 鼠标按键（左+右+中+侧）——分布条与趋势图第三条曲线
     pub mouse_clicks: &'static str,
     /// 鼠标五键热力键的短标签（方向键上方那 5 个格子）
@@ -321,6 +322,7 @@ const ZH: Strings = Strings {
     hour_suffix: " 时",
     hour_dist: "每小时分布",
     strip_hint: "（点击只看该小时）",
+    fn_key_hint: "硬件级功能键，系统无法直接检测单独按压",
     mouse_clicks: "鼠标按键",
     mkey_l: "左键",
     mkey_m: "中键",
@@ -465,6 +467,7 @@ const EN: Strings = Strings {
     hour_suffix: ":00",
     hour_dist: "Hourly distribution",
     strip_hint: " (click to filter)",
+    fn_key_hint: "Hardware function key; standalone presses cannot be captured",
     mouse_clicks: "Mouse buttons",
     mkey_l: "LMB",
     mkey_m: "MMB",
