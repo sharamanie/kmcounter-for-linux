@@ -57,8 +57,22 @@ pub struct Config {
     pub autostart: bool,
     /// 首次运行的欢迎横幅是否已显示过
     pub welcome_shown: bool,
-    /// 极简悬浮窗 HUD 模式
+    /// 极简悬浮窗 HUD 模式（旧版兼容标志）
     pub hud_mode: bool,
+    /// 独立 APM 悬浮窗是否显示
+    pub hud_apm_show: bool,
+    /// APM 滑动窗口大小（秒），默认 60
+    pub apm_window_secs: u32,
+    /// 独立 KPS 悬浮窗是否显示
+    pub hud_kps_show: bool,
+    /// KPS 滑动窗口大小（毫秒），默认 1000
+    pub kps_window_ms: u32,
+    /// KPS 监控按键列表（逗号隔开，如 "Z, X, M1, M2"）
+    pub kps_keys: String,
+    /// KPS 悬浮窗是否显示按键累计次数
+    pub kps_show_hits: bool,
+    /// KPS 悬浮窗是否显示 Max 峰值
+    pub kps_show_max: bool,
     /// 鼠标移动距离阈值（公里/小时）：某个小时超过则**该小时整体作废**
     /// （原始数值仍记录在案并打上标记，只是不计入当日/总计；0 = 关闭）
     pub limit_move_km: f64,
@@ -83,6 +97,13 @@ impl Default for Config {
             font_path: String::new(),
             autostart: false,
             hud_mode: false,
+            hud_apm_show: false,
+            apm_window_secs: 60,
+            hud_kps_show: false,
+            kps_window_ms: 1000,
+            kps_keys: "Z, X, M1, M2".into(),
+            kps_show_hits: true,
+            kps_show_max: true,
             limit_move_km: 20.0,
             limit_clicks: 0,
             limit_keystrokes: 0,
@@ -124,6 +145,19 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).unwrap_or_default(),
             Err(_) => Config::default(),
+        }
+    }
+
+    pub fn kps_key_list(&self) -> Vec<String> {
+        let list: Vec<String> = self.kps_keys
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if list.is_empty() {
+            vec!["Z".into(), "X".into(), "M1".into(), "M2".into()]
+        } else {
+            list
         }
     }
 

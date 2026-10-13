@@ -27,6 +27,10 @@ pub struct UiFlags {
     pub show_today: AtomicBool,
     /// 托盘请求切换 HUD 悬浮模式
     pub toggle_hud: AtomicBool,
+    /// 托盘请求切换 APM 悬浮窗
+    pub toggle_apm_hud: AtomicBool,
+    /// 托盘请求切换 KPS 悬浮窗
+    pub toggle_kps_hud: AtomicBool,
 }
 
 pub struct Controller {
@@ -89,10 +93,13 @@ pub fn spawn(ctl: Controller, rx: Receiver<TrayCmd>, ctx: egui::Context, show_re
                         let keep = ctl.cfg.lock().keep_on_top;
                         show_window(&ctl.shared, &ctx, keep);
                     }
-                    TrayCmd::ToggleHud => {
-                        ctl.flags.toggle_hud.store(true, Ordering::Relaxed);
-                        let keep = ctl.cfg.lock().keep_on_top;
-                        show_window(&ctl.shared, &ctx, keep);
+                    TrayCmd::ToggleHud | TrayCmd::ToggleApmHud => {
+                        ctl.flags.toggle_apm_hud.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                    }
+                    TrayCmd::ToggleKpsHud => {
+                        ctl.flags.toggle_kps_hud.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
                     }
                     TrayCmd::ToggleAutostart => {
                         let new_state = {

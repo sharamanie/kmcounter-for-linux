@@ -29,9 +29,19 @@ pub fn spawn_applier(shared: Arc<Shared>) -> Sender<InEvent> {
                 shared.rollover_if_needed();
                 let date = shared.today.lock().clone();
                 let hour = shared.current_hour();
-                let is_action = match &ev {
-                    InEvent::Key(_) | InEvent::KeyOther(_) => true,
-                    InEvent::Mouse(m) => matches!(m, MouseEv::LeftUp | MouseEv::RightUp | MouseEv::MiddleUp | MouseEv::XUp),
+                let (is_action, kps_name) = match &ev {
+                    InEvent::Key(idx) => {
+                        let name = crate::keys::KEYS.get(*idx).map(|k| k.name).unwrap_or("");
+                        (true, Some(name.to_string()))
+                    }
+                    InEvent::KeyOther(id) => (true, Some(id.clone())),
+                    InEvent::Mouse(m) => match m {
+                        MouseEv::LeftUp => (true, Some("M1".into())),
+                        MouseEv::RightUp => (true, Some("M2".into())),
+                        MouseEv::MiddleUp => (true, Some("M3".into())),
+                        MouseEv::XUp => (true, Some("M4".into())),
+                        _ => (false, None),
+                    },
                 };
                 let mut store = shared.store.lock();
                 match ev {
@@ -40,7 +50,10 @@ pub fn spawn_applier(shared: Arc<Shared>) -> Sender<InEvent> {
                     InEvent::Mouse(m) => store.bump_mouse(&date, hour, &m),
                 }
                 if is_action {
-                    let (_, peak) = shared.apm.lock().record(&date);
+                    let apm_w = shared.apm_window_secs.load(std::sync::atomic::Ordering::Relaxed);
+                    let (_, peak) = shared.apm.lock().record(&date, apm_w);
+                    let kps_w = shared.kps_window_ms.load(std::sync::atomic::Ordering::Relaxed);
+                    shared.kps.lock().record(&date, kps_name.as_deref().unwrap_or(""), kps_w);
                     if let Some(day) = store.days.get_mut(&date) {
                         if peak > day.peak_apm {
                             day.peak_apm = peak;

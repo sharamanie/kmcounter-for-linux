@@ -208,29 +208,29 @@ impl ApmTracker {
     }
 
     /// 记录一次动作（击键或鼠标点击），返回 (当前APM, 今日峰值)
-    pub fn record(&mut self, date: &str) -> (u32, u32) {
+    pub fn record(&mut self, date: &str, window_secs: u32) -> (u32, u32) {
         let now = Instant::now();
         self.actions.push_back(now);
-        self.cleanup(now, date);
-        (self.calc_apm(), self.today_peak)
+        self.cleanup(now, date, window_secs);
+        (self.calc_apm(window_secs), self.today_peak)
     }
 
     /// 获取当前实时 APM 与当日峰值
-    pub fn get(&mut self, date: &str) -> (u32, u32) {
+    pub fn get(&mut self, date: &str, window_secs: u32) -> (u32, u32) {
         let now = Instant::now();
-        self.cleanup(now, date);
-        (self.calc_apm(), self.today_peak)
+        self.cleanup(now, date, window_secs);
+        (self.calc_apm(window_secs), self.today_peak)
     }
 
-    /// 清理 5 秒滑动窗口外的过期动作，并维护跨天峰值
-    fn cleanup(&mut self, now: Instant, date: &str) {
+    /// 清理滑动窗口外的过期动作，并维护跨天峰值
+    fn cleanup(&mut self, now: Instant, date: &str, window_secs: u32) {
         if self.peak_date != date {
             self.peak_date = date.to_string();
             self.today_peak = 0;
             self.actions.clear();
             return;
         }
-        let window = std::time::Duration::from_secs(5);
+        let window = std::time::Duration::from_secs(window_secs.max(1) as u64);
         while let Some(&front) = self.actions.front() {
             if now.saturating_duration_since(front) > window {
                 self.actions.pop_front();
@@ -238,25 +238,181 @@ impl ApmTracker {
                 break;
             }
         }
-        let current = self.calc_apm();
+        let current = self.calc_apm(window_secs);
         if current > self.today_peak {
             self.today_peak = current;
         }
     }
 
-    fn calc_apm(&self) -> u32 {
+    fn calc_apm(&self, window_secs: u32) -> u32 {
         let count = self.actions.len();
         if count == 0 {
             0
+        } else if window_secs == 60 {
+            // 60秒自然窗口：点 1 次就是 1 APM，彻底解决“点一次+12”
+            count as u32
+        } else if count <= 1 {
+            // 自定义窗口下，单次敲击直接计 1，不放大
+            count as u32
         } else {
-            // 5 秒滑动窗口：5 秒内的动作数 × 12 换算为每分钟操作数
-            ((count as f64) * 60.0 / 5.0).round() as u32
+            let w = (window_secs.max(1) as f64).max(1.0);
+            ((count as f64) * 60.0 / w).round() as u32
         }
     }
 
     #[allow(dead_code)]
     pub fn peak(&self) -> u32 {
         self.today_peak
+    }
+
+    pub fn reset_peak(&mut self) {
+        self.today_peak = 0;
+    }
+}
+
+/// 监控按键的实时状态
+#[derive(Clone, Debug, Default)]
+pub struct KpsKeyInfo {
+    pub name: String,
+    pub hits: u64,
+    pub is_active: bool,
+}
+
+/// KPS (Keys Per Second / 按键每秒) 跟踪器（参照 osu-kps 与 KeysPerSecond）
+pub struct KpsTracker {
+    actions: VecDeque<Instant>,
+    today_peak: u32,
+    peak_date: String,
+    /// 监控键最近按下的时间戳（用于界面发光点亮反馈）
+    recent_presses: BTreeMap<String, Instant>,
+    /// 监控键累计按压次数
+    key_hits: BTreeMap<String, u64>,
+}
+
+impl KpsTracker {
+    pub fn new(today: &str) -> Self {
+        KpsTracker {
+            actions: VecDeque::new(),
+            today_peak: 0,
+            peak_date: today.to_string(),
+            recent_presses: BTreeMap::new(),
+            key_hits: BTreeMap::new(),
+        }
+    }
+
+    /// 记录一次动作（击键或鼠标），key_id 比如 "Z", "Space", "M1"
+    pub fn record(&mut self, date: &str, key_id: &str, window_ms: u32) -> (u32, u32) {
+        let now = Instant::now();
+        self.actions.push_back(now);
+        let norm = normalize_kps_key(key_id);
+        if !norm.is_empty() {
+            self.recent_presses.insert(norm.clone(), now);
+            *self.key_hits.entry(norm.clone()).or_insert(0) += 1;
+            if norm == "lshift" || norm == "rshift" {
+                self.recent_presses.insert("shift".into(), now);
+                *self.key_hits.entry("shift".into()).or_insert(0) += 1;
+            } else if norm == "lctrl" || norm == "rctrl" {
+                self.recent_presses.insert("ctrl".into(), now);
+                *self.key_hits.entry("ctrl".into()).or_insert(0) += 1;
+            } else if norm == "lalt" || norm == "ralt" {
+                self.recent_presses.insert("alt".into(), now);
+                *self.key_hits.entry("alt".into()).or_insert(0) += 1;
+            }
+        }
+        self.cleanup(now, date, window_ms);
+        (self.calc_kps(window_ms), self.today_peak)
+    }
+
+    /// 获取当前实时 KPS 与今日峰值
+    pub fn get(&mut self, date: &str, window_ms: u32) -> (u32, u32) {
+        let now = Instant::now();
+        self.cleanup(now, date, window_ms);
+        (self.calc_kps(window_ms), self.today_peak)
+    }
+
+    /// 查询监控按键列表的当前状态（名称、命中次数、最近是否按下）
+    pub fn query_keys(&self, keys: &[String]) -> Vec<KpsKeyInfo> {
+        let now = Instant::now();
+        let active_duration = std::time::Duration::from_millis(130);
+        keys.iter().map(|k| {
+            let norm = normalize_kps_key(k);
+            let hits = self.key_hits.get(&norm).copied().unwrap_or(0);
+            let is_active = self.recent_presses.get(&norm)
+                .map(|t| now.saturating_duration_since(*t) < active_duration)
+                .unwrap_or(false);
+            KpsKeyInfo {
+                name: k.trim().to_string(),
+                hits,
+                is_active,
+            }
+        }).collect()
+    }
+
+    fn cleanup(&mut self, now: Instant, date: &str, window_ms: u32) {
+        if self.peak_date != date {
+            self.peak_date = date.to_string();
+            self.today_peak = 0;
+            self.actions.clear();
+            self.key_hits.clear();
+            self.recent_presses.clear();
+            return;
+        }
+        let window = std::time::Duration::from_millis(window_ms.max(100) as u64);
+        while let Some(&front) = self.actions.front() {
+            if now.saturating_duration_since(front) > window {
+                self.actions.pop_front();
+            } else {
+                break;
+            }
+        }
+        let current = self.calc_kps(window_ms);
+        if current > self.today_peak {
+            self.today_peak = current;
+        }
+    }
+
+    fn calc_kps(&self, window_ms: u32) -> u32 {
+        let count = self.actions.len();
+        if count == 0 {
+            0
+        } else if window_ms == 1000 {
+            count as u32
+        } else {
+            let sec = (window_ms.max(100) as f64) / 1000.0;
+            ((count as f64) / sec).round() as u32
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn reset_peak(&mut self) {
+        self.today_peak = 0;
+    }
+
+    #[allow(dead_code)]
+    pub fn reset_hits(&mut self) {
+        self.key_hits.clear();
+    }
+}
+
+pub fn normalize_kps_key(k: &str) -> String {
+    let s = k.trim().to_lowercase();
+    match s.as_str() {
+        "m1" | "mouse1" | "left" | "lbutton" => "m1".into(),
+        "m2" | "mouse2" | "right" | "rbutton" => "m2".into(),
+        "m3" | "mouse3" | "middle" | "mbutton" => "m3".into(),
+        "m4" | "mouse4" | "side" | "xbutton" | "xb1" => "m4".into(),
+        "m5" | "mouse5" | "extra" | "xb2" => "m5".into(),
+        "d0" => "0".into(),
+        "d1" => "1".into(),
+        "d2" => "2".into(),
+        "d3" => "3".into(),
+        "d4" => "4".into(),
+        "d5" => "5".into(),
+        "d6" => "6".into(),
+        "d7" => "7".into(),
+        "d8" => "8".into(),
+        "d9" => "9".into(),
+        _ => s,
     }
 }
 
@@ -616,6 +772,12 @@ pub struct Shared {
     pub dirty: AtomicBool,
     /// 实时手速跟踪器（滑动窗口 + 当日峰值）
     pub apm: Mutex<ApmTracker>,
+    /// KPS 跟踪器（键位实时发光与按键每秒）
+    pub kps: Mutex<KpsTracker>,
+    /// APM 滑动窗口大小（秒），默认 60
+    pub apm_window_secs: AtomicU32,
+    /// KPS 滑动窗口大小（毫秒），默认 1000
+    pub kps_window_ms: AtomicU32,
     /// 主显示器宽度（像素），用于像素→米换算
     pub screen_px_w: AtomicU32,
     /// 主显示器物理宽度（毫米），启动时解析
@@ -637,6 +799,9 @@ impl Shared {
             today: Mutex::new(today.clone()),
             hour: AtomicU32::new(Local::now().hour()),
             apm: Mutex::new(ApmTracker::new(&today, initial_peak)),
+            kps: Mutex::new(KpsTracker::new(&today)),
+            apm_window_secs: AtomicU32::new(60),
+            kps_window_ms: AtomicU32::new(1000),
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
             screen_px_w: AtomicU32::new(0),
@@ -662,7 +827,10 @@ impl Shared {
         let mut t = self.today.lock();
         if *t != date {
             *t = date.clone();
-            self.apm.lock().cleanup(Instant::now(), &date);
+            let apm_w = self.apm_window_secs.load(Ordering::Relaxed);
+            let kps_w = self.kps_window_ms.load(Ordering::Relaxed);
+            self.apm.lock().cleanup(Instant::now(), &date, apm_w);
+            self.kps.lock().cleanup(Instant::now(), &date, kps_w);
             self.dirty.store(true, Ordering::Relaxed);
             true
         } else {
@@ -983,23 +1151,57 @@ mod tests {
     fn apm_tracker_sliding_window_and_peak() {
         let mut tracker = ApmTracker::new("20261013", 0);
         assert_eq!(tracker.peak(), 0);
-        let (apm, peak) = tracker.get("20261013");
+        let (apm, peak) = tracker.get("20261013", 60);
         assert_eq!(apm, 0);
         assert_eq!(peak, 0);
 
+        // 单次操作绝不放大：点 1 次必须是 1 APM
+        tracker.record("20261013", 5);
+        let (apm1, _) = tracker.get("20261013", 5);
+        assert_eq!(apm1, 1, "单次点击绝不能放大为 12");
+
         // 记录 5 次操作（在 5 秒滑动窗口内）
         // 5 次 / 5s = 1 次/s = 60 次/分 (60 APM)
-        for _ in 0..5 {
-            tracker.record("20261013");
+        for _ in 1..5 {
+            tracker.record("20261013", 5);
         }
-        let (apm, peak) = tracker.get("20261013");
+        let (apm, peak) = tracker.get("20261013", 5);
         assert_eq!(apm, 60);
         assert_eq!(peak, 60);
         assert_eq!(tracker.peak(), 60);
 
         // 跨天重置
-        let (apm_next, peak_next) = tracker.get("20261014");
+        let (apm_next, peak_next) = tracker.get("20261014", 5);
         assert_eq!(apm_next, 0);
         assert_eq!(peak_next, 0);
+    }
+
+    #[test]
+    fn kps_tracker_sliding_window_and_hits() {
+        let mut tracker = KpsTracker::new("20261013");
+        let (kps, peak) = tracker.get("20261013", 1000);
+        assert_eq!(kps, 0);
+        assert_eq!(peak, 0);
+
+        tracker.record("20261013", "Z", 1000);
+        tracker.record("20261013", "X", 1000);
+        tracker.record("20261013", "M1", 1000);
+        let (kps, peak) = tracker.get("20261013", 1000);
+        assert_eq!(kps, 3);
+        assert_eq!(peak, 3);
+
+        let query = tracker.query_keys(&["Z".into(), "X".into(), "C".into(), "M1".into(), "M2".into()]);
+        assert_eq!(query.len(), 5);
+        assert_eq!(query[0].name, "Z");
+        assert_eq!(query[0].hits, 1);
+        assert!(query[0].is_active);
+        assert_eq!(query[1].hits, 1);
+        assert!(query[1].is_active);
+        assert_eq!(query[2].hits, 0);
+        assert!(!query[2].is_active);
+        assert_eq!(query[3].hits, 1);
+        assert!(query[3].is_active);
+        assert_eq!(query[4].hits, 0);
+        assert!(!query[4].is_active);
     }
 }

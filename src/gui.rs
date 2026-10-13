@@ -367,10 +367,16 @@ pub struct App {
     wheel_delta_accum: f32,
     /// 是否处于极简悬浮窗（HUD）模式
     pub is_hud: bool,
+    /// 独立 APM 悬浮窗是否显示
+    pub hud_apm_show: bool,
+    /// 独立 KPS 悬浮窗是否显示
+    pub hud_kps_show: bool,
 }
 
 /// 极简悬浮窗 HUD 模式默认尺寸
+#[allow(dead_code)]
 pub const HUD_W: f32 = 390.0;
+#[allow(dead_code)]
 pub const HUD_H: f32 = 36.0;
 
 /// 窗口尺寸管理：底部展开 设置/统计 面板时向下加高窗口（按钮位置保持不动）
@@ -568,6 +574,8 @@ impl App {
             nav_title_rect: Rect::NOTHING,
             wheel_delta_accum: 0.0,
             is_hud: cfg.hud_mode,
+            hud_apm_show: cfg.hud_apm_show || cfg.hud_mode,
+            hud_kps_show: cfg.hud_kps_show,
             start_minimized,
             last_applied_h: BASE_H,
             resize_target: None,
@@ -1070,9 +1078,6 @@ impl App {
 
         // ---- 托盘请求：打开设置（控制线程只置标志，UI 状态在渲染线程改）----
         if self.flags.want_settings.swap(false, Ordering::Relaxed) {
-            if self.is_hud {
-                self.exit_hud(ctx);
-            }
             self.edit = self.cfg.clone();
             self.more_open = true;
         }
@@ -1136,15 +1141,20 @@ impl App {
             )));
         }
 
-        // 托盘等跨线程请求切换 HUD
-        if self.flags.toggle_hud.swap(false, Ordering::Relaxed) {
-            self.toggle_hud(ctx);
+        // 托盘等跨线程请求切换 HUD / APM / KPS
+        if self.flags.toggle_hud.swap(false, Ordering::Relaxed) || self.flags.toggle_apm_hud.swap(false, Ordering::Relaxed) {
+            self.toggle_apm_hud();
+        }
+        if self.flags.toggle_kps_hud.swap(false, Ordering::Relaxed) {
+            self.toggle_kps_hud();
         }
 
-        // HUD 模式：直接跳转 HUD 专用悬浮窗渲染，跳过完整窗口逻辑
-        if self.is_hud {
-            self.show_hud(ctx, s);
-            return;
+        // HUD 独立悬浮窗渲染（多视口，与主程序并存）
+        if self.hud_apm_show {
+            self.show_apm_hud(ctx, s);
+        }
+        if self.hud_kps_show {
+            self.show_kps_hud(ctx, s);
         }
 
         // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
@@ -1301,15 +1311,34 @@ impl App {
                     ui.selectable_value(&mut self.page, Page::Ranking, s.tab_rank);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let kps_btn_text = if self.hud_kps_show {
+                            format!("🎯 {} ✓", s.kps_label)
+                        } else {
+                            format!("🎯 {}", s.kps_label)
+                        };
                         if ui
-                            .button(egui::RichText::new(format!("⤢ {}", s.hud_mode_btn)).small())
-                            .on_hover_text(s.hud_drag_hint)
+                            .button(egui::RichText::new(kps_btn_text).small())
+                            .on_hover_text(s.hud_kps_title)
                             .clicked()
                         {
-                            self.toggle_hud(ctx);
+                            self.toggle_kps_hud();
                         }
 
-                        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today);
+                        let apm_btn_text = if self.hud_apm_show {
+                            format!("⚡ {} ✓", s.hud_mode_btn)
+                        } else {
+                            format!("⚡ {}", s.hud_mode_btn)
+                        };
+                        if ui
+                            .button(egui::RichText::new(apm_btn_text).small())
+                            .on_hover_text(s.hud_apm_title)
+                            .clicked()
+                        {
+                            self.toggle_apm_hud();
+                        }
+
+                        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
+                        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today, apm_w);
                         let apm_color = if cur_apm >= 200 {
                             Color32::from_rgb(0xFF, 0x55, 0x55)
                         } else if cur_apm >= 100 {
@@ -1539,58 +1568,47 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
-    pub fn toggle_hud(&mut self, ctx: &egui::Context) {
-        if self.is_hud {
-            self.exit_hud(ctx);
-        } else {
-            self.enter_hud(ctx);
-        }
+    #[allow(dead_code)]
+    pub fn toggle_hud(&mut self, _ctx: &egui::Context) {
+        self.toggle_apm_hud();
     }
 
-    pub fn enter_hud(&mut self, ctx: &egui::Context) {
-        self.is_hud = true;
-        self.cfg.hud_mode = true;
-        {
-            let mut cfg = self.cfg_shared.lock();
-            cfg.hud_mode = true;
-            let _ = cfg.save(&self.cfg_path);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(HUD_W, HUD_H)));
-        ctx.request_repaint();
+    #[allow(dead_code)]
+    pub fn enter_hud(&mut self, _ctx: &egui::Context) {
+        self.hud_apm_show = true;
+        self.cfg.hud_apm_show = true;
+        let mut cfg = self.cfg_shared.lock();
+        cfg.hud_apm_show = true;
+        let _ = cfg.save(&self.cfg_path);
     }
 
-    pub fn exit_hud(&mut self, ctx: &egui::Context) {
-        self.is_hud = false;
-        self.cfg.hud_mode = false;
-        {
-            let mut cfg = self.cfg_shared.lock();
-            cfg.hud_mode = false;
-            let _ = cfg.save(&self.cfg_path);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-        let level = if self.cfg.keep_on_top {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
-        let restore_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
-        let restore_h = self.base_h + self.panel_extra_h();
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(restore_w, restore_h)));
-        self.resize_target_w = Some(restore_w);
-        self.user_sized = false;
-        self.resize_deadline = Instant::now() + Duration::from_secs(3);
-        self.title_dirty = true;
-        ctx.request_repaint();
+    #[allow(dead_code)]
+    pub fn exit_hud(&mut self, _ctx: &egui::Context) {
+        self.hud_apm_show = false;
+        self.cfg.hud_apm_show = false;
+        let mut cfg = self.cfg_shared.lock();
+        cfg.hud_apm_show = false;
+        let _ = cfg.save(&self.cfg_path);
     }
 
-    fn show_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
-        ctx.request_repaint_after(Duration::from_millis(250));
+    pub fn toggle_apm_hud(&mut self) {
+        self.hud_apm_show = !self.hud_apm_show;
+        self.is_hud = self.hud_apm_show;
+        self.cfg.hud_apm_show = self.hud_apm_show;
+        let mut cfg = self.cfg_shared.lock();
+        cfg.hud_apm_show = self.hud_apm_show;
+        let _ = cfg.save(&self.cfg_path);
+    }
 
+    pub fn toggle_kps_hud(&mut self) {
+        self.hud_kps_show = !self.hud_kps_show;
+        self.cfg.hud_kps_show = self.hud_kps_show;
+        let mut cfg = self.cfg_shared.lock();
+        cfg.hud_kps_show = self.hud_kps_show;
+        let _ = cfg.save(&self.cfg_path);
+    }
+
+    fn show_apm_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
         let (today_keys, today_clicks, today_dist_m) = {
             let store = self.shared.store.lock();
             if let Some(entry) = store.days.get(&self.snap_today) {
@@ -1599,85 +1617,332 @@ impl App {
                 (0, 0, 0.0)
             }
         };
-        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today);
+        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
+        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today, apm_w);
 
-        let bg_fill = Color32::from_rgb(0x18, 0x1A, 0x22);
-        let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0x3B, 0x42, 0x52));
+        let apm_color = if cur_apm >= 200 {
+            Color32::from_rgb(0xFF, 0x55, 0x55)
+        } else if cur_apm >= 100 {
+            Color32::from_rgb(0xF5, 0xA6, 0x23)
+        } else {
+            Color32::from_rgb(0x4E, 0xC9, 0xB0)
+        };
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(bg_fill)
-                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                    .stroke(border_stroke)
-                    .rounding(6.0),
-            )
-            .show(ctx, |ui| {
-                let full_rect = ui.max_rect();
-                let bg_resp = ui.interact(full_rect, ui.id().with("hud_bg"), Sense::click_and_drag());
-                if bg_resp.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if bg_resp.double_clicked() {
-                    self.exit_hud(ctx);
+        let vp_id = egui::ViewportId::from_hash_of("kmc_apm_hud");
+        let mut close_requested = false;
+        let mut open_main_requested = false;
+        let mut open_settings_requested = false;
+        let mut reset_peak_requested = false;
+
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("KMC - APM")
+                .with_inner_size([340.0, 32.0])
+                .with_resizable(false)
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_transparent(true),
+            |hud_ctx, _class| {
+                if hud_ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
                     return;
                 }
-                bg_resp.on_hover_text(s.hud_drag_hint);
+                hud_ctx.request_repaint_after(Duration::from_millis(200));
 
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(7.0, 0.0);
+                let bg_fill = Color32::from_rgba_premultiplied(24, 26, 34, 240);
+                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(59, 66, 82, 220));
 
-                    // 键盘
-                    let k_text = format!("⌨ {}", fmt_thousands(today_keys as f64));
-                    ui.label(egui::RichText::new(k_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                        .on_hover_text(format!("{}: {}", s.keystrokes, today_keys));
-
-                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                    // 鼠标点击
-                    let c_text = format!("🖱 {}", fmt_thousands(today_clicks as f64));
-                    ui.label(egui::RichText::new(c_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                        .on_hover_text(format!("{}: {}", s.mouse_clicks, today_clicks));
-
-                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                    // 移动距离
-                    let d_text = format!("📏 {:.1}{}", today_dist_m, s.unit_m.trim());
-                    ui.label(egui::RichText::new(d_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                        .on_hover_text(format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m));
-
-                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                    // 实时 APM
-                    let apm_color = if cur_apm >= 200 {
-                        Color32::from_rgb(0xFF, 0x55, 0x55)
-                    } else if cur_apm >= 100 {
-                        Color32::from_rgb(0xF5, 0xA6, 0x23)
-                    } else {
-                        Color32::from_rgb(0x4E, 0xC9, 0xB0)
-                    };
-                    let apm_text = format!("⚡ {} APM", cur_apm);
-                    ui.label(egui::RichText::new(apm_text).strong().size(13.0).color(apm_color))
-                        .on_hover_text(format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm));
-
-                    // 靠右放置还原按钮
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(egui::RichText::new("⤢").size(13.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
-                            .on_hover_text(s.hud_expand_btn)
-                            .clicked()
-                        {
-                            self.exit_hud(ctx);
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(bg_fill)
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .stroke(border_stroke)
+                            .rounding(6.0),
+                    )
+                    .show(hud_ctx, |ui| {
+                        let full_rect = ui.max_rect();
+                        let bg_resp = ui.interact(full_rect, ui.id().with("apm_hud_drag"), Sense::click_and_drag());
+                        if bg_resp.drag_started() {
+                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
+                        if bg_resp.double_clicked() {
+                            open_main_requested = true;
+                        }
+                        bg_resp.context_menu(|ui| {
+                            if ui.button(format!("⚙ {}", s.hud_open_settings)).clicked() {
+                                open_settings_requested = true;
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("🗖 {}", s.hud_open_main)).clicked() {
+                                open_main_requested = true;
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("🔄 {}", s.hud_reset_peak)).clicked() {
+                                reset_peak_requested = true;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button(format!("✕ {}", s.hud_close)).clicked() {
+                                close_requested = true;
+                                ui.close_menu();
+                            }
+                        });
+                        bg_resp.on_hover_text(s.hud_drag_hint);
+
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+
+                            // 键盘
+                            let k_text = format!("⌨ {}", fmt_thousands(today_keys as f64));
+                            ui.label(egui::RichText::new(k_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                                .on_hover_text(format!("{}: {}", s.keystrokes, today_keys));
+
+                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                            // 鼠标点击
+                            let c_text = format!("🖱 {}", fmt_thousands(today_clicks as f64));
+                            ui.label(egui::RichText::new(c_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                                .on_hover_text(format!("{}: {}", s.mouse_clicks, today_clicks));
+
+                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                            // 移动距离
+                            let d_text = format!("📏 {}", format_dist_m(today_dist_m));
+                            ui.label(egui::RichText::new(d_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                                .on_hover_text(format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m));
+
+                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                            // 实时 APM
+                            let apm_text = format!("⚡ {} APM", cur_apm);
+                            ui.label(egui::RichText::new(apm_text).strong().size(12.0).color(apm_color))
+                                .on_hover_text(format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm));
+
+                            // 靠右放置还原按钮与关闭按钮
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button(egui::RichText::new("✕").size(11.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
+                                    .on_hover_text(s.hud_close)
+                                    .clicked()
+                                {
+                                    close_requested = true;
+                                }
+                                if ui
+                                    .button(egui::RichText::new("⤢").size(12.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
+                                    .on_hover_text(s.hud_expand_btn)
+                                    .clicked()
+                                {
+                                    open_main_requested = true;
+                                }
+                            });
+                        });
                     });
-                });
-            });
+            },
+        );
+
+        if close_requested {
+            self.toggle_apm_hud();
+        }
+        if open_main_requested {
+            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
+        }
+        if open_settings_requested {
+            self.edit = self.cfg.clone();
+            self.more_open = true;
+            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
+        }
+        if reset_peak_requested {
+            self.shared.apm.lock().reset_peak();
+        }
+    }
+
+    fn show_kps_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
+        let keys_list = self.cfg.kps_key_list();
+        let kps_w = self.shared.kps_window_ms.load(Ordering::Relaxed);
+        let (cur_kps, peak_kps) = self.shared.kps.lock().get(&self.snap_today, kps_w);
+        let key_infos = self.shared.kps.lock().query_keys(&keys_list);
+
+        let n_keys = key_infos.len().max(1);
+        let key_box_w = 34.0;
+        let meter_w = if self.cfg.kps_show_max { 64.0 } else { 50.0 };
+        let total_w = 16.0 + (n_keys as f32) * (key_box_w + 3.0) + meter_w + 24.0;
+
+        let vp_id = egui::ViewportId::from_hash_of("kmc_kps_hud");
+        let mut close_requested = false;
+        let mut open_main_requested = false;
+        let mut open_settings_requested = false;
+        let mut reset_hits_requested = false;
+
+        let kps_color = if cur_kps >= 15 {
+            Color32::from_rgb(0xFF, 0x47, 0x57)
+        } else if cur_kps >= 8 {
+            Color32::from_rgb(0xFF, 0xA5, 0x02)
+        } else {
+            Color32::from_rgb(0x2E, 0xD5, 0x73)
+        };
+
+        let show_hits = self.cfg.kps_show_hits;
+        let show_max = self.cfg.kps_show_max;
+
+        ctx.show_viewport_immediate(
+            vp_id,
+            egui::ViewportBuilder::default()
+                .with_title("KMC - KPS")
+                .with_inner_size([total_w, 36.0])
+                .with_resizable(false)
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_transparent(true),
+            |hud_ctx, _class| {
+                if hud_ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                    return;
+                }
+                hud_ctx.request_repaint_after(Duration::from_millis(40));
+
+                let bg_fill = Color32::from_rgba_premultiplied(16, 18, 24, 240);
+                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(60, 68, 86, 220));
+
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::none()
+                            .fill(bg_fill)
+                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                            .stroke(border_stroke)
+                            .rounding(6.0),
+                    )
+                    .show(hud_ctx, |ui| {
+                        let full_rect = ui.max_rect();
+                        let bg_resp = ui.interact(full_rect, ui.id().with("kps_hud_drag"), Sense::click_and_drag());
+                        if bg_resp.drag_started() {
+                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if bg_resp.double_clicked() {
+                            open_main_requested = true;
+                        }
+                        bg_resp.context_menu(|ui| {
+                            if ui.button(format!("⚙ {}", s.hud_open_settings)).clicked() {
+                                open_settings_requested = true;
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("🗖 {}", s.hud_open_main)).clicked() {
+                                open_main_requested = true;
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("🔄 {}", s.hud_reset_peak)).clicked() {
+                                reset_hits_requested = true;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button(format!("✕ {}", s.hud_close)).clicked() {
+                                close_requested = true;
+                                ui.close_menu();
+                            }
+                        });
+                        bg_resp.on_hover_text(s.hud_drag_hint);
+
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+
+                            // 监控按键格子
+                            for k in &key_infos {
+                                let (box_bg, box_border, text_color) = if k.is_active {
+                                    (
+                                        Color32::from_rgb(0x00, 0xBD, 0xB0), // 激活高亮青绿发光
+                                        egui::Stroke::new(1.5_f32, Color32::WHITE),
+                                        Color32::WHITE,
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgba_premultiplied(35, 38, 48, 220),
+                                        egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(70, 75, 95, 160)),
+                                        Color32::from_rgb(0xD0, 0xD4, 0xDC),
+                                    )
+                                };
+
+                                let (rect, _) = ui.allocate_exact_size(Vec2::new(key_box_w, 28.0), Sense::hover());
+                                ui.painter().rect(rect, 4.0, box_bg, box_border);
+
+                                if show_hits {
+                                    let top_pos = Pos2::new(rect.center().x, rect.min.y + 7.0);
+                                    ui.painter().text(
+                                        top_pos,
+                                        egui::Align2::CENTER_CENTER,
+                                        &k.name,
+                                        egui::FontId::proportional(10.0),
+                                        text_color,
+                                    );
+                                    let bot_pos = Pos2::new(rect.center().x, rect.min.y + 20.0);
+                                    let hit_str = format_compact_num(k.hits);
+                                    ui.painter().text(
+                                        bot_pos,
+                                        egui::Align2::CENTER_CENTER,
+                                        hit_str,
+                                        egui::FontId::proportional(8.5),
+                                        if k.is_active { Color32::WHITE } else { Color32::from_rgb(0x8E, 0x98, 0xA8) },
+                                    );
+                                } else {
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        &k.name,
+                                        egui::FontId::proportional(12.0),
+                                        text_color,
+                                    );
+                                }
+                            }
+
+                            ui.add_space(4.0);
+
+                            // KPS 读数
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(cur_kps.to_string()).size(14.0).strong().color(kps_color));
+                                    ui.label(egui::RichText::new("KPS").size(9.0).color(Color32::from_rgb(0x8E, 0x98, 0xA8)));
+                                });
+                                if show_max {
+                                    ui.label(egui::RichText::new(format!("{}: {}", s.kps_max_label, peak_kps)).size(8.5).color(Color32::from_rgb(0x7A, 0x84, 0x94)));
+                                }
+                            });
+
+                            // 关闭按钮
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button(egui::RichText::new("✕").size(11.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
+                                    .on_hover_text(s.hud_close)
+                                    .clicked()
+                                {
+                                    close_requested = true;
+                                }
+                            });
+                        });
+                    });
+            },
+        );
+
+        if close_requested {
+            self.toggle_kps_hud();
+        }
+        if open_main_requested {
+            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
+        }
+        if open_settings_requested {
+            self.edit = self.cfg.clone();
+            self.more_open = true;
+            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
+        }
+        if reset_hits_requested {
+            self.shared.kps.lock().reset_peak();
+            self.shared.kps.lock().reset_hits();
+        }
     }
 
     #[cfg(any(test, feature = "softshot"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn debug_toggle_hud(&mut self) {
-        self.is_hud = !self.is_hud;
+        self.toggle_apm_hud();
     }
 
     #[cfg(feature = "softshot")]
@@ -1689,7 +1954,8 @@ impl App {
     #[cfg(feature = "softshot")]
     #[allow(dead_code)]
     pub(crate) fn debug_record_apm_action(&mut self, date: &str) {
-        self.shared.apm.lock().record(date);
+        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
+        self.shared.apm.lock().record(date, apm_w);
     }
 
     /// 日期 + 分时导航行（热力图页与趋势页共用，选择状态也是共用的）
@@ -3005,6 +3271,7 @@ impl App {
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
+                ui.set_max_width(inner_w);
                 ui.set_width(inner_w);
                 let label = |ui: &mut egui::Ui, t: &str| {
                     ui.label(egui::RichText::new(t).color(TEXT));
@@ -3043,8 +3310,44 @@ impl App {
                     ui.label(egui::RichText::new(s.settings_window_sub).small().color(TEXT));
                     ui.checkbox(&mut self.edit.keep_on_top, s.settings_keep_on_top);
                     ui.add(egui::Label::new(egui::RichText::new(s.settings_keep_on_top_sub).small().color(TEXT)).wrap());
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut self.edit.hud_mode, s.hud_mode_btn);
+                };
+
+                let mut render_hud = |ui: &mut egui::Ui| {
+                    ui.strong(egui::RichText::new(s.settings_hud_section).size(14.0).color(TEXT))
+                        .on_hover_text(s.settings_hud_section_sub);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.edit.hud_apm_show, s.hud_apm_title);
+                        ui.checkbox(&mut self.edit.hud_kps_show, s.hud_kps_title);
+                    });
+                    ui.horizontal(|ui| {
+                        label(ui, s.settings_apm_window);
+                        ui.add(egui::DragValue::new(&mut self.edit.apm_window_secs).range(5..=300).speed(1.0))
+                            .on_hover_text(s.settings_apm_window_sub);
+                        label(ui, "s");
+                        ui.add_space(4.0);
+                        label(ui, s.settings_kps_window);
+                        ui.add(egui::DragValue::new(&mut self.edit.kps_window_ms).range(200..=5000).speed(50.0))
+                            .on_hover_text(s.settings_kps_window_sub);
+                        label(ui, "ms");
+                    });
+                    ui.horizontal(|ui| {
+                        label(ui, s.settings_kps_keys);
+                        ui.add(egui::TextEdit::singleline(&mut self.edit.kps_keys).desired_width(65.0))
+                            .on_hover_text(s.settings_kps_keys_hint);
+                        if ui.small_button("osu!").on_hover_text(s.kps_preset_osu).clicked() {
+                            self.edit.kps_keys = "Z, X, M1, M2".into();
+                        }
+                        if ui.small_button("4K").on_hover_text(s.kps_preset_4k).clicked() {
+                            self.edit.kps_keys = "D, F, J, K".into();
+                        }
+                        if ui.small_button("FPS").on_hover_text(s.kps_preset_fps).clicked() {
+                            self.edit.kps_keys = "W, A, S, D, Space, M1, M2".into();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.edit.kps_show_hits, s.settings_kps_show_hits);
+                        ui.checkbox(&mut self.edit.kps_show_max, s.settings_kps_show_max);
+                    });
                 };
 
                 let mut render_lang = |ui: &mut egui::Ui| {
@@ -3139,21 +3442,30 @@ impl App {
                 if is_compact_layout || inner_w < 820.0 {
                     // 紧凑小排列（60 / 64 / 68 / 75 / 87 配列）或宽度不足时：两栏排布，宽敞舒展
                     ui.columns(2, |cols| {
+                        let c_w = (inner_w - 12.0) / 2.0;
+                        cols[0].set_max_width(c_w);
+                        cols[1].set_max_width(c_w);
                         render_history(&mut cols[0]);
                         cols[0].add_space(6.0);
                         render_screen(&mut cols[0]);
                         cols[0].add_space(6.0);
                         render_window(&mut cols[0]);
                         cols[0].add_space(6.0);
-                        render_lang(&mut cols[0]);
+                        render_hud(&mut cols[0]);
 
                         render_layout(&mut cols[1]);
                         cols[1].add_space(6.0);
                         render_limits(&mut cols[1]);
+                        cols[1].add_space(6.0);
+                        render_lang(&mut cols[1]);
                     });
                 } else {
                     // 宽窗口（如 104 配列 1260px，或大于 820px 的大窗口）：三栏排布
                     ui.columns(3, |cols| {
+                        let c_w = (inner_w - 24.0) / 3.0;
+                        cols[0].set_max_width(c_w);
+                        cols[1].set_max_width(c_w);
+                        cols[2].set_max_width(c_w);
                         render_history(&mut cols[0]);
                         cols[0].add_space(6.0);
                         render_screen(&mut cols[0]);
@@ -3161,6 +3473,8 @@ impl App {
                         render_lang(&mut cols[0]);
 
                         render_layout(&mut cols[1]);
+                        cols[1].add_space(6.0);
+                        render_hud(&mut cols[1]);
 
                         render_window(&mut cols[2]);
                         cols[2].add_space(6.0);
@@ -3174,26 +3488,29 @@ impl App {
                         if ui.button(s.menu_exit).clicked() {
                             self.exiting = true;
                         }
-                        // 按钮靠右：宽窗口下也在容器右下角，右边缘预留充分呼吸空隙（16px）杜绝裁切
+                        // 按钮靠右：宽窗口下也在容器右下角，右边缘预留充分呼吸空隙（36px）杜绝裁切
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(16.0);
+                            ui.add_space(36.0);
                             if ui.button(s.settings_save).clicked() {
                                 let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
-                                let hud_changed = self.is_hud != self.edit.hud_mode;
+                                let apm_window_changed = self.cfg.apm_window_secs != self.edit.apm_window_secs;
+                                let kps_window_changed = self.cfg.kps_window_ms != self.edit.kps_window_ms;
                                 {
                                     let mut cfg = self.cfg_shared.lock();
                                     *cfg = self.edit.clone();
                                     let _ = cfg.save(&self.cfg_path);
                                 }
                                 self.cfg = self.edit.clone();
+                                self.hud_apm_show = self.cfg.hud_apm_show;
+                                self.hud_kps_show = self.cfg.hud_kps_show;
                                 self.apply_language();
-                                if hud_changed {
-                                    if self.edit.hud_mode {
-                                        self.enter_hud(ui.ctx());
-                                    } else {
-                                        self.exit_hud(ui.ctx());
-                                    }
-                                } else if layout_changed {
+                                if apm_window_changed {
+                                    self.shared.apm_window_secs.store(self.cfg.apm_window_secs, Ordering::Relaxed);
+                                }
+                                if kps_window_changed {
+                                    self.shared.kps_window_ms.store(self.cfg.kps_window_ms, Ordering::Relaxed);
+                                }
+                                if layout_changed {
                                     let new_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
                                     self.resize_target_w = Some(new_w);
                                     self.user_sized = false;
@@ -3707,6 +4024,24 @@ fn fmt_thousands(v: f64) -> String {
         out.insert(0, '-');
     }
     out
+}
+
+fn format_compact_num(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_dist_m(d: f64) -> String {
+    if d >= 1000.0 {
+        format!("{:.1}km", d / 1000.0)
+    } else {
+        format!("{:.1}m", d)
+    }
 }
 
 /// 选中按键的按压次数合计
