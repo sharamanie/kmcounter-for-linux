@@ -1107,50 +1107,40 @@ impl App {
         }
 
         // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
+        let scr_size = ctx.screen_rect().size();
         let (actual_h, actual_w) = ctx.input(|i| {
             let r = i.viewport().inner_rect;
-            (r.map(|r| r.height()), r.map(|r| r.width()))
+            (
+                r.map(|r| r.height()).unwrap_or(scr_size.y),
+                r.map(|r| r.width()).unwrap_or(scr_size.x),
+            )
         });
         // 配列默认宽度：若未手动拉伸且无处理中 resize，自动贴合当前配列宽度（杜绝右侧留白）
         let want_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
         if !self.user_sized && self.resize_target_w.is_none() {
-            if let Some(w) = actual_w {
-                if (w - want_w).abs() > 5.0 {
-                    self.resize_target_w = Some(want_w);
-                    self.resize_deadline = Instant::now() + Duration::from_secs(3);
-                }
+            if (actual_w - want_w).abs() > 4.0 {
+                self.resize_target_w = Some(want_w);
+                self.resize_deadline = Instant::now() + Duration::from_secs(3);
             }
         }
         // 识别用户手动缩放：无待处理 resize 时宽度变了（或收起状态下高度变了）→ 尊重用户手动设定
         if self.resize_target.is_none() && self.resize_target_w.is_none() && !self.user_sized {
-            if let (Some(w), true) = (actual_w, self.last_seen_w > 100.0) {
-                if (w - self.last_seen_w).abs() > 4.0 {
-                    self.user_sized = true;
-                    log::debug!("检测到用户手动调整窗口宽度，停止自动贴合");
-                }
+            if self.last_seen_w > 100.0 && (actual_w - self.last_seen_w).abs() > 4.0 {
+                self.user_sized = true;
+                log::debug!("检测到用户手动调整窗口宽度，停止自动贴合");
             }
-            if !self.more_open {
-                if let (Some(h), true) = (actual_h, self.last_seen_h > 100.0) {
-                    if (h - self.last_seen_h).abs() > 4.0 {
-                        self.user_sized = true;
-                        log::debug!("检测到用户手动调整窗口高度，停止自动贴合");
-                    }
-                }
+            if !self.more_open && self.last_seen_h > 100.0 && (actual_h - self.last_seen_h).abs() > 4.0 {
+                self.user_sized = true;
+                log::debug!("检测到用户手动调整窗口高度，停止自动贴合");
             }
         }
-        if let Some(h) = actual_h {
-            self.last_seen_h = h;
-        }
-        if let Some(w) = actual_w {
-            self.last_seen_w = w;
-        }
+        self.last_seen_h = actual_h;
+        self.last_seen_w = actual_w;
         if self.user_sized {
             // 用户手动定过尺寸：收起时以实际高度为准
             if self.panel_extra_h() <= 0.0 && self.resize_target.is_none() && !self.shared.ui_hidden.load(Ordering::Relaxed) {
-                if let Some(h) = actual_h {
-                    if h > 100.0 {
-                        self.base_h = h;
-                    }
+                if actual_h > 100.0 {
+                    self.base_h = actual_h;
                 }
             }
         } else if self.page == Page::Heatmap && self.content_bottom > 100.0 {
@@ -1172,24 +1162,24 @@ impl App {
         let w_target = self.resize_target_w;
         let h_target = self.resize_target;
         if w_target.is_some() || h_target.is_some() {
-            let (actual_h, cur_w) = ctx.input(|i| {
-                let r = i.viewport().inner_rect;
-                (r.map(|r| r.height()), r.map(|r| r.width()).unwrap_or(BASE_W))
-            });
             let w_done = match w_target {
-                Some(tw) => (cur_w - tw).abs() <= 3.0,
+                Some(tw) => (actual_w - tw).abs() <= 3.0,
                 None => true,
             };
             let h_done = match h_target {
-                Some(th) => actual_h.map_or(false, |h| (h - th).abs() <= 2.0),
+                Some(th) => (actual_h - th).abs() <= 2.0,
                 None => true,
             };
             if (w_done && h_done) || Instant::now() > self.resize_deadline {
                 self.resize_target = None;
                 self.resize_target_w = None;
             } else {
-                let send_w = w_target.unwrap_or(cur_w);
-                let send_h = h_target.or(actual_h).unwrap_or(self.base_h);
+                let send_w = if self.user_sized {
+                    w_target.unwrap_or(actual_w)
+                } else {
+                    w_target.unwrap_or(want_w)
+                };
+                let send_h = h_target.unwrap_or(actual_h);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(send_w, send_h)));
             }
         }
@@ -2875,8 +2865,9 @@ impl App {
                     });
                 };
 
-                if inner_w < 680.0 {
-                    // 紧凑小排列（60 / 64 / 87 配列，窗口宽 860~1000px）：两栏排布，宽敞舒展
+                let is_compact_layout = self.cfg.layout.keyboard_layout != "104";
+                if is_compact_layout || inner_w < 680.0 {
+                    // 紧凑小排列（60 / 64 / 87 配列）：两栏排布，宽敞舒展
                     ui.columns(2, |cols| {
                         render_history_screen_lang(&mut cols[0]);
 

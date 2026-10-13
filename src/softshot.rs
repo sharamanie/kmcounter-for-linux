@@ -1107,11 +1107,15 @@ mod tests {
         // ④ 展开面板：紧凑配列（860px）下自适应为 2 栏，设置项全部正常渲染无截断
         app.debug_open_panel();
         drive(&mut app, &ctx, w_64, 900.0, 2, vec![]);
-        let panel_texts = frame_texts(&ctx, &mut app, w_64, 900.0);
-        assert!(panel_texts.iter().any(|t| t == s.settings_history), "应渲染历史数据");
-        assert!(panel_texts.iter().any(|t| t == s.settings_layout), "应渲染键盘布局");
-        assert!(panel_texts.iter().any(|t| t == s.settings_limits), "应渲染数据校验");
-        assert!(panel_texts.iter().any(|t| t == s.settings_save), "应渲染保存按钮");
+        let panel_items = frame_texts_pos(&ctx, &mut app, w_64, 900.0);
+        let find_x = |label: &str| panel_items.iter().find(|(_, _, _, t)| t == label).map(|(_, x, _, _)| *x);
+        let x_hist = find_x(s.settings_history).expect("应有历史数据");
+        let x_layout = find_x(s.settings_layout).expect("应有键盘布局");
+        let x_limits = find_x(s.settings_limits).expect("应有数据校验");
+        // 紧凑两栏排布：键盘布局与数据校验在第 2 栏（x 相同），历史数据在第 1 栏（x 更小）
+        assert!(x_hist < x_layout - 50.0, "第 1 栏与第 2 栏应错开");
+        assert!((x_layout - x_limits).abs() < 4.0, "键盘布局与数据校验应在同一列（2 栏布局）");
+        assert!(panel_items.iter().any(|(_, _, _, t)| t == s.settings_save), "应渲染保存按钮");
     }
 
     /// 排行页：列出名次、点某一行跳到热力图并选中该键
