@@ -1380,21 +1380,20 @@ impl App {
                 if self.more_open {
                     let before = ui.cursor().min.y;
                     // 左右两栏：统计在左、设置在右，宽度按窗口宽度合理分配
-                    // 宽窗口（>=1200）给统计较多空间；紧凑窗口（<1200）给统计约 240px，保证右侧设置面板有充足宽度
+                    // 宽窗口（>=1200）给统计约 280px；紧凑窗口（<1200）给统计约 210px，保证右侧设置面板有充足空间
                     let left_w = if panel_area_w >= 1200.0 {
                         (panel_area_w * 0.38 - 4.0).clamp(330.0, 480.0)
                     } else {
-                        (panel_area_w * 0.28).clamp(230.0, 290.0)
+                        (panel_area_w * 0.25).clamp(190.0, 220.0)
                     };
-                    let right_w = (panel_area_w - left_w - 8.0).max(360.0);
                     geo_log("panel area", Rect::from_min_size(Pos2::ZERO, Vec2::new(panel_area_w, 0.0)));
-                    geo_log("left col alloc", Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(left_w, 0.0)));
-                    geo_log("right col alloc", Rect::from_min_size(Pos2::new(left_w + 8.0, 0.0), Vec2::new(right_w, 0.0)));
+                    let item_gap = ui.spacing().item_spacing.x;
+                    let right_w = (panel_area_w - left_w - item_gap).max(200.0);
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui(Vec2::new(left_w, 0.0), |ui| {
                             self.show_stats_list(ui, s);
                         });
-                        // 列间距用 item_spacing，不再额外 add_space（否则两列会整体右移）
+                        geo_log("right col alloc", Rect::from_min_size(Pos2::ZERO, Vec2::new(right_w, 0.0)));
                         ui.allocate_ui(Vec2::new(right_w, 0.0), |ui| {
                             self.show_settings_section(ui, s);
                         });
@@ -2697,7 +2696,8 @@ impl App {
         let (header, rows) = self.stats_table(s);
         let dim = Color32::from_rgb(0x99, 0x99, 0x99);
         let avail_before = ui.available_width();
-        let inner_w = (avail_before - group_pad(ui).x).max(240.0);
+        let pad = group_pad(ui);
+        let inner_w = (avail_before - pad.x - 2.0).max(160.0);
         let frame = egui::Frame::group(ui.style())
             .fill(Color32::from_rgb(0xF7, 0xF7, 0xF7))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
@@ -2746,20 +2746,22 @@ impl App {
     /// 设置：底部内嵌展开（与统计列表同一套浅色风格）
     fn show_settings_section(&mut self, ui: &mut egui::Ui, s: &'static Strings) {
         let avail_before = ui.available_width();
-        let inner_w = (avail_before - group_pad(ui).x).max(240.0);
+        let pad = group_pad(ui);
+        let inner_w = (avail_before - pad.x - 2.0).max(200.0);
         let frame = egui::Frame::group(ui.style())
             .fill(Color32::from_rgb(0xF7, 0xF7, 0xF7))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
-                ui.set_max_width(inner_w);
+                ui.set_width(inner_w);
                 let label = |ui: &mut egui::Ui, t: &str| {
                     ui.label(egui::RichText::new(t).color(TEXT));
                 };
 
                 ui.strong(egui::RichText::new(s.settings_title).size(16.0).color(TEXT));
                 ui.add_space(2.0);
-                let mut render_history_screen_lang = |ui: &mut egui::Ui| {
+
+                let mut render_history = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_history).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_history_sub).small().color(TEXT));
                     ui.horizontal(|ui| {
@@ -2767,7 +2769,9 @@ impl App {
                         ui.add(egui::DragValue::new(&mut self.edit.history_days).range(0..=10000).speed(1.0));
                         label(ui, s.settings_days);
                     });
-                    ui.add_space(6.0);
+                };
+
+                let mut render_screen = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_screen).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_screen_sub).small().color(TEXT));
                     egui::Grid::new("screen_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
@@ -2780,8 +2784,16 @@ impl App {
                         label(ui, s.settings_mm);
                         ui.end_row();
                     });
+                };
 
-                    ui.add_space(6.0);
+                let mut render_window = |ui: &mut egui::Ui| {
+                    ui.strong(egui::RichText::new(s.settings_window).size(14.0).color(TEXT));
+                    ui.label(egui::RichText::new(s.settings_window_sub).small().color(TEXT));
+                    ui.checkbox(&mut self.edit.keep_on_top, s.settings_keep_on_top);
+                    ui.add(egui::Label::new(egui::RichText::new(s.settings_keep_on_top_sub).small().color(TEXT)).wrap());
+                };
+
+                let mut render_lang = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_language).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_language_sub).small().color(TEXT));
                     ui.horizontal(|ui| {
@@ -2841,14 +2853,9 @@ impl App {
                     });
                 };
 
-                let mut render_window_limits = |ui: &mut egui::Ui| {
-                    ui.strong(egui::RichText::new(s.settings_window).size(14.0).color(TEXT));
-                    ui.label(egui::RichText::new(s.settings_window_sub).small().color(TEXT));
-                    ui.checkbox(&mut self.edit.keep_on_top, s.settings_keep_on_top);
-
-                    ui.add_space(6.0);
+                let mut render_limits = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_limits).size(14.0).color(TEXT));
-                    ui.label(egui::RichText::new(s.settings_limits_sub).small().color(TEXT));
+                    ui.add(egui::Label::new(egui::RichText::new(s.settings_limits_sub).small().color(TEXT)).wrap());
                     egui::Grid::new("limits_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
                         label(ui, s.settings_limit_move);
                         ui.add(egui::DragValue::new(&mut self.edit.limit_move_km).range(0.0..=100000.0).speed(1.0));
@@ -2869,18 +2876,32 @@ impl App {
                 if is_compact_layout || inner_w < 680.0 {
                     // 紧凑小排列（60 / 64 / 87 配列）：两栏排布，宽敞舒展
                     ui.columns(2, |cols| {
-                        render_history_screen_lang(&mut cols[0]);
+                        render_history(&mut cols[0]);
+                        cols[0].add_space(6.0);
+                        render_screen(&mut cols[0]);
+                        cols[0].add_space(6.0);
+                        render_window(&mut cols[0]);
+                        cols[0].add_space(6.0);
+                        render_lang(&mut cols[0]);
 
                         render_layout(&mut cols[1]);
                         cols[1].add_space(6.0);
-                        render_window_limits(&mut cols[1]);
+                        render_limits(&mut cols[1]);
                     });
                 } else {
                     // 宽窗口（如 104 配列 1260px）：三栏排布
                     ui.columns(3, |cols| {
-                        render_history_screen_lang(&mut cols[0]);
+                        render_history(&mut cols[0]);
+                        cols[0].add_space(6.0);
+                        render_screen(&mut cols[0]);
+                        cols[0].add_space(6.0);
+                        render_lang(&mut cols[0]);
+
                         render_layout(&mut cols[1]);
-                        render_window_limits(&mut cols[2]);
+
+                        render_window(&mut cols[2]);
+                        cols[2].add_space(6.0);
+                        render_limits(&mut cols[2]);
                     });
                 }
 

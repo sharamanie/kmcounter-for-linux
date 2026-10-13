@@ -1116,6 +1116,19 @@ mod tests {
         assert!(x_hist < x_layout - 50.0, "第 1 栏与第 2 栏应错开");
         assert!((x_layout - x_limits).abs() < 4.0, "键盘布局与数据校验应在同一列（2 栏布局）");
         assert!(panel_items.iter().any(|(_, _, _, t)| t == s.settings_save), "应渲染保存按钮");
+
+        // 验证展开面板内的所有文本元素均严格限制在窗口可视边界以内（至少预留 10px 边距），绝不溢出或被裁切
+        for (y, x, w, t) in &panel_items {
+            if *y > 350.0 && !t.trim().is_empty() {
+                assert!(
+                    *x + *w <= w_64 - 10.0,
+                    "文本 '{}' (右边缘 {:.1}) 超出窗口安全边界 ({:.1})",
+                    t,
+                    *x + *w,
+                    w_64 - 10.0
+                );
+            }
+        }
     }
 
     /// 排行页：列出名次、点某一行跳到热力图并选中该键
