@@ -15,11 +15,19 @@ pub struct LayoutCfg {
     pub key_spacing: u32,
     /// 区域水平间距（像素）
     pub h_spacing: u32,
+    /// 键盘配列: "104" | "87" | "60" | "64"
+    pub keyboard_layout: String,
 }
 
 impl Default for LayoutCfg {
     fn default() -> Self {
-        LayoutCfg { key_w: 52, key_h: 45, key_spacing: 2, h_spacing: 10 }
+        LayoutCfg {
+            key_w: 52,
+            key_h: 45,
+            key_spacing: 2,
+            h_spacing: 10,
+            keyboard_layout: "104".into(),
+        }
     }
 }
 
