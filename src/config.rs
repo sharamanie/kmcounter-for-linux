@@ -15,7 +15,7 @@ pub struct LayoutCfg {
     pub key_spacing: u32,
     /// 区域水平间距（像素）
     pub h_spacing: u32,
-    /// 键盘配列: "104" | "87" | "60" | "64"
+    /// 键盘配列: "104" | "98" | "87" | "75" | "68" | "64" | "60"
     pub keyboard_layout: String,
 }
 

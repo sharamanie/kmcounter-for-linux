@@ -374,7 +374,9 @@ pub fn default_width_for_layout(layout_id: &str, cfg: &crate::config::LayoutCfg)
     let prof = layout_profile(layout_id);
     match prof.id {
         "104" => BASE_W,
+        "98" => 1140.0,
         "87" => 990.0,
+        "75" | "68" => 940.0,
         "60" | "64" => 860.0,
         _ => {
             let u = (cfg.key_w + cfg.key_spacing) as f32;
@@ -2817,9 +2819,12 @@ impl App {
                         label(ui, s.settings_keyboard_profile);
                         let cur_layout = self.edit.layout.keyboard_layout.as_str();
                         let cur_text = match cur_layout {
+                            "98" => s.layout_98,
                             "87" => s.layout_87,
-                            "60" => s.layout_60,
+                            "75" => s.layout_75,
+                            "68" => s.layout_68,
                             "64" => s.layout_64,
+                            "60" => s.layout_60,
                             _ => s.layout_104,
                         };
                         egui::ComboBox::from_id_salt("keyboard_profile_combo")
@@ -2827,9 +2832,12 @@ impl App {
                             .width(80.0)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "104".to_string(), s.layout_104);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "98".to_string(), s.layout_98);
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "87".to_string(), s.layout_87);
-                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "60".to_string(), s.layout_60);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "75".to_string(), s.layout_75);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "68".to_string(), s.layout_68);
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "64".to_string(), s.layout_64);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "60".to_string(), s.layout_60);
                             });
                     });
                     ui.add_space(2.0);
@@ -2872,7 +2880,7 @@ impl App {
                     });
                 };
 
-                let is_compact_layout = self.cfg.layout.keyboard_layout != "104";
+                let is_compact_layout = matches!(self.cfg.layout.keyboard_layout.as_str(), "60" | "64" | "68" | "75" | "87");
                 if is_compact_layout || inner_w < 680.0 {
                     // 紧凑小排列（60 / 64 / 87 配列）：两栏排布，宽敞舒展
                     ui.columns(2, |cols| {

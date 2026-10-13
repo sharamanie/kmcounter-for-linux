@@ -1129,6 +1129,77 @@ mod tests {
                 );
             }
         }
+
+        // ⑤ 98 键（紧凑全键）
+        app.debug_set_layout("98");
+        let w_98 = crate::gui::default_width_for_layout("98", &cfg.layout);
+        assert_eq!(w_98, 1140.0);
+        drive(&mut app, &ctx, w_98, 500.0, 2, vec![]);
+        let strip_98 = app.debug_strip_rect();
+        assert!(strip_98.top() < 100.0, "98 配列分时条应在顶部导航行: {strip_98:?}");
+        let texts_98 = frame_texts(&ctx, &mut app, w_98, 500.0);
+        assert!(texts_98.iter().any(|t| t == "NumLock"), "98 配列应渲染 NumLock 标签");
+        assert!(texts_98.iter().any(|t| t == "Fn"), "98 配列应渲染 Fn 标签");
+        // 98 键宽窗口（1140px）：展开面板应维持 3 栏排布
+        drive(&mut app, &ctx, w_98, 900.0, 2, vec![]);
+        let panel_98 = frame_texts_pos(&ctx, &mut app, w_98, 900.0);
+        let find_x_98 = |label: &str| panel_98.iter().find(|(_, _, _, t)| t == label).map(|(_, x, _, _)| *x);
+        let x_hist_98 = find_x_98(s.settings_history).expect("98 展开应有历史数据");
+        let x_layout_98 = find_x_98(s.settings_layout).expect("98 展开应有键盘布局");
+        let x_limits_98 = find_x_98(s.settings_limits).expect("98 展开应有数据校验");
+        assert!(x_hist_98 < x_layout_98 - 50.0, "98 配列历史数据与键盘布局应分栏");
+        assert!(x_layout_98 < x_limits_98 - 50.0, "98 配列宽窗口下应呈三栏排布");
+        for (y, x, w, t) in &panel_98 {
+            if *y > 350.0 && !t.trim().is_empty() {
+                assert!(*x + *w <= w_98 - 10.0, "98 文本 '{}' 超出窗口安全边界", t);
+            }
+        }
+
+        // ⑥ 75% 配列（84 键）
+        app.debug_set_layout("75");
+        let w_75 = crate::gui::default_width_for_layout("75", &cfg.layout);
+        assert_eq!(w_75, 940.0);
+        drive(&mut app, &ctx, w_75, 500.0, 2, vec![]);
+        let strip_75 = app.debug_strip_rect();
+        assert!(strip_75.top() < 100.0, "75 配列分时条应在顶部导航行: {strip_75:?}");
+        let texts_75 = frame_texts(&ctx, &mut app, w_75, 500.0);
+        assert!(texts_75.iter().any(|t| t == "F1"), "75 配列应渲染 F1 标签");
+        assert!(texts_75.iter().any(|t| t == "Delete"), "75 配列应渲染 Delete 标签");
+        // 75 键紧凑窗口（940px）：展开面板应自适应为 2 栏排布
+        drive(&mut app, &ctx, w_75, 900.0, 2, vec![]);
+        let panel_75 = frame_texts_pos(&ctx, &mut app, w_75, 900.0);
+        let find_x_75 = |label: &str| panel_75.iter().find(|(_, _, _, t)| t == label).map(|(_, x, _, _)| *x);
+        let x_layout_75 = find_x_75(s.settings_layout).expect("75 展开应有键盘布局");
+        let x_limits_75 = find_x_75(s.settings_limits).expect("75 展开应有数据校验");
+        assert!((x_layout_75 - x_limits_75).abs() < 4.0, "75 配列应为两栏布局");
+        for (y, x, w, t) in &panel_75 {
+            if *y > 350.0 && !t.trim().is_empty() {
+                assert!(*x + *w <= w_75 - 10.0, "75 文本 '{}' 超出窗口安全边界", t);
+            }
+        }
+
+        // ⑦ 68 键（65% 配列）
+        app.debug_set_layout("68");
+        let w_68 = crate::gui::default_width_for_layout("68", &cfg.layout);
+        assert_eq!(w_68, 940.0);
+        drive(&mut app, &ctx, w_68, 500.0, 2, vec![]);
+        let strip_68 = app.debug_strip_rect();
+        assert!(strip_68.top() < 100.0, "68 配列分时条应在顶部导航行: {strip_68:?}");
+        let texts_68 = frame_texts(&ctx, &mut app, w_68, 500.0);
+        assert!(texts_68.iter().any(|t| t == "PageUp"), "68 配列应渲染 PageUp 标签");
+        assert!(texts_68.iter().any(|t| t == "PageDown"), "68 配列应渲染 PageDown 标签");
+        // 68 键紧凑窗口（940px）：展开面板应自适应为 2 栏排布
+        drive(&mut app, &ctx, w_68, 900.0, 2, vec![]);
+        let panel_68 = frame_texts_pos(&ctx, &mut app, w_68, 900.0);
+        let find_x_68 = |label: &str| panel_68.iter().find(|(_, _, _, t)| t == label).map(|(_, x, _, _)| *x);
+        let x_layout_68 = find_x_68(s.settings_layout).expect("68 展开应有键盘布局");
+        let x_limits_68 = find_x_68(s.settings_limits).expect("68 展开应有数据校验");
+        assert!((x_layout_68 - x_limits_68).abs() < 4.0, "68 配列应为两栏布局");
+        for (y, x, w, t) in &panel_68 {
+            if *y > 350.0 && !t.trim().is_empty() {
+                assert!(*x + *w <= w_68 - 10.0, "68 文本 '{}' 超出窗口安全边界", t);
+            }
+        }
     }
 
     /// 排行页：列出名次、点某一行跳到热力图并选中该键

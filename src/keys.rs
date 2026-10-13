@@ -368,6 +368,30 @@ const MOUSE_POS_SIDE: [MouseKeyPos; 5] = [
     MouseKeyPos { x: 15.0, y: 4.0, gap_count: 1 },
 ];
 
+const MOUSE_POS_SIDE_16: [MouseKeyPos; 5] = [
+    MouseKeyPos { x: 16.0, y: 0.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 1.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 2.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 3.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 4.0, gap_count: 1 },
+];
+
+const MOUSE_POS_SIDE_75: [MouseKeyPos; 5] = [
+    MouseKeyPos { x: 16.0, y: 1.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 2.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 3.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 4.0, gap_count: 1 },
+    MouseKeyPos { x: 16.0, y: 5.0, gap_count: 1 },
+];
+
+const MOUSE_POS_SIDE_98: [MouseKeyPos; 5] = [
+    MouseKeyPos { x: 19.25, y: 1.0, gap_count: 1 },
+    MouseKeyPos { x: 19.25, y: 2.0, gap_count: 1 },
+    MouseKeyPos { x: 19.25, y: 3.0, gap_count: 1 },
+    MouseKeyPos { x: 19.25, y: 4.0, gap_count: 1 },
+    MouseKeyPos { x: 19.25, y: 5.0, gap_count: 1 },
+];
+
 pub static KEYS_104: &[LayoutKey] = &[
     lk(0, 0.0, 0.0, 1.0, 0), // Esc
     lk(1, 1.6667, 0.0, 1.0, 0), // F1
@@ -696,6 +720,296 @@ pub static KEYS_64: &[LayoutKey] = &[
     lk(83, 14.0, 4.0, 1.0, 0), // Right
 ];
 
+pub static KEYS_75: &[LayoutKey] = &[
+    // ---- Row 0: Esc + F1~F12 + PrtSc + Pause + Delete (16u) ----
+    lk(0, 0.0, 0.0, 1.0, 0),         // Esc
+    lk(1, 1.0, 0.0, 1.0, 0),         // F1
+    lk(2, 2.0, 0.0, 1.0, 0),         // F2
+    lk(3, 3.0, 0.0, 1.0, 0),         // F3
+    lk(4, 4.0, 0.0, 1.0, 0),         // F4
+    lk(5, 5.0, 0.0, 1.0, 0),         // F5
+    lk(6, 6.0, 0.0, 1.0, 0),         // F6
+    lk(7, 7.0, 0.0, 1.0, 0),         // F7
+    lk(8, 8.0, 0.0, 1.0, 0),         // F8
+    lk(9, 9.0, 0.0, 1.0, 0),         // F9
+    lk(10, 10.0, 0.0, 1.0, 0),       // F10
+    lk(11, 11.0, 0.0, 1.0, 0),       // F11
+    lk(12, 12.0, 0.0, 1.0, 0),       // F12
+    lk(101, 13.0, 0.0, 1.0, 0),      // PrtSc
+    lk(103, 14.0, 0.0, 1.0, 0),      // Pause
+    lk(77, 15.0, 0.0, 1.0, 0),       // Delete
+
+    // ---- Row 1: Backquote + 1~0, -, = + Backspace + Home (16u) ----
+    lk(13, 0.0, 1.0, 1.0, 0),        // Backquote
+    lk(14, 1.0, 1.0, 1.0, 0),        // 1
+    lk(15, 2.0, 1.0, 1.0, 0),        // 2
+    lk(16, 3.0, 1.0, 1.0, 0),        // 3
+    lk(17, 4.0, 1.0, 1.0, 0),        // 4
+    lk(18, 5.0, 1.0, 1.0, 0),        // 5
+    lk(19, 6.0, 1.0, 1.0, 0),        // 6
+    lk(20, 7.0, 1.0, 1.0, 0),        // 7
+    lk(21, 8.0, 1.0, 1.0, 0),        // 8
+    lk(22, 9.0, 1.0, 1.0, 0),        // 9
+    lk(23, 10.0, 1.0, 1.0, 0),       // 0
+    lk(24, 11.0, 1.0, 1.0, 0),       // Minus
+    lk(25, 12.0, 1.0, 1.0, 0),       // Equal
+    lk(26, 13.0, 1.0, 2.0, 0),       // Backspace
+    lk(75, 15.0, 1.0, 1.0, 0),       // Home
+
+    // ---- Row 2: Tab + Q~P, [, ], Backslash + PageUp (16u) ----
+    lkh(27, 0.0, 2.0, 1.5, 1.0, 0),  // Tab
+    lk(28, 1.5, 2.0, 1.0, 0),        // Q
+    lk(29, 2.5, 2.0, 1.0, 0),        // W
+    lk(30, 3.5, 2.0, 1.0, 0),        // E
+    lk(31, 4.5, 2.0, 1.0, 0),        // R
+    lk(32, 5.5, 2.0, 1.0, 0),        // T
+    lk(33, 6.5, 2.0, 1.0, 0),        // Y
+    lk(34, 7.5, 2.0, 1.0, 0),        // U
+    lk(35, 8.5, 2.0, 1.0, 0),        // I
+    lk(36, 9.5, 2.0, 1.0, 0),        // O
+    lk(37, 10.5, 2.0, 1.0, 0),       // P
+    lk(38, 11.5, 2.0, 1.0, 0),       // [
+    lk(39, 12.5, 2.0, 1.0, 0),       // ]
+    lkh(40, 13.5, 2.0, 1.5, 1.0, 0), // Backslash
+    lk(76, 15.0, 2.0, 1.0, 0),       // PageUp
+
+    // ---- Row 3: CapsLock + A~', Enter + PageDown (16u) ----
+    lkh(41, 0.0, 3.0, 1.75, 1.0, 0), // CapsLock
+    lk(42, 1.75, 3.0, 1.0, 0),       // A
+    lk(43, 2.75, 3.0, 1.0, 0),       // S
+    lk(44, 3.75, 3.0, 1.0, 0),       // D
+    lk(45, 4.75, 3.0, 1.0, 0),       // F
+    lk(46, 5.75, 3.0, 1.0, 0),       // G
+    lk(47, 6.75, 3.0, 1.0, 0),       // H
+    lk(48, 7.75, 3.0, 1.0, 0),       // J
+    lk(49, 8.75, 3.0, 1.0, 0),       // K
+    lk(50, 9.75, 3.0, 1.0, 0),       // L
+    lk(51, 10.75, 3.0, 1.0, 0),      // Semicolon
+    lk(52, 11.75, 3.0, 1.0, 0),      // Quote
+    lkh(53, 12.75, 3.0, 2.25, 1.0, 0), // Enter
+    lk(79, 15.0, 3.0, 1.0, 0),       // PageDown
+
+    // ---- Row 4: LShift + Z~/, RShift + Up + End (16u) ----
+    lkh(54, 0.0, 4.0, 2.25, 1.0, 0), // LShift
+    lk(55, 2.25, 4.0, 1.0, 0),       // Z
+    lk(56, 3.25, 4.0, 1.0, 0),       // X
+    lk(57, 4.25, 4.0, 1.0, 0),       // C
+    lk(58, 5.25, 4.0, 1.0, 0),       // V
+    lk(59, 6.25, 4.0, 1.0, 0),       // B
+    lk(60, 7.25, 4.0, 1.0, 0),       // N
+    lk(61, 8.25, 4.0, 1.0, 0),       // M
+    lk(62, 9.25, 4.0, 1.0, 0),       // Comma
+    lk(63, 10.25, 4.0, 1.0, 0),      // Period
+    lk(64, 11.25, 4.0, 1.0, 0),      // Slash
+    lkh(65, 12.25, 4.0, 1.75, 1.0, 0), // RShift
+    lk(80, 14.0, 4.0, 1.0, 0),       // Up
+    lk(78, 15.0, 4.0, 1.0, 0),       // End
+
+    // ---- Row 5: LCtrl, LWin, LAlt, Space, RAlt, Fn, RCtrl, Left, Down, Right (16u) ----
+    lkh(66, 0.0, 5.0, 1.25, 1.0, 0), // LCtrl
+    lkh(67, 1.25, 5.0, 1.25, 1.0, 0),// LWin
+    lkh(68, 2.5, 5.0, 1.25, 1.0, 0), // LAlt
+    lkh(69, 3.75, 5.0, 6.25, 1.0, 0),// Space
+    lk(70, 10.0, 5.0, 1.0, 0),       // RAlt
+    lko(72, 11.0, 5.0, 1.0, 0, "Fn"),// Fn
+    lk(73, 12.0, 5.0, 1.0, 0),       // RCtrl
+    lk(81, 13.0, 5.0, 1.0, 0),       // Left
+    lk(82, 14.0, 5.0, 1.0, 0),       // Down
+    lk(83, 15.0, 5.0, 1.0, 0),       // Right
+];
+
+pub static KEYS_68: &[LayoutKey] = &[
+    // ---- Row 0: Esc + 1~0, -, = + Backspace + Delete (16u) ----
+    lko(0, 0.0, 0.0, 1.0, 0, "Esc"), // Esc
+    lk(14, 1.0, 0.0, 1.0, 0),        // 1
+    lk(15, 2.0, 0.0, 1.0, 0),        // 2
+    lk(16, 3.0, 0.0, 1.0, 0),        // 3
+    lk(17, 4.0, 0.0, 1.0, 0),        // 4
+    lk(18, 5.0, 0.0, 1.0, 0),        // 5
+    lk(19, 6.0, 0.0, 1.0, 0),        // 6
+    lk(20, 7.0, 0.0, 1.0, 0),        // 7
+    lk(21, 8.0, 0.0, 1.0, 0),        // 8
+    lk(22, 9.0, 0.0, 1.0, 0),        // 9
+    lk(23, 10.0, 0.0, 1.0, 0),       // 0
+    lk(24, 11.0, 0.0, 1.0, 0),       // Minus
+    lk(25, 12.0, 0.0, 1.0, 0),       // Equal
+    lk(26, 13.0, 0.0, 2.0, 0),       // Backspace
+    lk(77, 15.0, 0.0, 1.0, 0),       // Delete
+
+    // ---- Row 1: Tab + Q~P, [, ], Backslash + PageUp (16u) ----
+    lkh(27, 0.0, 1.0, 1.5, 1.0, 0),  // Tab
+    lk(28, 1.5, 1.0, 1.0, 0),        // Q
+    lk(29, 2.5, 1.0, 1.0, 0),        // W
+    lk(30, 3.5, 1.0, 1.0, 0),        // E
+    lk(31, 4.5, 1.0, 1.0, 0),        // R
+    lk(32, 5.5, 1.0, 1.0, 0),        // T
+    lk(33, 6.5, 1.0, 1.0, 0),        // Y
+    lk(34, 7.5, 1.0, 1.0, 0),        // U
+    lk(35, 8.5, 1.0, 1.0, 0),        // I
+    lk(36, 9.5, 1.0, 1.0, 0),        // O
+    lk(37, 10.5, 1.0, 1.0, 0),       // P
+    lk(38, 11.5, 1.0, 1.0, 0),       // [
+    lk(39, 12.5, 1.0, 1.0, 0),       // ]
+    lkh(40, 13.5, 1.0, 1.5, 1.0, 0), // Backslash
+    lk(76, 15.0, 1.0, 1.0, 0),       // PageUp
+
+    // ---- Row 2: CapsLock + A~', Enter + PageDown (16u) ----
+    lkh(41, 0.0, 2.0, 1.75, 1.0, 0), // CapsLock
+    lk(42, 1.75, 2.0, 1.0, 0),       // A
+    lk(43, 2.75, 2.0, 1.0, 0),       // S
+    lk(44, 3.75, 2.0, 1.0, 0),       // D
+    lk(45, 4.75, 2.0, 1.0, 0),       // F
+    lk(46, 5.75, 2.0, 1.0, 0),       // G
+    lk(47, 6.75, 2.0, 1.0, 0),       // H
+    lk(48, 7.75, 2.0, 1.0, 0),       // J
+    lk(49, 8.75, 2.0, 1.0, 0),       // K
+    lk(50, 9.75, 2.0, 1.0, 0),       // L
+    lk(51, 10.75, 2.0, 1.0, 0),      // Semicolon
+    lk(52, 11.75, 2.0, 1.0, 0),      // Quote
+    lkh(53, 12.75, 2.0, 2.25, 1.0, 0), // Enter
+    lk(79, 15.0, 2.0, 1.0, 0),       // PageDown
+
+    // ---- Row 3: LShift + Z~/, RShift + Up + End (16u) ----
+    lkh(54, 0.0, 3.0, 2.25, 1.0, 0), // LShift
+    lk(55, 2.25, 3.0, 1.0, 0),       // Z
+    lk(56, 3.25, 3.0, 1.0, 0),       // X
+    lk(57, 4.25, 3.0, 1.0, 0),       // C
+    lk(58, 5.25, 3.0, 1.0, 0),       // V
+    lk(59, 6.25, 3.0, 1.0, 0),       // B
+    lk(60, 7.25, 3.0, 1.0, 0),       // N
+    lk(61, 8.25, 3.0, 1.0, 0),       // M
+    lk(62, 9.25, 3.0, 1.0, 0),       // Comma
+    lk(63, 10.25, 3.0, 1.0, 0),      // Period
+    lk(64, 11.25, 3.0, 1.0, 0),      // Slash
+    lkh(65, 12.25, 3.0, 1.75, 1.0, 0), // RShift
+    lk(80, 14.0, 3.0, 1.0, 0),       // Up
+    lk(78, 15.0, 3.0, 1.0, 0),       // End
+
+    // ---- Row 4: LCtrl, LWin, LAlt, Space, RAlt, Fn, RCtrl, Left, Down, Right (16u) ----
+    lkh(66, 0.0, 4.0, 1.25, 1.0, 0), // LCtrl
+    lkh(67, 1.25, 4.0, 1.25, 1.0, 0),// LWin
+    lkh(68, 2.5, 4.0, 1.25, 1.0, 0), // LAlt
+    lkh(69, 3.75, 4.0, 6.25, 1.0, 0),// Space
+    lk(70, 10.0, 4.0, 1.0, 0),       // RAlt
+    lko(72, 11.0, 4.0, 1.0, 0, "Fn"),// Fn
+    lk(73, 12.0, 4.0, 1.0, 0),       // RCtrl
+    lk(81, 13.0, 4.0, 1.0, 0),       // Left
+    lk(82, 14.0, 4.0, 1.0, 0),       // Down
+    lk(83, 15.0, 4.0, 1.0, 0),       // Right
+];
+
+pub static KEYS_98: &[LayoutKey] = &[
+    // ---- Row 0: Esc + F1~F12 (gap=0) + Delete, Insert, PageUp, PageDown (gap=1) ----
+    lk(0, 0.0, 0.0, 1.0, 0),         // Esc
+    lk(1, 1.6667, 0.0, 1.0, 0),      // F1
+    lk(2, 2.6667, 0.0, 1.0, 0),      // F2
+    lk(3, 3.6667, 0.0, 1.0, 0),      // F3
+    lk(4, 4.6667, 0.0, 1.0, 0),      // F4
+    lk(5, 6.3333, 0.0, 1.0, 0),      // F5
+    lk(6, 7.3333, 0.0, 1.0, 0),      // F6
+    lk(7, 8.3333, 0.0, 1.0, 0),      // F7
+    lk(8, 9.3333, 0.0, 1.0, 0),      // F8
+    lk(9, 11.0, 0.0, 1.0, 0),        // F9
+    lk(10, 12.0, 0.0, 1.0, 0),       // F10
+    lk(11, 13.0, 0.0, 1.0, 0),       // F11
+    lk(12, 14.0, 0.0, 1.0, 0),       // F12
+    lk(77, 15.25, 0.0, 1.0, 1),      // Delete
+    lk(74, 16.25, 0.0, 1.0, 1),      // Insert
+    lk(76, 17.25, 0.0, 1.0, 1),      // PageUp
+    lk(79, 18.25, 0.0, 1.0, 1),      // PageDown
+
+    // ---- Row 1: Backquote + 1~0, -, = + Backspace + NumLock, NumSlash, NumAsterisk, NumMinus ----
+    lk(13, 0.0, 1.0, 1.0, 0),        // Backquote
+    lk(14, 1.0, 1.0, 1.0, 0),        // 1
+    lk(15, 2.0, 1.0, 1.0, 0),        // 2
+    lk(16, 3.0, 1.0, 1.0, 0),        // 3
+    lk(17, 4.0, 1.0, 1.0, 0),        // 4
+    lk(18, 5.0, 1.0, 1.0, 0),        // 5
+    lk(19, 6.0, 1.0, 1.0, 0),        // 6
+    lk(20, 7.0, 1.0, 1.0, 0),        // 7
+    lk(21, 8.0, 1.0, 1.0, 0),        // 8
+    lk(22, 9.0, 1.0, 1.0, 0),        // 9
+    lk(23, 10.0, 1.0, 1.0, 0),       // 0
+    lk(24, 11.0, 1.0, 1.0, 0),       // Minus
+    lk(25, 12.0, 1.0, 1.0, 0),       // Equal
+    lk(26, 13.0, 1.0, 2.0, 0),       // Backspace
+    lk(84, 15.25, 1.0, 1.0, 1),      // NumLock
+    lk(85, 16.25, 1.0, 1.0, 1),      // NumSlash
+    lk(86, 17.25, 1.0, 1.0, 1),      // NumAsterisk
+    lk(87, 18.25, 1.0, 1.0, 1),      // NumMinus
+
+    // ---- Row 2: Tab + Q~P, [, ], Backslash + Num7, Num8, Num9, NumPlus ----
+    lkh(27, 0.0, 2.0, 1.5, 1.0, 0),  // Tab
+    lk(28, 1.5, 2.0, 1.0, 0),        // Q
+    lk(29, 2.5, 2.0, 1.0, 0),        // W
+    lk(30, 3.5, 2.0, 1.0, 0),        // E
+    lk(31, 4.5, 2.0, 1.0, 0),        // R
+    lk(32, 5.5, 2.0, 1.0, 0),        // T
+    lk(33, 6.5, 2.0, 1.0, 0),        // Y
+    lk(34, 7.5, 2.0, 1.0, 0),        // U
+    lk(35, 8.5, 2.0, 1.0, 0),        // I
+    lk(36, 9.5, 2.0, 1.0, 0),        // O
+    lk(37, 10.5, 2.0, 1.0, 0),       // P
+    lk(38, 11.5, 2.0, 1.0, 0),       // [
+    lk(39, 12.5, 2.0, 1.0, 0),       // ]
+    lkh(40, 13.5, 2.0, 1.5, 1.0, 0), // Backslash
+    lk(88, 15.25, 2.0, 1.0, 1),      // Num7
+    lk(89, 16.25, 2.0, 1.0, 1),      // Num8
+    lk(90, 17.25, 2.0, 1.0, 1),      // Num9
+    lkh(91, 18.25, 2.0, 1.0, 2.0, 1),// NumPlus (h=2.0)
+
+    // ---- Row 3: CapsLock + A~', Enter + Num4, Num5, Num6 ----
+    lkh(41, 0.0, 3.0, 1.75, 1.0, 0), // CapsLock
+    lk(42, 1.75, 3.0, 1.0, 0),       // A
+    lk(43, 2.75, 3.0, 1.0, 0),       // S
+    lk(44, 3.75, 3.0, 1.0, 0),       // D
+    lk(45, 4.75, 3.0, 1.0, 0),       // F
+    lk(46, 5.75, 3.0, 1.0, 0),       // G
+    lk(47, 6.75, 3.0, 1.0, 0),       // H
+    lk(48, 7.75, 3.0, 1.0, 0),       // J
+    lk(49, 8.75, 3.0, 1.0, 0),       // K
+    lk(50, 9.75, 3.0, 1.0, 0),       // L
+    lk(51, 10.75, 3.0, 1.0, 0),      // Semicolon
+    lk(52, 11.75, 3.0, 1.0, 0),      // Quote
+    lkh(53, 12.75, 3.0, 2.25, 1.0, 0), // Enter
+    lk(92, 15.25, 3.0, 1.0, 1),      // Num4
+    lk(93, 16.25, 3.0, 1.0, 1),      // Num5
+    lk(94, 17.25, 3.0, 1.0, 1),      // Num6
+
+    // ---- Row 4: LShift + Z~/, RShift + Up + Num1, Num2, Num3, NumEnter ----
+    lkh(54, 0.0, 4.0, 2.25, 1.0, 0), // LShift
+    lk(55, 2.25, 4.0, 1.0, 0),       // Z
+    lk(56, 3.25, 4.0, 1.0, 0),       // X
+    lk(57, 4.25, 4.0, 1.0, 0),       // C
+    lk(58, 5.25, 4.0, 1.0, 0),       // V
+    lk(59, 6.25, 4.0, 1.0, 0),       // B
+    lk(60, 7.25, 4.0, 1.0, 0),       // N
+    lk(61, 8.25, 4.0, 1.0, 0),       // M
+    lk(62, 9.25, 4.0, 1.0, 0),       // Comma
+    lk(63, 10.25, 4.0, 1.0, 0),      // Period
+    lk(64, 11.25, 4.0, 1.0, 0),      // Slash
+    lkh(65, 12.25, 4.0, 1.75, 1.0, 0), // RShift
+    lk(80, 14.0, 4.0, 1.0, 0),       // Up
+    lk(95, 15.25, 4.0, 1.0, 1),      // Num1
+    lk(96, 16.25, 4.0, 1.0, 1),      // Num2
+    lk(97, 17.25, 4.0, 1.0, 1),      // Num3
+    lkh(98, 18.25, 4.0, 1.0, 2.0, 1),// NumEnter (h=2.0)
+
+    // ---- Row 5: LCtrl, LWin, LAlt, Space, RAlt, Fn, RCtrl, Left, Down, Right + Num0, NumDot ----
+    lkh(66, 0.0, 5.0, 1.25, 1.0, 0), // LCtrl
+    lkh(67, 1.25, 5.0, 1.25, 1.0, 0),// LWin
+    lkh(68, 2.5, 5.0, 1.25, 1.0, 0), // LAlt
+    lkh(69, 3.75, 5.0, 6.25, 1.0, 0),// Space
+    lk(70, 10.0, 5.0, 1.0, 0),       // RAlt
+    lko(72, 11.0, 5.0, 1.0, 0, "Fn"),// Fn
+    lk(73, 12.0, 5.0, 1.0, 0),       // RCtrl
+    lk(81, 13.0, 5.0, 1.0, 0),       // Left
+    lk(82, 14.0, 5.0, 1.0, 0),       // Down
+    lk(83, 15.0, 5.0, 1.0, 0),       // Right
+    lk(99, 16.25, 5.0, 1.0, 1),      // Num0
+    lk(100, 17.25, 5.0, 1.0, 1),     // NumDot
+];
+
 
 pub static LAYOUT_104: LayoutProfile = LayoutProfile {
     id: "104",
@@ -709,6 +1023,18 @@ pub static LAYOUT_104: LayoutProfile = LayoutProfile {
     hour_strip: HourStripPlacement::KeyboardRect { x: 18.0, y: 0.0, w: 4.0, gap_count: 2 },
 };
 
+pub static LAYOUT_98: LayoutProfile = LayoutProfile {
+    id: "98",
+    name_zh: "98 键 (紧凑全键)",
+    name_en: "98-Key (Compact Full)",
+    units_w: 20.25,
+    gaps: 1.0,
+    rows_h: 6.0,
+    keys: KEYS_98,
+    mouse_keys: MOUSE_POS_SIDE_98,
+    hour_strip: HourStripPlacement::NavRow,
+};
+
 pub static LAYOUT_87: LayoutProfile = LayoutProfile {
     id: "87",
     name_zh: "87 键 (TKL)",
@@ -718,6 +1044,30 @@ pub static LAYOUT_87: LayoutProfile = LayoutProfile {
     rows_h: 6.0,
     keys: KEYS_87,
     mouse_keys: MOUSE_POS_NAV,
+    hour_strip: HourStripPlacement::NavRow,
+};
+
+pub static LAYOUT_75: LayoutProfile = LayoutProfile {
+    id: "75",
+    name_zh: "75% (84 键)",
+    name_en: "75% (84-Key)",
+    units_w: 17.0,
+    gaps: 1.0,
+    rows_h: 6.0,
+    keys: KEYS_75,
+    mouse_keys: MOUSE_POS_SIDE_75,
+    hour_strip: HourStripPlacement::NavRow,
+};
+
+pub static LAYOUT_68: LayoutProfile = LayoutProfile {
+    id: "68",
+    name_zh: "68 键 (65% 配列)",
+    name_en: "68-Key (65%)",
+    units_w: 17.0,
+    gaps: 1.0,
+    rows_h: 5.0,
+    keys: KEYS_68,
+    mouse_keys: MOUSE_POS_SIDE_16,
     hour_strip: HourStripPlacement::NavRow,
 };
 
@@ -748,16 +1098,22 @@ pub static LAYOUT_64: LayoutProfile = LayoutProfile {
 #[allow(dead_code)]
 pub static ALL_LAYOUTS: &[&LayoutProfile] = &[
     &LAYOUT_104,
+    &LAYOUT_98,
     &LAYOUT_87,
-    &LAYOUT_60,
+    &LAYOUT_75,
+    &LAYOUT_68,
     &LAYOUT_64,
+    &LAYOUT_60,
 ];
 
 pub fn layout_profile(id: &str) -> &'static LayoutProfile {
     match id {
+        "98" => &LAYOUT_98,
         "87" => &LAYOUT_87,
-        "60" => &LAYOUT_60,
+        "75" => &LAYOUT_75,
+        "68" => &LAYOUT_68,
         "64" => &LAYOUT_64,
+        "60" => &LAYOUT_60,
         _ => &LAYOUT_104,
     }
 }
@@ -884,9 +1240,12 @@ mod tests {
     #[test]
     fn layout_profiles_properties() {
         assert_eq!(layout_profile("104").keys.len(), 104);
+        assert_eq!(layout_profile("98").keys.len(), 98);
         assert_eq!(layout_profile("87").keys.len(), 87);
-        assert_eq!(layout_profile("60").keys.len(), 61);
+        assert_eq!(layout_profile("75").keys.len(), 84);
+        assert_eq!(layout_profile("68").keys.len(), 68);
         assert_eq!(layout_profile("64").keys.len(), 64);
+        assert_eq!(layout_profile("60").keys.len(), 61);
 
         // 未知配列默认回退到 104
         assert_eq!(layout_profile("unknown").id, "104");
@@ -900,10 +1259,13 @@ mod tests {
             assert_eq!(prof.mouse_keys.len(), 5);
         }
 
-        // 104 键在键盘内部，87/60/64 移至导航行
+        // 104 键在键盘内部，其余移至导航行
         assert!(matches!(layout_profile("104").hour_strip, HourStripPlacement::KeyboardRect { .. }));
+        assert_eq!(layout_profile("98").hour_strip, HourStripPlacement::NavRow);
         assert_eq!(layout_profile("87").hour_strip, HourStripPlacement::NavRow);
-        assert_eq!(layout_profile("60").hour_strip, HourStripPlacement::NavRow);
+        assert_eq!(layout_profile("75").hour_strip, HourStripPlacement::NavRow);
+        assert_eq!(layout_profile("68").hour_strip, HourStripPlacement::NavRow);
         assert_eq!(layout_profile("64").hour_strip, HourStripPlacement::NavRow);
+        assert_eq!(layout_profile("60").hour_strip, HourStripPlacement::NavRow);
     }
 }
