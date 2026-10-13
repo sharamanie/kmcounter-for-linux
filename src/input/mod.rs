@@ -29,11 +29,23 @@ pub fn spawn_applier(shared: Arc<Shared>) -> Sender<InEvent> {
                 shared.rollover_if_needed();
                 let date = shared.today.lock().clone();
                 let hour = shared.current_hour();
+                let is_action = match &ev {
+                    InEvent::Key(_) | InEvent::KeyOther(_) => true,
+                    InEvent::Mouse(m) => matches!(m, MouseEv::LeftUp | MouseEv::RightUp | MouseEv::MiddleUp | MouseEv::XUp),
+                };
                 let mut store = shared.store.lock();
                 match ev {
                     InEvent::Key(idx) => store.bump_key(&date, hour, idx),
                     InEvent::KeyOther(id) => store.bump_other_key(&date, hour, &id),
                     InEvent::Mouse(m) => store.bump_mouse(&date, hour, &m),
+                }
+                if is_action {
+                    let (_, peak) = shared.apm.lock().record(&date);
+                    if let Some(day) = store.days.get_mut(&date) {
+                        if peak > day.peak_apm {
+                            day.peak_apm = peak;
+                        }
+                    }
                 }
                 drop(store);
                 shared.dirty.store(true, std::sync::atomic::Ordering::Relaxed);

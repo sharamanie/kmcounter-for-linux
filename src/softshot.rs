@@ -1959,6 +1959,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hud_mode_and_apm_badge_render() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+
+        // 产生几次动作增加 APM
+        for _ in 0..10 {
+            app.debug_record_apm_action(&today);
+        }
+
+        // 常规窗口下：页签行包含 APM 文本和 HUD 按钮
+        drive(&mut app, &ctx, 1260.0, 900.0, 2, vec![]);
+        let texts = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        let s = app.debug_strings();
+        assert!(texts.iter().any(|t| t.contains("APM")), "页签右侧应有 APM 徽章：{texts:?}");
+        assert!(texts.iter().any(|t| t.contains(s.hud_mode_btn)), "页签右侧应有 HUD 按钮：{texts:?}");
+
+        // 切到 HUD 模式
+        app.debug_toggle_hud();
+        assert!(app.debug_is_hud());
+        drive(&mut app, &ctx, crate::gui::HUD_W, crate::gui::HUD_H, 2, vec![]);
+        let hud_texts = frame_texts(&ctx, &mut app, crate::gui::HUD_W, crate::gui::HUD_H);
+        assert!(hud_texts.iter().any(|t| t.contains("APM")), "HUD 模式应显示 APM：{hud_texts:?}");
+        assert!(hud_texts.iter().any(|t| t.contains("⌨")), "HUD 模式应显示键盘按键图标：{hud_texts:?}");
+        assert!(hud_texts.iter().any(|t| t.contains("🖱")), "HUD 模式应显示鼠标点击图标：{hud_texts:?}");
+        assert!(hud_texts.iter().any(|t| t.contains("📏")), "HUD 模式应显示距离图标：{hud_texts:?}");
+        assert!(hud_texts.iter().any(|t| t.contains("⤢")), "HUD 模式应有还原按钮：{hud_texts:?}");
+
+        // 再次切换退出 HUD 模式
+        app.debug_toggle_hud();
+        assert!(!app.debug_is_hud());
+    }
+
     /// 生成 README 配图（默认 ignore；用 --ignored 跑）
     /// 环境变量：KMCOUNTER_SHOT_STATS 指定演示数据；KMCOUNTER_SHOT_DIR 指定输出目录
     /// 各种界面状态通过 debug 入口配置（不设进程级环境变量，避免与并行测试互相串）

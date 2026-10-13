@@ -194,6 +194,11 @@ pub struct Strings {
     pub sel_hint: &'static str,
     pub more_label: &'static str,
     pub more_collapse: &'static str,
+    pub apm_label: &'static str,
+    pub apm_peak_label: &'static str,
+    pub hud_mode_btn: &'static str,
+    pub hud_expand_btn: &'static str,
+    pub hud_drag_hint: &'static str,
 }
 
 const ZH: Strings = Strings {
@@ -339,6 +344,11 @@ const ZH: Strings = Strings {
     sel_hint: "点击键盘上的按键可选中并查看其按压次数；再次点击取消",
     more_label: "展开更多",
     more_collapse: "收起",
+    apm_label: "实时手速",
+    apm_peak_label: "今日峰值",
+    hud_mode_btn: "HUD 悬浮",
+    hud_expand_btn: "还原完整窗口",
+    hud_drag_hint: "按住拖动 · 双击还原",
 };
 
 const EN: Strings = Strings {
@@ -484,6 +494,11 @@ const EN: Strings = Strings {
     sel_hint: "Click keys on the keyboard to inspect their press counts; click again to deselect",
     more_label: "More",
     more_collapse: "Collapse",
+    apm_label: "Live APM",
+    apm_peak_label: "Daily Peak",
+    hud_mode_btn: "HUD Mode",
+    hud_expand_btn: "Expand Window",
+    hud_drag_hint: "Drag to move · Double-click to restore",
 };
 
 /// 界面里可选的具体语言项（配置值, 显示名）；语言名用其母语书写，不随界面语言变化

@@ -8,6 +8,7 @@ use crate::lang::Lang;
 pub enum TrayCmd {
     Show,
     Settings,
+    ToggleHud,
     ToggleAutostart,
     Exit,
     /// GUI → 托盘：开机启动勾选状态变化
@@ -141,6 +142,14 @@ mod imp {
                     ..Default::default()
                 }
                 .into(),
+                StandardItem {
+                    label: s.hud_mode_btn.into(),
+                    activate: Box::new(|t: &mut Self| {
+                        let _ = t.tx.send(TrayCmd::ToggleHud);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 CheckmarkItem {
                     label: s.menu_autostart.into(),
@@ -266,8 +275,9 @@ mod imp {
     // 菜单 ID
     const ID_STATS: u32 = 1;
     const ID_SETTINGS: u32 = 2;
-    const ID_AUTOSTART: u32 = 3;
-    const ID_EXIT: u32 = 4;
+    const ID_HUD: u32 = 3;
+    const ID_AUTOSTART: u32 = 4;
+    const ID_EXIT: u32 = 5;
     const WM_APP_TRAY: u32 = 0x8000; // WM_APP
 
     fn wide(s: &str) -> Vec<u16> {
@@ -324,6 +334,7 @@ mod imp {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, 0, ID_STATS as usize, wide(s.menu_stats).as_ptr());
         AppendMenuW(menu, 0, ID_SETTINGS as usize, wide(s.menu_settings).as_ptr());
+        AppendMenuW(menu, 0, ID_HUD as usize, wide(s.hud_mode_btn).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         let checked = if crate::autostart::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
         AppendMenuW(menu, checked, ID_AUTOSTART as usize, wide(s.menu_autostart).as_ptr());
@@ -372,6 +383,7 @@ mod imp {
                             let cmd = match id as u32 {
                                 ID_STATS => Some(TrayCmd::Show),
                                 ID_SETTINGS => Some(TrayCmd::Settings),
+                                ID_HUD => Some(TrayCmd::ToggleHud),
                                 ID_AUTOSTART => Some(TrayCmd::ToggleAutostart),
                                 ID_EXIT => Some(TrayCmd::Exit),
                                 _ => None,

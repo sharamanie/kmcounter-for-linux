@@ -25,6 +25,8 @@ pub struct UiFlags {
     pub switch_page_after: AtomicBool,
     /// 托盘呼出窗口时：把视图切回「今日」
     pub show_today: AtomicBool,
+    /// 托盘请求切换 HUD 悬浮模式
+    pub toggle_hud: AtomicBool,
 }
 
 pub struct Controller {
@@ -84,6 +86,11 @@ pub fn spawn(ctl: Controller, rx: Receiver<TrayCmd>, ctx: egui::Context, show_re
                         }
                         // 呼出即回到「今日」：多数时候想看的就是今天
                         ctl.flags.show_today.store(true, Ordering::Relaxed);
+                        let keep = ctl.cfg.lock().keep_on_top;
+                        show_window(&ctl.shared, &ctx, keep);
+                    }
+                    TrayCmd::ToggleHud => {
+                        ctl.flags.toggle_hud.store(true, Ordering::Relaxed);
                         let keep = ctl.cfg.lock().keep_on_top;
                         show_window(&ctl.shared, &ctx, keep);
                     }

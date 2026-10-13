@@ -11,11 +11,12 @@ use crate::keys::{N_KEYS, KEYS};
 use chrono::{Duration, Local, Timelike};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub fn today_string() -> String {
     Local::now().format("%Y%m%d").to_string()
@@ -186,11 +187,91 @@ impl HourLimits {
     }
 }
 
+/// 实时手速与当日峰值跟踪器（Actions Per Minute / 每分钟操作数）
+#[derive(Debug)]
+pub struct ApmTracker {
+    /// 滑动窗口内的动作时间戳队列
+    actions: VecDeque<Instant>,
+    /// 今日峰值 APM
+    today_peak: u32,
+    /// 峰值对应的日期（YYYYMMDD）
+    peak_date: String,
+}
+
+impl ApmTracker {
+    pub fn new(today: &str, initial_peak: u32) -> Self {
+        ApmTracker {
+            actions: VecDeque::new(),
+            today_peak: initial_peak,
+            peak_date: today.to_string(),
+        }
+    }
+
+    /// 记录一次动作（击键或鼠标点击），返回 (当前APM, 今日峰值)
+    pub fn record(&mut self, date: &str) -> (u32, u32) {
+        let now = Instant::now();
+        self.actions.push_back(now);
+        self.cleanup(now, date);
+        (self.calc_apm(), self.today_peak)
+    }
+
+    /// 获取当前实时 APM 与当日峰值
+    pub fn get(&mut self, date: &str) -> (u32, u32) {
+        let now = Instant::now();
+        self.cleanup(now, date);
+        (self.calc_apm(), self.today_peak)
+    }
+
+    /// 清理 5 秒滑动窗口外的过期动作，并维护跨天峰值
+    fn cleanup(&mut self, now: Instant, date: &str) {
+        if self.peak_date != date {
+            self.peak_date = date.to_string();
+            self.today_peak = 0;
+            self.actions.clear();
+            return;
+        }
+        let window = std::time::Duration::from_secs(5);
+        while let Some(&front) = self.actions.front() {
+            if now.saturating_duration_since(front) > window {
+                self.actions.pop_front();
+            } else {
+                break;
+            }
+        }
+        let current = self.calc_apm();
+        if current > self.today_peak {
+            self.today_peak = current;
+        }
+    }
+
+    fn calc_apm(&self) -> u32 {
+        let count = self.actions.len();
+        if count == 0 {
+            0
+        } else {
+            // 5 秒滑动窗口：5 秒内的动作数 × 12 换算为每分钟操作数
+            ((count as f64) * 60.0 / 5.0).round() as u32
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn peak(&self) -> u32 {
+        self.today_peak
+    }
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 /// 一天的数据：当天汇总（扁平字段，与旧版文件兼容）+ 各小时明细
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct DayEntry {
     #[serde(flatten)]
     pub bucket: BucketStats,
+    /// 当日峰值 APM（每分钟操作数）
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub peak_apm: u32,
     /// 小时（0-23）→ 该小时明细；只存有数据的小时
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hours: BTreeMap<u8, BucketStats>,
@@ -421,6 +502,11 @@ impl Store {
         self.days.get(date)
     }
 
+    /// 某日峰值 APM
+    pub fn day_peak_apm(&self, date: &str) -> u32 {
+        self.days.get(date).map(|d| d.peak_apm).unwrap_or(0)
+    }
+
     /// 某日某小时（只读）
     pub fn hour(&self, date: &str, hour: u8) -> Option<&BucketStats> {
         self.days.get(date).and_then(|d| d.hour(hour))
@@ -528,6 +614,8 @@ pub struct Shared {
     pub hour: AtomicU32,
     /// 有新数据未显示/未保存
     pub dirty: AtomicBool,
+    /// 实时手速跟踪器（滑动窗口 + 当日峰值）
+    pub apm: Mutex<ApmTracker>,
     /// 主显示器宽度（像素），用于像素→米换算
     pub screen_px_w: AtomicU32,
     /// 主显示器物理宽度（毫米），启动时解析
@@ -543,9 +631,12 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(store: Store, screen_w_mm: u32, screen_h_mm: u32) -> Arc<Shared> {
+        let today = today_string();
+        let initial_peak = store.day_peak_apm(&today);
         Arc::new(Shared {
-            today: Mutex::new(today_string()),
+            today: Mutex::new(today.clone()),
             hour: AtomicU32::new(Local::now().hour()),
+            apm: Mutex::new(ApmTracker::new(&today, initial_peak)),
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
             screen_px_w: AtomicU32::new(0),
@@ -570,7 +661,8 @@ impl Shared {
         self.hour.store(now.hour(), Ordering::Relaxed);
         let mut t = self.today.lock();
         if *t != date {
-            *t = date;
+            *t = date.clone();
+            self.apm.lock().cleanup(Instant::now(), &date);
             self.dirty.store(true, Ordering::Relaxed);
             true
         } else {
@@ -885,5 +977,29 @@ mod tests {
         assert_eq!(s.purge(30), 1);
         assert_eq!(s.days.len(), 1);
         assert!(s.day(&old).is_none(), "过期天连同小时明细一起删除");
+    }
+
+    #[test]
+    fn apm_tracker_sliding_window_and_peak() {
+        let mut tracker = ApmTracker::new("20261013", 0);
+        assert_eq!(tracker.peak(), 0);
+        let (apm, peak) = tracker.get("20261013");
+        assert_eq!(apm, 0);
+        assert_eq!(peak, 0);
+
+        // 记录 5 次操作（在 5 秒滑动窗口内）
+        // 5 次 / 5s = 1 次/s = 60 次/分 (60 APM)
+        for _ in 0..5 {
+            tracker.record("20261013");
+        }
+        let (apm, peak) = tracker.get("20261013");
+        assert_eq!(apm, 60);
+        assert_eq!(peak, 60);
+        assert_eq!(tracker.peak(), 60);
+
+        // 跨天重置
+        let (apm_next, peak_next) = tracker.get("20261014");
+        assert_eq!(apm_next, 0);
+        assert_eq!(peak_next, 0);
     }
 }

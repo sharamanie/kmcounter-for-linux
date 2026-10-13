@@ -365,7 +365,13 @@ pub struct App {
     nav_title_rect: Rect,
     /// 鼠标滚轮翻页增量累加器（防微增量连发与抖动）
     wheel_delta_accum: f32,
+    /// 是否处于极简悬浮窗（HUD）模式
+    pub is_hud: bool,
 }
+
+/// 极简悬浮窗 HUD 模式默认尺寸
+pub const HUD_W: f32 = 390.0;
+pub const HUD_H: f32 = 36.0;
 
 /// 窗口尺寸管理：底部展开 设置/统计 面板时向下加高窗口（按钮位置保持不动）
 const BASE_W: f32 = 1260.0;
@@ -561,6 +567,7 @@ impl App {
             cal_month: (chrono::Local::now().year(), chrono::Local::now().month()),
             nav_title_rect: Rect::NOTHING,
             wheel_delta_accum: 0.0,
+            is_hud: cfg.hud_mode,
             start_minimized,
             last_applied_h: BASE_H,
             resize_target: None,
@@ -1063,6 +1070,9 @@ impl App {
 
         // ---- 托盘请求：打开设置（控制线程只置标志，UI 状态在渲染线程改）----
         if self.flags.want_settings.swap(false, Ordering::Relaxed) {
+            if self.is_hud {
+                self.exit_hud(ctx);
+            }
             self.edit = self.cfg.clone();
             self.more_open = true;
         }
@@ -1124,6 +1134,17 @@ impl App {
                 s.view_date_prefix,
                 self.view_label()
             )));
+        }
+
+        // 托盘等跨线程请求切换 HUD
+        if self.flags.toggle_hud.swap(false, Ordering::Relaxed) {
+            self.toggle_hud(ctx);
+        }
+
+        // HUD 模式：直接跳转 HUD 专用悬浮窗渲染，跳过完整窗口逻辑
+        if self.is_hud {
+            self.show_hud(ctx, s);
+            return;
         }
 
         // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
@@ -1273,11 +1294,33 @@ impl App {
                 // 与趋势页不一致，导致设置栏左右移动
                 let panel_area_w = ui.available_width();
 
-                // 页签：热力图 / 趋势（开关按钮固定在窗口底部，不在此处）
+                // 页签：热力图 / 趋势 / 排行 + 右侧实时 APM 与 HUD 悬浮按钮
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.page, Page::Heatmap, s.tab_heatmap);
                     ui.selectable_value(&mut self.page, Page::Trends, s.tab_trend);
                     ui.selectable_value(&mut self.page, Page::Ranking, s.tab_rank);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new(format!("⤢ {}", s.hud_mode_btn)).small())
+                            .on_hover_text(s.hud_drag_hint)
+                            .clicked()
+                        {
+                            self.toggle_hud(ctx);
+                        }
+
+                        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today);
+                        let apm_color = if cur_apm >= 200 {
+                            Color32::from_rgb(0xFF, 0x55, 0x55)
+                        } else if cur_apm >= 100 {
+                            Color32::from_rgb(0xF5, 0xA6, 0x23)
+                        } else {
+                            Color32::from_rgb(0x99, 0x99, 0x99)
+                        };
+                        let apm_text = format!("⚡ {} APM ({} {})", cur_apm, s.apm_peak_label, peak_apm);
+                        ui.label(egui::RichText::new(apm_text).small().strong().color(apm_color))
+                            .on_hover_text(format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm));
+                    });
                 });
 
                 // 日期/分时导航（热力图页与趋势页共用）
@@ -1494,6 +1537,159 @@ impl App {
             );
         }
         ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    pub fn toggle_hud(&mut self, ctx: &egui::Context) {
+        if self.is_hud {
+            self.exit_hud(ctx);
+        } else {
+            self.enter_hud(ctx);
+        }
+    }
+
+    pub fn enter_hud(&mut self, ctx: &egui::Context) {
+        self.is_hud = true;
+        self.cfg.hud_mode = true;
+        {
+            let mut cfg = self.cfg_shared.lock();
+            cfg.hud_mode = true;
+            let _ = cfg.save(&self.cfg_path);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(HUD_W, HUD_H)));
+        ctx.request_repaint();
+    }
+
+    pub fn exit_hud(&mut self, ctx: &egui::Context) {
+        self.is_hud = false;
+        self.cfg.hud_mode = false;
+        {
+            let mut cfg = self.cfg_shared.lock();
+            cfg.hud_mode = false;
+            let _ = cfg.save(&self.cfg_path);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        let level = if self.cfg.keep_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+        let restore_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
+        let restore_h = self.base_h + self.panel_extra_h();
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(restore_w, restore_h)));
+        self.resize_target_w = Some(restore_w);
+        self.user_sized = false;
+        self.resize_deadline = Instant::now() + Duration::from_secs(3);
+        self.title_dirty = true;
+        ctx.request_repaint();
+    }
+
+    fn show_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
+        ctx.request_repaint_after(Duration::from_millis(250));
+
+        let (today_keys, today_clicks, today_dist_m) = {
+            let store = self.shared.store.lock();
+            if let Some(entry) = store.days.get(&self.snap_today) {
+                (entry.keystrokes, entry.mouse_clicks(), self.shared.px_to_meters(entry.mouse.move_px))
+            } else {
+                (0, 0, 0.0)
+            }
+        };
+        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today);
+
+        let bg_fill = Color32::from_rgb(0x18, 0x1A, 0x22);
+        let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0x3B, 0x42, 0x52));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(bg_fill)
+                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                    .stroke(border_stroke)
+                    .rounding(6.0),
+            )
+            .show(ctx, |ui| {
+                let full_rect = ui.max_rect();
+                let bg_resp = ui.interact(full_rect, ui.id().with("hud_bg"), Sense::click_and_drag());
+                if bg_resp.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if bg_resp.double_clicked() {
+                    self.exit_hud(ctx);
+                    return;
+                }
+                bg_resp.on_hover_text(s.hud_drag_hint);
+
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(7.0, 0.0);
+
+                    // 键盘
+                    let k_text = format!("⌨ {}", fmt_thousands(today_keys as f64));
+                    ui.label(egui::RichText::new(k_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                        .on_hover_text(format!("{}: {}", s.keystrokes, today_keys));
+
+                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                    // 鼠标点击
+                    let c_text = format!("🖱 {}", fmt_thousands(today_clicks as f64));
+                    ui.label(egui::RichText::new(c_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                        .on_hover_text(format!("{}: {}", s.mouse_clicks, today_clicks));
+
+                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                    // 移动距离
+                    let d_text = format!("📏 {:.1}{}", today_dist_m, s.unit_m.trim());
+                    ui.label(egui::RichText::new(d_text).strong().size(13.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
+                        .on_hover_text(format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m));
+
+                    ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
+
+                    // 实时 APM
+                    let apm_color = if cur_apm >= 200 {
+                        Color32::from_rgb(0xFF, 0x55, 0x55)
+                    } else if cur_apm >= 100 {
+                        Color32::from_rgb(0xF5, 0xA6, 0x23)
+                    } else {
+                        Color32::from_rgb(0x4E, 0xC9, 0xB0)
+                    };
+                    let apm_text = format!("⚡ {} APM", cur_apm);
+                    ui.label(egui::RichText::new(apm_text).strong().size(13.0).color(apm_color))
+                        .on_hover_text(format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm));
+
+                    // 靠右放置还原按钮
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new("⤢").size(13.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
+                            .on_hover_text(s.hud_expand_btn)
+                            .clicked()
+                        {
+                            self.exit_hud(ctx);
+                        }
+                    });
+                });
+            });
+    }
+
+    #[cfg(any(test, feature = "softshot"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn debug_toggle_hud(&mut self) {
+        self.is_hud = !self.is_hud;
+    }
+
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_is_hud(&self) -> bool {
+        self.is_hud
+    }
+
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_record_apm_action(&mut self, date: &str) {
+        self.shared.apm.lock().record(date);
     }
 
     /// 日期 + 分时导航行（热力图页与趋势页共用，选择状态也是共用的）
@@ -2847,6 +3043,8 @@ impl App {
                     ui.label(egui::RichText::new(s.settings_window_sub).small().color(TEXT));
                     ui.checkbox(&mut self.edit.keep_on_top, s.settings_keep_on_top);
                     ui.add(egui::Label::new(egui::RichText::new(s.settings_keep_on_top_sub).small().color(TEXT)).wrap());
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.edit.hud_mode, s.hud_mode_btn);
                 };
 
                 let mut render_lang = |ui: &mut egui::Ui| {
@@ -2981,6 +3179,7 @@ impl App {
                             ui.add_space(16.0);
                             if ui.button(s.settings_save).clicked() {
                                 let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
+                                let hud_changed = self.is_hud != self.edit.hud_mode;
                                 {
                                     let mut cfg = self.cfg_shared.lock();
                                     *cfg = self.edit.clone();
@@ -2988,7 +3187,13 @@ impl App {
                                 }
                                 self.cfg = self.edit.clone();
                                 self.apply_language();
-                                if layout_changed {
+                                if hud_changed {
+                                    if self.edit.hud_mode {
+                                        self.enter_hud(ui.ctx());
+                                    } else {
+                                        self.exit_hud(ui.ctx());
+                                    }
+                                } else if layout_changed {
                                     let new_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
                                     self.resize_target_w = Some(new_w);
                                     self.user_sized = false;
@@ -3721,6 +3926,37 @@ mod tests {
         assert!(bytes.starts_with(b"P6\n2 1\n255\n"), "头部错误");
         assert!(bytes.ends_with(&[255, 0, 0, 0, 255, 0]), "像素序错误");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hud_mode_toggle_state() {
+        let ctx = egui::Context::default();
+        let tmp = std::env::temp_dir().join(format!("kmc_hud_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("config.toml");
+        let stats_path = tmp.join("stats.json");
+        let show_request_path = tmp.join("show_request");
+        let cfg = Config::default();
+        let cfg_shared = Arc::new(parking_lot::Mutex::new(cfg));
+        let shared = Shared::new(Store::default(), 0, 0);
+        let autostart_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut app = App::new(
+            &ctx,
+            shared,
+            cfg_shared,
+            cfg_path,
+            stats_path,
+            show_request_path,
+            false,
+            None,
+            autostart_state,
+        );
+        assert!(!app.is_hud);
+        app.debug_toggle_hud();
+        assert!(app.is_hud);
+        app.debug_toggle_hud();
+        assert!(!app.is_hud);
+        std::fs::remove_dir_all(tmp).ok();
     }
 }
 

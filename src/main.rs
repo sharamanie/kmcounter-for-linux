@@ -528,13 +528,20 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     // GUI
     // 调试/截图模式（KMCOUNTER_START_PANELS=stats|settings|both）：预展开面板并置顶显示
     let debug_panels = std::env::var("KMCOUNTER_START_PANELS").map(|v| !v.is_empty()).unwrap_or(false);
-    let initial_w = {
+    let (initial_w, initial_h, is_hud) = {
         let cfg = cfg_shared.lock();
-        crate::gui::default_width_for_layout(&cfg.layout.keyboard_layout, &cfg.layout)
+        if cfg.hud_mode {
+            (crate::gui::HUD_W, crate::gui::HUD_H, true)
+        } else {
+            (crate::gui::default_width_for_layout(&cfg.layout.keyboard_layout, &cfg.layout), 500.0, false)
+        }
     };
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([initial_w, 500.0])
-        .with_min_inner_size([800.0, 380.0]);
+        .with_inner_size([initial_w, initial_h])
+        .with_min_inner_size([280.0, 32.0]);
+    if is_hud {
+        viewport = viewport.with_decorations(false).with_always_on_top();
+    }
     if debug_panels {
         viewport = viewport.with_always_on_top();
     }
