@@ -287,6 +287,8 @@ pub struct App {
     last_applied_h: f32,
     /// 待达成的窗口高度（早期 resize 请求可能被 WM 丢弃，需按实际尺寸校验重发）
     resize_target: Option<f32>,
+    /// 待达成的窗口宽度（切换配列时设定，由每帧轮询校验达成）
+    resize_target_w: Option<f32>,
     resize_deadline: Instant,
     /// 底部展开面板的实测高度（首帧估算窗口高度用）
     measured_panel_h: f32,
@@ -370,13 +372,13 @@ pub fn default_width_for_layout(layout_id: &str, cfg: &crate::config::LayoutCfg)
     let prof = layout_profile(layout_id);
     match prof.id {
         "104" => BASE_W,
-        "87" => 1020.0,
-        "60" | "64" => 920.0,
+        "87" => 1040.0,
+        "60" | "64" => 980.0,
         _ => {
             let u = (cfg.key_w + cfg.key_spacing) as f32;
             let gap = cfg.h_spacing as f32;
             let kbd_w = prof.units_w * u + prof.gaps * gap - cfg.key_spacing as f32;
-            (kbd_w + 60.0).max(860.0)
+            (kbd_w + 60.0).max(960.0)
         }
     }
 }
@@ -555,6 +557,7 @@ impl App {
             start_minimized,
             last_applied_h: BASE_H,
             resize_target: None,
+            resize_target_w: None,
             resize_deadline: Instant::now(),
             measured_panel_h: 0.0,
             panel_bottom: 0.0,
@@ -1100,10 +1103,10 @@ impl App {
             )));
         }
 
-        // ---- 窗口高度：底部面板展开时向下加高，按钮与内容位置不变 ----
-        // 识别用户手动缩放：无待处理 resize 时窗口高度自己变了 → 尊重用户，不再自动贴合
+        // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
+        // 识别用户手动缩放：无待处理 resize 时窗口尺寸自己变了 → 尊重用户，不再自动贴合
         let actual_h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
-        if self.resize_target.is_none() && !self.user_sized {
+        if self.resize_target.is_none() && self.resize_target_w.is_none() && !self.user_sized {
             if let (Some(h), true) = (actual_h, self.last_seen_h > 100.0) {
                 if (h - self.last_seen_h).abs() > 3.0 {
                     self.user_sized = true;
@@ -1139,15 +1142,28 @@ impl App {
             self.resize_target = Some(desired_h);
             self.resize_deadline = Instant::now() + Duration::from_secs(3);
         }
-        if let Some(target) = self.resize_target {
+        let w_target = self.resize_target_w;
+        let h_target = self.resize_target;
+        if w_target.is_some() || h_target.is_some() {
             let (actual_h, cur_w) = ctx.input(|i| {
                 let r = i.viewport().inner_rect;
                 (r.map(|r| r.height()), r.map(|r| r.width()).unwrap_or(BASE_W))
             });
-            if actual_h.map_or(false, |h| (h - target).abs() <= 2.0) || Instant::now() > self.resize_deadline {
-                self.resize_target = None; // 已达成，或 WM 拒绝（放弃，避免与用户手动缩放打架）
+            let w_done = match w_target {
+                Some(tw) => (cur_w - tw).abs() <= 3.0,
+                None => true,
+            };
+            let h_done = match h_target {
+                Some(th) => actual_h.map_or(false, |h| (h - th).abs() <= 2.0),
+                None => true,
+            };
+            if (w_done && h_done) || Instant::now() > self.resize_deadline {
+                self.resize_target = None;
+                self.resize_target_w = None;
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(cur_w.max(960.0), target)));
+                let send_w = w_target.unwrap_or(cur_w);
+                let send_h = h_target.or(actual_h).unwrap_or(self.base_h);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(send_w, send_h)));
             }
         }
 
@@ -1346,11 +1362,14 @@ impl App {
                 // ---- 按钮下方的展开面板（窗口向下生长，按钮位置不变）----
                 if self.more_open {
                     let before = ui.cursor().min.y;
-                    // 左右两栏：统计在左、设置在右，宽度按窗口宽度固定分配（与页面无关，位置稳定）
-                    // 两列宽度之和 + 列间距 = 面板可用宽度：右缘与上方图表/卡片严格对齐
-                    // 统计表 3~4 列够用即可，其余留给“设置”（设置内部改成三栏，不再又窄又长）
-                    let left_w = (panel_area_w * 0.38 - 4.0).max(330.0);
-                    let right_w = (panel_area_w - left_w - 8.0).max(340.0);
+                    // 左右两栏：统计在左、设置在右，宽度按窗口宽度合理分配
+                    // 宽窗口（>=1200）给统计较多空间；紧凑窗口（<1200）保证右侧设置面板有充足宽度
+                    let left_w = if panel_area_w >= 1200.0 {
+                        (panel_area_w * 0.38 - 4.0).clamp(330.0, 480.0)
+                    } else {
+                        (panel_area_w * 0.30).clamp(260.0, 310.0)
+                    };
+                    let right_w = (panel_area_w - left_w - 8.0).max(360.0);
                     geo_log("panel area", Rect::from_min_size(Pos2::ZERO, Vec2::new(panel_area_w, 0.0)));
                     geo_log("left col alloc", Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(left_w, 0.0)));
                     geo_log("right col alloc", Rect::from_min_size(Pos2::new(left_w + 8.0, 0.0), Vec2::new(right_w, 0.0)));
@@ -1471,53 +1490,54 @@ impl App {
                     self.nav_hour(false);
                 }
             });
+            if self.page == Page::Heatmap && self.active_layout().hour_strip == HourStripPlacement::NavRow {
+                ui.add_space(8.0);
+                let (strip, resp) = ui.allocate_exact_size(Vec2::new(214.0, 20.0), Sense::click());
+                self.strip_rect = strip;
+                let entry = self.day_for_view();
+                let prof = entry.hour_profile();
+                let invalid: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
+                let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
+                    .then(|| chrono::Local::now().hour().min(23) as u8);
+                let painter = ui.painter().clone();
+                paint_hour_lines(&painter, strip, &prof, self.hour_sel, now_hour, &invalid);
+                if let Some(pos) = resp.hover_pos() {
+                    if let Some(idx) = hour_bar_index(strip, pos.x) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        let p = prof.get(idx).copied().unwrap_or_default();
+                        let unit = s.unit_times.trim();
+                        let mark = if invalid.get(idx).copied().unwrap_or(false) { s.invalid_mark } else { "" };
+                        let text = format!(
+                            "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
+                            idx,
+                            s.hour_suffix,
+                            s.keystrokes,
+                            p.keystrokes,
+                            unit,
+                            s.mouse_clicks,
+                            p.clicks,
+                            unit,
+                            s.mouse_move,
+                            self.shared.px_to_meters(p.move_px),
+                            s.unit_m,
+                            mark,
+                            s.strip_hint
+                        );
+                        paint_tooltip(&painter, ui, pos, &text);
+                    }
+                }
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(idx) = hour_bar_index(strip, pos.x) {
+                            let h = idx as u8;
+                            self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
+                        }
+                    }
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.page == Page::Heatmap && !self.selected.is_empty() && ui.button(s.sel_clear).clicked() {
                     self.selected.clear();
-                }
-                if self.page == Page::Heatmap && self.active_layout().hour_strip == HourStripPlacement::NavRow {
-                    let (strip, resp) = ui.allocate_exact_size(Vec2::new(214.0, 20.0), Sense::click());
-                    self.strip_rect = strip;
-                    let entry = self.day_for_view();
-                    let prof = entry.hour_profile();
-                    let invalid: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
-                    let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
-                        .then(|| chrono::Local::now().hour().min(23) as u8);
-                    let painter = ui.painter().clone();
-                    paint_hour_lines(&painter, strip, &prof, self.hour_sel, now_hour, &invalid);
-                    if let Some(pos) = resp.hover_pos() {
-                        if let Some(idx) = hour_bar_index(strip, pos.x) {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            let p = prof.get(idx).copied().unwrap_or_default();
-                            let unit = s.unit_times.trim();
-                            let mark = if invalid.get(idx).copied().unwrap_or(false) { s.invalid_mark } else { "" };
-                            let text = format!(
-                                "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
-                                idx,
-                                s.hour_suffix,
-                                s.keystrokes,
-                                p.keystrokes,
-                                unit,
-                                s.mouse_clicks,
-                                p.clicks,
-                                unit,
-                                s.mouse_move,
-                                self.shared.px_to_meters(p.move_px),
-                                s.unit_m,
-                                mark,
-                                s.strip_hint
-                            );
-                            paint_tooltip(&painter, ui, pos, &text);
-                        }
-                    }
-                    if resp.clicked() {
-                        if let Some(pos) = resp.interact_pointer_pos() {
-                            if let Some(idx) = hour_bar_index(strip, pos.x) {
-                                let h = idx as u8;
-                                self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
-                            }
-                        }
-                    }
                 }
             });
         });
@@ -2715,7 +2735,7 @@ impl App {
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
             .show(ui, |ui| {
                 ui.vertical(|ui| {
-                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
                 let label = |ui: &mut egui::Ui, t: &str| {
                     ui.label(egui::RichText::new(t).color(TEXT));
                 };
@@ -2769,7 +2789,7 @@ impl App {
                     let ui = &mut cols[1];
                     ui.strong(egui::RichText::new(s.settings_layout).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_layout_sub).small().color(TEXT));
-                    egui::Grid::new("layout_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                    ui.horizontal(|ui| {
                         label(ui, s.settings_keyboard_profile);
                         let cur_layout = self.edit.layout.keyboard_layout.as_str();
                         let cur_text = match cur_layout {
@@ -2780,15 +2800,16 @@ impl App {
                         };
                         egui::ComboBox::from_id_salt("keyboard_profile_combo")
                             .selected_text(cur_text)
+                            .width(80.0)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "104".to_string(), s.layout_104);
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "87".to_string(), s.layout_87);
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "60".to_string(), s.layout_60);
                                 ui.selectable_value(&mut self.edit.layout.keyboard_layout, "64".to_string(), s.layout_64);
                             });
-                        ui.label("");
-                        ui.end_row();
-
+                    });
+                    ui.add_space(2.0);
+                    egui::Grid::new("layout_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
                         label(ui, s.settings_key_w);
                         ui.add(egui::DragValue::new(&mut self.edit.layout.key_w).range(30..=200).speed(1.0));
                         label(ui, s.settings_px);
@@ -2838,8 +2859,9 @@ impl App {
                         if ui.button(s.menu_exit).clicked() {
                             self.exiting = true;
                         }
-                        // 按钮靠右：宽窗口下也在容器右下角
+                        // 按钮靠右：宽窗口下也在容器右下角，右边缘预留呼吸空隙避免裁切
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
                             if ui.button(s.settings_save).clicked() {
                                 let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
                                 {
@@ -2851,6 +2873,9 @@ impl App {
                                 self.apply_language();
                                 if layout_changed {
                                     let new_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
+                                    self.resize_target_w = Some(new_w);
+                                    self.user_sized = false;
+                                    self.resize_deadline = Instant::now() + Duration::from_secs(3);
                                     let cur_h = self.last_applied_h.max(BASE_H);
                                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(new_w, cur_h)));
                                 }
