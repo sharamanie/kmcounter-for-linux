@@ -1067,6 +1067,42 @@ mod tests {
         assert!(deepest.r() > deepest.g(), "键盘最深的一格应是红色系：{deepest:?}");
     }
 
+    /// 多配列切换测试：87 / 60 / 64 配列切换后，窗口默认宽度自适应、24h分时条移至顶部导航行、按键正确渲染
+    #[test]
+    fn layout_switching_and_rendering() {
+        let store = Store::default();
+        let (mut app, ctx) = headless_app(store);
+        let cfg = Config::default();
+
+        // ① 87 键（TKL）
+        app.debug_set_layout("87");
+        let w_87 = crate::gui::default_width_for_layout("87", &cfg.layout);
+        assert_eq!(w_87, 1020.0);
+        drive(&mut app, &ctx, w_87, 500.0, 2, vec![]);
+        let strip_87 = app.debug_strip_rect();
+        // 87 配列的分时条在顶部导航行：顶部 y 应小于 100px
+        assert!(strip_87.top() < 100.0, "87 配列分时条应在顶部导航行: {strip_87:?}");
+
+        // ② 60 键（Poker）
+        app.debug_set_layout("60");
+        let w_60 = crate::gui::default_width_for_layout("60", &cfg.layout);
+        assert_eq!(w_60, 920.0);
+        drive(&mut app, &ctx, w_60, 500.0, 2, vec![]);
+        let strip_60 = app.debug_strip_rect();
+        assert!(strip_60.top() < 100.0, "60 配列分时条应在顶部导航行: {strip_60:?}");
+
+        // ③ 64 键（带独立方向键）
+        app.debug_set_layout("64");
+        let w_64 = crate::gui::default_width_for_layout("64", &cfg.layout);
+        assert_eq!(w_64, 920.0);
+        drive(&mut app, &ctx, w_64, 500.0, 2, vec![]);
+        let texts_64 = frame_texts(&ctx, &mut app, w_64, 500.0);
+        assert!(texts_64.iter().any(|t| t == "Esc"), "64 配列应渲染 Esc 标签");
+        assert!(texts_64.iter().any(|t| t == "Fn"), "64 配列应渲染 Fn 标签");
+        let s = app.debug_strings();
+        assert!(texts_64.iter().any(|t| t == s.mkey_l), "64 配列应渲染鼠标键");
+    }
+
     /// 排行页：列出名次、点某一行跳到热力图并选中该键
     #[test]
     fn rank_page_lists_and_jumps() {

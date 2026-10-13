@@ -4,7 +4,9 @@
 
 use crate::chart;
 use crate::config::Config;
-use crate::keys::{KEYS, MAIN_UNITS, NAV_UNITS, NUM_UNITS, MAIN_ROWS};
+use crate::keys::{
+    layout_profile, HourStripPlacement, LayoutKey, LayoutProfile, KEYS,
+};
 use crate::lang::{strings, Lang, Strings};
 use crate::stats::{BucketStats, DayEntry, HourPoint, MouseStats, Shared, Store};
 use crate::tray::Tray;
@@ -256,18 +258,16 @@ fn mouse_heat_color(count: f64, maxcount: f64) -> Color32 {
 /// 方向键上方的 5 个格子：鼠标左/中/右键（上一行）与滚轮/侧键（下一行，中间留出 ↑ 键）。
 /// 它们**不参与键盘热力**：颜色取自「鼠标五键」这个独立计数池（绿色系）。
 struct MouseKeyDef {
-    x: f32,
-    y: f32,
     label: fn(&Strings) -> &'static str,
     value: fn(&MouseStats) -> f64,
 }
 
 const MOUSE_KEYS: [MouseKeyDef; 5] = [
-    MouseKeyDef { x: 0.0, y: 3.0, label: |s| s.mkey_l, value: |m| m.lb as f64 },
-    MouseKeyDef { x: 1.0, y: 3.0, label: |s| s.mkey_m, value: |m| m.mb as f64 },
-    MouseKeyDef { x: 2.0, y: 3.0, label: |s| s.mkey_r, value: |m| m.rb as f64 },
-    MouseKeyDef { x: 0.0, y: 4.0, label: |s| s.mkey_wheel, value: |m| m.wheel as f64 },
-    MouseKeyDef { x: 2.0, y: 4.0, label: |s| s.mkey_side, value: |m| m.xb as f64 },
+    MouseKeyDef { label: |s| s.mkey_l, value: |m| m.lb as f64 },
+    MouseKeyDef { label: |s| s.mkey_m, value: |m| m.mb as f64 },
+    MouseKeyDef { label: |s| s.mkey_r, value: |m| m.rb as f64 },
+    MouseKeyDef { label: |s| s.mkey_wheel, value: |m| m.wheel as f64 },
+    MouseKeyDef { label: |s| s.mkey_side, value: |m| m.xb as f64 },
 ];
 
 /// 鼠标五键的计数池量程（五个值里的最大值）
@@ -364,6 +364,22 @@ pub struct App {
 /// 窗口尺寸管理：底部展开 设置/统计 面板时向下加高窗口（按钮位置保持不动）
 const BASE_W: f32 = 1260.0;
 const BASE_H: f32 = 500.0;
+
+/// 根据键盘配列与几何配置计算窗口默认宽度
+pub fn default_width_for_layout(layout_id: &str, cfg: &crate::config::LayoutCfg) -> f32 {
+    let prof = layout_profile(layout_id);
+    match prof.id {
+        "104" => BASE_W,
+        "87" => 1020.0,
+        "60" | "64" => 920.0,
+        _ => {
+            let u = (cfg.key_w + cfg.key_spacing) as f32;
+            let gap = cfg.h_spacing as f32;
+            let kbd_w = prof.units_w * u + prof.gaps * gap - cfg.key_spacing as f32;
+            (kbd_w + 60.0).max(860.0)
+        }
+    }
+}
 const SETTINGS_EXTRA_H: f32 = 285.0;
 const STATS_EXTRA_H: f32 = 205.0;
 const CONTROLS_H: f32 = 36.0;
@@ -880,47 +896,60 @@ impl App {
         self.last_save = Instant::now();
     }
 
+    pub(crate) fn active_layout(&self) -> &'static LayoutProfile {
+        layout_profile(&self.cfg.layout.keyboard_layout)
+    }
+
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_set_layout(&mut self, id: &str) {
+        self.cfg.layout.keyboard_layout = id.to_string();
+        self.edit.layout.keyboard_layout = id.to_string();
+        self.cfg_shared.lock().layout.keyboard_layout = id.to_string();
+    }
+
     fn current_metrics(&self) -> (f32, f32, f32, Vec2) {
         let l = &self.cfg.layout;
         let u = (l.key_w + l.key_spacing) as f32;
         let pitch = (l.key_h + l.key_spacing) as f32;
         let gap = l.h_spacing as f32;
-        let nav_x = MAIN_UNITS * u + gap;
-        let num_x = nav_x + NAV_UNITS * u + gap;
+        let prof = self.active_layout();
         let size = Vec2::new(
-            num_x + NUM_UNITS * u - l.key_spacing as f32,
-            MAIN_ROWS * pitch - l.key_spacing as f32,
+            prof.units_w * u + prof.gaps * gap - l.key_spacing as f32,
+            prof.rows_h * pitch - l.key_spacing as f32,
         );
         (u, pitch, gap, size)
     }
 
-    /// 按键画在哪一块：直接按分区决定（控制键区那两段都画在导航块，
-    /// PrtScr / ScrollLock / Pause 就在它顶部一行）
-    fn block_offset(&self, i: usize, u: f32, gap: f32) -> f32 {
-        let nav_x = MAIN_UNITS * u + gap;
-        match crate::keys::block_of(i) {
-            crate::keys::Block::Main => 0.0,
-            crate::keys::Block::Control => nav_x,
-            crate::keys::Block::Numpad => nav_x + NAV_UNITS * u + gap,
-        }
-    }
-
-    /// 鼠标五键（方向键上方那 5 个格子）的矩形
-    fn mouse_key_rect(&self, rect: Rect, u: f32, pitch: f32, gap: f32, mk: &MouseKeyDef) -> Rect {
+    fn key_rect_for(&self, lk: &LayoutKey, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
         let spacing = self.cfg.layout.key_spacing as f32;
-        let nav_x = MAIN_UNITS * u + gap;
+        let ox = lk.x * u + lk.gap_count as f32 * gap;
+        let oy = lk.y * pitch;
         Rect::from_min_size(
-            Pos2::new(rect.left() + nav_x + mk.x * u, rect.top() + mk.y * pitch),
-            Vec2::new(u - spacing, pitch - spacing),
+            Pos2::new(rect.left() + ox, rect.top() + oy),
+            Vec2::new(lk.w * u - spacing, lk.h * pitch - spacing),
         )
     }
 
-    fn key_rect(&self, i: usize, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
-        let k = &KEYS[i];
-        let ox = self.block_offset(i, u, gap);
+    #[allow(dead_code)]
+    pub(crate) fn key_rect(&self, i: usize, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
+        let prof = self.active_layout();
+        if let Some(lk) = prof.keys.iter().find(|k| k.idx == i) {
+            self.key_rect_for(lk, rect, u, pitch, gap)
+        } else {
+            Rect::NOTHING
+        }
+    }
+
+    /// 鼠标五键的矩形（根据当前配列自适应摆放）
+    fn mouse_key_rect(&self, rect: Rect, u: f32, pitch: f32, gap: f32, mk_idx: usize) -> Rect {
+        let spacing = self.cfg.layout.key_spacing as f32;
+        let p = &self.active_layout().mouse_keys[mk_idx];
+        let ox = p.x * u + p.gap_count as f32 * gap;
+        let oy = p.y * pitch;
         Rect::from_min_size(
-            Pos2::new(rect.left() + ox + k.x * u, rect.top() + k.y * pitch),
-            Vec2::new(k.w * u - self.cfg.layout.key_spacing as f32, k.h * pitch - self.cfg.layout.key_spacing as f32),
+            Pos2::new(rect.left() + ox, rect.top() + oy),
+            Vec2::new(u - spacing, pitch - spacing),
         )
     }
 
@@ -1445,6 +1474,50 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.page == Page::Heatmap && !self.selected.is_empty() && ui.button(s.sel_clear).clicked() {
                     self.selected.clear();
+                }
+                if self.page == Page::Heatmap && self.active_layout().hour_strip == HourStripPlacement::NavRow {
+                    let (strip, resp) = ui.allocate_exact_size(Vec2::new(214.0, 20.0), Sense::click());
+                    self.strip_rect = strip;
+                    let entry = self.day_for_view();
+                    let prof = entry.hour_profile();
+                    let invalid: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
+                    let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
+                        .then(|| chrono::Local::now().hour().min(23) as u8);
+                    let painter = ui.painter().clone();
+                    paint_hour_lines(&painter, strip, &prof, self.hour_sel, now_hour, &invalid);
+                    if let Some(pos) = resp.hover_pos() {
+                        if let Some(idx) = hour_bar_index(strip, pos.x) {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            let p = prof.get(idx).copied().unwrap_or_default();
+                            let unit = s.unit_times.trim();
+                            let mark = if invalid.get(idx).copied().unwrap_or(false) { s.invalid_mark } else { "" };
+                            let text = format!(
+                                "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
+                                idx,
+                                s.hour_suffix,
+                                s.keystrokes,
+                                p.keystrokes,
+                                unit,
+                                s.mouse_clicks,
+                                p.clicks,
+                                unit,
+                                s.mouse_move,
+                                self.shared.px_to_meters(p.move_px),
+                                s.unit_m,
+                                mark,
+                                s.strip_hint
+                            );
+                            paint_tooltip(&painter, ui, pos, &text);
+                        }
+                    }
+                    if resp.clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            if let Some(idx) = hour_bar_index(strip, pos.x) {
+                                let h = idx as u8;
+                                self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
+                            }
+                        }
+                    }
                 }
             });
         });
@@ -2325,9 +2398,12 @@ impl App {
         // 数据被判定作废的小时不画热力（原始数值仍在数据里）
         let enough = !day.invalid && day.keystrokes >= if self.hour_sel.is_some() { HOUR_ENOUGH_KEYS } else { 100 };
         let key_font = FontId::proportional((self.cfg.layout.key_w as f32 * 0.21).clamp(8.0, 12.0));
+        let prof = self.active_layout();
 
-        for (i, k) in KEYS.iter().enumerate() {
-            let r = self.key_rect(i, rect, u, pitch, gap);
+        for lk in prof.keys {
+            let i = lk.idx;
+            let k = &KEYS[i];
+            let r = self.key_rect_for(lk, rect, u, pitch, gap);
             let count = day.key_count(i) as f64;
             let fill = if enough && count > 0.0 { heat_color(count, maxcount) } else { BG };
             painter.rect_filled(r, 2.0, fill);
@@ -2339,18 +2415,19 @@ impl App {
             };
             painter.rect_stroke(r, 2.0, stroke);
 
+            let label = lk.label_override.unwrap_or(k.label);
             if let Some(dir) = k.arrow {
                 let (a, b, c) = arrow_points(dir, r);
                 painter.add(Shape::convex_polygon(vec![a, b, c], TEXT, egui::Stroke::NONE));
-            } else if !k.label.is_empty() {
-                painter.text(r.center(), Align2::CENTER_CENTER, k.label, key_font.clone(), TEXT);
+            } else if !label.is_empty() {
+                painter.text(r.center(), Align2::CENTER_CENTER, label, key_font.clone(), TEXT);
             }
         }
 
-        // ---- 方向键上方那 5 个格子：鼠标左/中/右键 + 滚轮/侧键（独立计数池，绿色系）----
+        // ---- 鼠标五键（自适应位置：104/87在方向键上方，60/64在键盘右侧列）----
         let pool = mouse_key_pool(&day.mouse);
-        for mk in MOUSE_KEYS.iter() {
-            let r = self.mouse_key_rect(rect, u, pitch, gap, mk);
+        for (mk_idx, mk) in MOUSE_KEYS.iter().enumerate() {
+            let r = self.mouse_key_rect(rect, u, pitch, gap, mk_idx);
             let v = (mk.value)(&day.mouse);
             let fill = if enough && v > 0.0 { mouse_heat_color(v, pool) } else { BG };
             painter.rect_filled(r, 2.0, fill);
@@ -2358,29 +2435,39 @@ impl App {
             painter.text(r.center(), Align2::CENTER_CENTER, (mk.label)(self.s()), key_font.clone(), TEXT);
         }
 
-        // ---- 键盘右上角空白处：24 小时分时折线（点击只看该小时）----
-        let strip = self.hour_strip_rect(rect, u, pitch, gap);
-        self.strip_rect = strip;
-        let prof = entry.hour_profile();
-        let hover_pos = if resp.hovered() { ui.input(|i| i.pointer.hover_pos()) } else { None };
+        // ---- 键盘内部分时折线（104 键在小键盘上方；87/60/64 移至顶部日期导航行）----
+        let in_kbd_strip = matches!(prof.hour_strip, HourStripPlacement::KeyboardRect { .. });
+        let strip = if in_kbd_strip {
+            let s = self.hour_strip_rect(rect, u, pitch, gap);
+            self.strip_rect = s;
+            let hprof = entry.hour_profile();
+            let hstrip_sel = self.hour_sel;
+            let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
+                .then(|| chrono::Local::now().hour().min(23) as u8);
+            let invalid_hours: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
+            paint_hour_lines(&painter, s, &hprof, hstrip_sel, now_hour, &invalid_hours);
+            Some((s, hprof, invalid_hours))
+        } else {
+            None
+        };
 
-        let hstrip_sel = self.hour_sel;
-        let now_hour = (self.view_idx > 0 && self.view_label() == self.snap_today)
-            .then(|| chrono::Local::now().hour().min(23) as u8);
-        let invalid_hours: Vec<bool> = (0..HOURS).map(|h| entry.hour_invalid(h as u8)).collect();
-        paint_hour_lines(&painter, strip, &prof, hstrip_sel, now_hour, &invalid_hours);
-
-        // ---- 点击：分布条优先，其次是按键（选中/取消，查看按压次数）----
+        // ---- 点击：键盘内分布条优先，其次是按键（选中/取消，查看按压次数）----
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                if strip.contains(pos) {
-                    if let Some(idx) = hour_bar_index(strip, pos.x) {
-                        let h = idx as u8;
-                        self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
+                let mut hit_strip = false;
+                if let Some((strip_box, _, _)) = &strip {
+                    if strip_box.contains(pos) {
+                        if let Some(idx) = hour_bar_index(*strip_box, pos.x) {
+                            let h = idx as u8;
+                            self.hour_sel = if self.hour_sel == Some(h) { None } else { Some(h) };
+                        }
+                        hit_strip = true;
                     }
-                } else {
-                    for i in 0..KEYS.len() {
-                        if self.key_rect(i, rect, u, pitch, gap).contains(pos) {
+                }
+                if !hit_strip {
+                    for lk in prof.keys {
+                        let i = lk.idx;
+                        if self.key_rect_for(lk, rect, u, pitch, gap).contains(pos) {
                             if !self.selected.remove(&i) {
                                 self.selected.insert(i);
                             }
@@ -2392,36 +2479,41 @@ impl App {
         }
 
         // ---- 悬停提示：分布条显示该小时数值，按键显示该键敲击次数 ----
+        let hover_pos = if resp.hovered() { ui.input(|i| i.pointer.hover_pos()) } else { None };
         if let Some(pos) = hover_pos {
-            if strip.contains(pos) {
-                if let Some(idx) = hour_bar_index(strip, pos.x) {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    let p = prof.get(idx).copied().unwrap_or_default();
-                    let unit = self.s().unit_times.trim();
-                    let mark = if invalid_hours.get(idx).copied().unwrap_or(false) { self.s().invalid_mark } else { "" };
-                    let text = format!(
-                        "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
-                        idx,
-                        self.s().hour_suffix,
-                        self.s().keystrokes,
-                        p.keystrokes,
-                        unit,
-                        self.s().mouse_clicks,
-                        p.clicks,
-                        unit,
-                        self.s().mouse_move,
-                        self.shared.px_to_meters(p.move_px),
-                        self.s().unit_m,
-                        mark,
-                        self.s().strip_hint
-                    );
-                    paint_tooltip(&painter, ui, pos, &text);
+            let mut handled = false;
+            if let Some((strip_box, hprof, invalid_hours)) = &strip {
+                if strip_box.contains(pos) {
+                    if let Some(idx) = hour_bar_index(*strip_box, pos.x) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        let p = hprof.get(idx).copied().unwrap_or_default();
+                        let unit = self.s().unit_times.trim();
+                        let mark = if invalid_hours.get(idx).copied().unwrap_or(false) { self.s().invalid_mark } else { "" };
+                        let text = format!(
+                            "{}{} · {} {}{} · {} {}{} · {} {:.2} {}{}{}",
+                            idx,
+                            self.s().hour_suffix,
+                            self.s().keystrokes,
+                            p.keystrokes,
+                            unit,
+                            self.s().mouse_clicks,
+                            p.clicks,
+                            unit,
+                            self.s().mouse_move,
+                            self.shared.px_to_meters(p.move_px),
+                            self.s().unit_m,
+                            mark,
+                            self.s().strip_hint
+                        );
+                        paint_tooltip(&painter, ui, pos, &text);
+                    }
+                    handled = true;
                 }
-            } else {
-                // 鼠标五键（方向键上方）优先：显示各自的计数
-                let mut hit_mouse_key = false;
-                for mk in MOUSE_KEYS.iter() {
-                    if self.mouse_key_rect(rect, u, pitch, gap, mk).contains(pos) {
+            }
+            if !handled {
+                // 鼠标五键优先：显示各自的计数
+                for (mk_idx, mk) in MOUSE_KEYS.iter().enumerate() {
+                    if self.mouse_key_rect(rect, u, pitch, gap, mk_idx).contains(pos) {
                         let v = (mk.value)(&day.mouse) as u64;
                         if v > 0 {
                             let unit = self.s().unit_times.trim();
@@ -2432,19 +2524,21 @@ impl App {
                             };
                             paint_tooltip(&painter, ui, pos, &text);
                         }
-                        hit_mouse_key = true;
+                        handled = true;
                         break;
                     }
                 }
-                for (i, k) in KEYS.iter().enumerate() {
-                    if hit_mouse_key {
-                        break;
-                    }
-                    let r = self.key_rect(i, rect, u, pitch, gap);
+            }
+            if !handled {
+                for lk in prof.keys {
+                    let i = lk.idx;
+                    let k = &KEYS[i];
+                    let r = self.key_rect_for(lk, rect, u, pitch, gap);
                     if r.contains(pos) {
                         let count = day.key_count(i);
                         if count > 0 {
-                            let label = if k.label.is_empty() { k.name } else { k.label };
+                            let raw_label = lk.label_override.unwrap_or(k.label);
+                            let label = if raw_label.is_empty() { k.name } else { raw_label };
                             let unit = self.s().unit_times.trim();
                             let text = if unit.is_empty() {
                                 format!("{label}: {count}")
@@ -2460,19 +2554,20 @@ impl App {
         }
     }
 
-    /// 分时分布条的位置：F 行右侧、数字键盘区上方那一块空白（正好一个键位高）。
-    /// 导航区顶部现在放了 PrtScr / ScrollLock / Pause，所以这块只剩数字键盘上方 4 个单位宽。
-    /// 右边界与键盘矩形对齐（num_x + 4 个单位 - 键间距）：多算一个 h_spacing 会伸出键盘右缘，
-    /// 而点击/悬停只在键盘矩形内生效，最右边一小截就点不到了。
+    /// 分时分布条的位置：若在键盘内部，计算其几何区域；若在导航行，返回已分配的 strip_rect。
     fn hour_strip_rect(&self, rect: Rect, u: f32, pitch: f32, gap: f32) -> Rect {
         let spacing = self.cfg.layout.key_spacing as f32;
-        let nav_x = MAIN_UNITS * u + gap;
-        let num_x = nav_x + NAV_UNITS * u + gap;
-        let right = num_x + NUM_UNITS * u - spacing;
-        Rect::from_min_max(
-            Pos2::new(rect.left() + num_x, rect.top()),
-            Pos2::new(rect.left() + right, rect.top() + pitch - spacing),
-        )
+        match self.active_layout().hour_strip {
+            HourStripPlacement::KeyboardRect { x, y, w, gap_count } => {
+                let ox = x * u + gap_count as f32 * gap;
+                let oy = y * pitch;
+                Rect::from_min_size(
+                    Pos2::new(rect.left() + ox, rect.top() + oy),
+                    Vec2::new(w * u - spacing, pitch - spacing),
+                )
+            }
+            HourStripPlacement::NavRow => self.strip_rect,
+        }
     }
 
     /// 统计表：列随视图变化 ——
@@ -2675,6 +2770,25 @@ impl App {
                     ui.strong(egui::RichText::new(s.settings_layout).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_layout_sub).small().color(TEXT));
                     egui::Grid::new("layout_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                        label(ui, s.settings_keyboard_profile);
+                        let cur_layout = self.edit.layout.keyboard_layout.as_str();
+                        let cur_text = match cur_layout {
+                            "87" => s.layout_87,
+                            "60" => s.layout_60,
+                            "64" => s.layout_64,
+                            _ => s.layout_104,
+                        };
+                        egui::ComboBox::from_id_salt("keyboard_profile_combo")
+                            .selected_text(cur_text)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "104".to_string(), s.layout_104);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "87".to_string(), s.layout_87);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "60".to_string(), s.layout_60);
+                                ui.selectable_value(&mut self.edit.layout.keyboard_layout, "64".to_string(), s.layout_64);
+                            });
+                        ui.label("");
+                        ui.end_row();
+
                         label(ui, s.settings_key_w);
                         ui.add(egui::DragValue::new(&mut self.edit.layout.key_w).range(30..=200).speed(1.0));
                         label(ui, s.settings_px);
@@ -2727,6 +2841,7 @@ impl App {
                         // 按钮靠右：宽窗口下也在容器右下角
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(s.settings_save).clicked() {
+                                let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
                                 {
                                     let mut cfg = self.cfg_shared.lock();
                                     *cfg = self.edit.clone();
@@ -2734,6 +2849,11 @@ impl App {
                                 }
                                 self.cfg = self.edit.clone();
                                 self.apply_language();
+                                if layout_changed {
+                                    let new_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
+                                    let cur_h = self.last_applied_h.max(BASE_H);
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(new_w, cur_h)));
+                                }
                                 // 阈值同步给输入线程（它按这个判定小时是否作废）：
                                 // 先把新屏幕尺寸写回 shared（0 = 恢复自动检测），再用同一套比例换算公里阈值，
                                 // 否则同一次保存里改了屏幕尺寸的话，阈值会按旧尺寸算
