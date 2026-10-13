@@ -1845,6 +1845,98 @@ mod tests {
         assert_eq!(app.debug_hour_sel(), None);
     }
 
+    /// 滚轮平滑滚动微增量防抖与历史日期边界防回绕测试
+    #[test]
+    fn wheel_jitter_and_boundary_clamping() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        drive(&mut app, &ctx, 1260.0, 500.0, 3, vec![]);
+        // 初始为今日 (view_idx = 1)
+        app.debug_set_view_idx(1);
+        let today_label = app.debug_view_label();
+
+        let center = Pos2::new(600.0, 200.0);
+        let wheel = |dy: f32| {
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]
+        };
+
+        // ① 微增量防抖：单次小滚动 5.0 不应触发日期跳跃
+        drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(5.0));
+        assert_eq!(app.debug_view_label(), today_label, "微增量 5.0 不应触发跳跃");
+
+        // 再次小滚动 10.0，累积 15.0 仍未达到 20.0 阈值
+        drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(10.0));
+        assert_eq!(app.debug_view_label(), today_label, "累积 15.0 仍不应触发跳跃");
+
+        // 补足 6.0，总累积达到 21.0 >= 20.0，应正好跳一步到「总计」
+        drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(6.0));
+        assert_eq!(app.debug_view_label(), app.debug_strings().total_label, "累积满阈值应步进到总计");
+
+        // ② 边界防回绕：在总计（最顶端）继续往未来向上滚动，绝不能跳到最老的历史天
+        drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(40.0));
+        assert_eq!(app.debug_view_label(), app.debug_strings().total_label, "在总计往上滚应钳位在总计，不得回绕到最老历史天");
+
+        // ③ 向下滚动至最远历史天，到达后继续往下滚，绝不能回绕到总计
+        for _ in 0..10 {
+            drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(-40.0));
+        }
+        let oldest_label = app.debug_view_label();
+        assert_ne!(oldest_label, app.debug_strings().total_label, "已滚动至历史最早一天");
+        drive(&mut app, &ctx, 1260.0, 500.0, 1, wheel(-40.0));
+        assert_eq!(app.debug_view_label(), oldest_label, "在最早历史天继续向下滚应停在最早一天，不得回绕到总计");
+    }
+
+    /// 统一键盘配列名称格式测试：所有配列均为“xx 键 (别名)”格式
+    #[test]
+    fn layout_names_unified_format() {
+        let (mut app, _ctx) = headless_app(Store::default());
+        let s = app.debug_strings();
+        assert_eq!(s.layout_104, "104 键 (全尺寸)");
+        assert_eq!(s.layout_98, "98 键 (紧凑全键)");
+        assert_eq!(s.layout_87, "87 键 (TKL)");
+        assert_eq!(s.layout_75, "84 键 (75%)");
+        assert_eq!(s.layout_68, "68 键 (65%)");
+        assert_eq!(s.layout_64, "64 键 (独立方向键)");
+        assert_eq!(s.layout_60, "60 键 (Poker)");
+
+        assert_eq!(crate::keys::layout_profile("75").name_zh, "84 键 (75%)");
+        assert_eq!(crate::keys::layout_profile("75").name_en, "84-Key (75%)");
+        assert_eq!(crate::keys::layout_profile("68").name_zh, "68 键 (65%)");
+        assert_eq!(crate::keys::layout_profile("68").name_en, "68-Key (65%)");
+
+        // 切换英文模式验证
+        app.debug_set_language("en");
+        let en = app.debug_strings();
+        assert_eq!(en.layout_75, "84-Key (75%)");
+        assert_eq!(en.layout_68, "68-Key (65%)");
+    }
+
+    /// 84 / 68 紧凑配列下展开设置第三栏数据校验右侧留白充足
+    #[test]
+    fn limits_section_right_margin_in_compact_layout() {
+        let (mut app, ctx) = headless_app(Store::default());
+        app.debug_open_panel();
+        app.debug_set_layout("75");
+        let w = crate::gui::default_width_for_layout("75", &Config::default().layout);
+        assert_eq!(w, 940.0);
+        drive(&mut app, &ctx, w, 900.0, 3, vec![]);
+        let panel = frame_texts_pos(&ctx, &mut app, w, 900.0);
+        // 校验数据校验副文本与单位文本均在安全右边界以内
+        let limits_sub = panel.iter().find(|(_, _, _, t)| t.contains("某个小时超过阈值"));
+        assert!(limits_sub.is_some(), "应渲染数据校验副文本");
+        for (y, x, text_w, t) in &panel {
+            if *y > 350.0 && !t.trim().is_empty() {
+                assert!(*x + *text_w <= w - 12.0, "文本 '{t}' 超出安全留白边界: x={x}, w={text_w}, max={}", w - 12.0);
+            }
+        }
+    }
+
     /// 生成 README 配图（默认 ignore；用 --ignored 跑）
     /// 环境变量：KMCOUNTER_SHOT_STATS 指定演示数据；KMCOUNTER_SHOT_DIR 指定输出目录
     /// 各种界面状态通过 debug 入口配置（不设进程级环境变量，避免与并行测试互相串）

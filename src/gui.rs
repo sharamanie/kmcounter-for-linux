@@ -363,6 +363,8 @@ pub struct App {
     cal_month: (i32, u32),
     /// 日期标题的矩形（日历定位用）
     nav_title_rect: Rect,
+    /// 鼠标滚轮翻页增量累加器（防微增量连发与抖动）
+    wheel_delta_accum: f32,
 }
 
 /// 窗口尺寸管理：底部展开 设置/统计 面板时向下加高窗口（按钮位置保持不动）
@@ -558,6 +560,7 @@ impl App {
             cal_open: std::env::var("KMCOUNTER_CAL").map(|v| v == "1").unwrap_or(false),
             cal_month: (chrono::Local::now().year(), chrono::Local::now().month()),
             nav_title_rect: Rect::NOTHING,
+            wheel_delta_accum: 0.0,
             start_minimized,
             last_applied_h: BASE_H,
             resize_target: None,
@@ -648,12 +651,15 @@ impl App {
         if len <= 1 {
             return;
         }
+        let old_idx = self.view_idx;
         self.view_idx = if newer {
-            if self.view_idx == 0 { len - 1 } else { self.view_idx - 1 }
+            self.view_idx.saturating_sub(1)
         } else {
-            (self.view_idx + 1) % len
+            (self.view_idx + 1).min(len - 1)
         };
-        self.title_dirty = true;
+        if self.view_idx != old_idx {
+            self.title_dirty = true;
+        }
     }
 
     /// 当前页面的显示区间（当周/当月/当年、排行页的当周/当月/当年/全部这类「一段」）。
@@ -774,14 +780,26 @@ impl App {
     fn nav_hour_step(&mut self, newer: bool) {
         let date = self.anchor_date();
         let h = self.anchor_hour() as i32;
+        let today = NaiveDate::parse_from_str(&self.snap_today, "%Y%m%d")
+            .unwrap_or_else(|_| chrono::Local::now().date_naive());
         let (nd, nh) = if newer {
-            if h >= 23 {
+            if date >= today && h >= 23 {
+                (date, 23)
+            } else if h >= 23 {
                 (shift_days(date, 1), 0)
             } else {
                 (date, h + 1)
             }
         } else if h <= 0 {
-            (shift_days(date, -1), 23)
+            let earliest = self.view_days.last()
+                .and_then(|o| o.as_deref())
+                .and_then(|d| NaiveDate::parse_from_str(d, "%Y%m%d").ok())
+                .unwrap_or(date);
+            if date <= earliest {
+                (date, 0)
+            } else {
+                (shift_days(date, -1), 23)
+            }
         } else {
             (date, h - 1)
         };
@@ -810,7 +828,7 @@ impl App {
             idx = if newer {
                 self.view_idx.saturating_sub(1)
             } else {
-                (self.view_idx + 1) % self.view_days.len()
+                (self.view_idx + 1).min(self.view_days.len() - 1)
             };
             if idx == self.view_idx {
                 return;
@@ -1219,11 +1237,29 @@ impl App {
             if down {
                 self.nav_step(false);
             }
-            if wheel_y > 0.0 {
-                self.nav_step(true);
-            } else if wheel_y < 0.0 {
-                self.nav_step(false);
+            const WHEEL_THRESHOLD: f32 = 20.0;
+            if wheel_y.abs() > 0.0 {
+                // 方向反转时立即清空累加，避免反向迟滞
+                if (self.wheel_delta_accum > 0.0 && wheel_y < 0.0) || (self.wheel_delta_accum < 0.0 && wheel_y > 0.0) {
+                    self.wheel_delta_accum = 0.0;
+                }
+                self.wheel_delta_accum += wheel_y;
+                if self.wheel_delta_accum >= WHEEL_THRESHOLD {
+                    self.nav_step(true);
+                    self.wheel_delta_accum = 0.0;
+                } else if self.wheel_delta_accum <= -WHEEL_THRESHOLD {
+                    self.nav_step(false);
+                    self.wheel_delta_accum = 0.0;
+                }
+            } else {
+                // 无滚轮输入时衰减累加值，防止残留增量在下一次滚动时误触
+                self.wheel_delta_accum *= 0.5;
+                if self.wheel_delta_accum.abs() < 1.0 {
+                    self.wheel_delta_accum = 0.0;
+                }
             }
+        } else {
+            self.wheel_delta_accum = 0.0;
         }
 
         // ---- 界面 ----
@@ -2765,7 +2801,7 @@ impl App {
     fn show_settings_section(&mut self, ui: &mut egui::Ui, s: &'static Strings) {
         let avail_before = ui.available_width();
         let pad = group_pad(ui);
-        let inner_w = (avail_before - pad.x - 2.0).max(200.0);
+        let inner_w = (avail_before - pad.x - 6.0).max(200.0);
         let frame = egui::Frame::group(ui.style())
             .fill(Color32::from_rgb(0xF7, 0xF7, 0xF7))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDD, 0xDD, 0xDD)))
@@ -2879,10 +2915,13 @@ impl App {
 
                 let mut render_limits = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_limits).size(14.0).color(TEXT));
-                    ui.add(egui::Label::new(egui::RichText::new(s.settings_limits_sub).small().color(TEXT)).wrap());
+                    ui.scope(|ui| {
+                        ui.set_max_width((ui.available_width() - 14.0).max(100.0));
+                        ui.add(egui::Label::new(egui::RichText::new(s.settings_limits_sub).small().color(TEXT)).wrap());
+                    });
                     egui::Grid::new("limits_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
                         label(ui, s.settings_limit_move);
-                        ui.add(egui::DragValue::new(&mut self.edit.limit_move_km).range(0.0..=100000.0).speed(1.0));
+                        ui.add(egui::DragValue::new(&mut self.edit.limit_move_km).range(0.0..=100000.0).speed(1.0).fixed_decimals(0));
                         label(ui, s.unit_km_per_hour);
                         ui.end_row();
                         label(ui, s.settings_limit_click);

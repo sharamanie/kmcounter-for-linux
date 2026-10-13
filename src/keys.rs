@@ -1055,8 +1055,8 @@ pub static LAYOUT_87: LayoutProfile = LayoutProfile {
 
 pub static LAYOUT_75: LayoutProfile = LayoutProfile {
     id: "75",
-    name_zh: "75% (84 键)",
-    name_en: "75% (84-Key)",
+    name_zh: "84 键 (75%)",
+    name_en: "84-Key (75%)",
     units_w: 17.0,
     gaps: 1.0,
     rows_h: 6.0,
@@ -1067,7 +1067,7 @@ pub static LAYOUT_75: LayoutProfile = LayoutProfile {
 
 pub static LAYOUT_68: LayoutProfile = LayoutProfile {
     id: "68",
-    name_zh: "68 键 (65% 配列)",
+    name_zh: "68 键 (65%)",
     name_en: "68-Key (65%)",
     units_w: 17.0,
     gaps: 1.0,
