@@ -302,6 +302,8 @@ pub struct App {
     content_bottom: f32,
     /// 上一帧实际窗口高度（用于识别用户手动缩放）
     last_seen_h: f32,
+    /// 上一帧实际窗口宽度（用于识别用户手动缩放）
+    last_seen_w: f32,
     /// 用户手动调整过窗口大小后不再自动贴合内容
     user_sized: bool,
     /// 调试：自截图输出前缀（KMCOUNTER_SCREENSHOT=/path/prefix）
@@ -372,13 +374,13 @@ pub fn default_width_for_layout(layout_id: &str, cfg: &crate::config::LayoutCfg)
     let prof = layout_profile(layout_id);
     match prof.id {
         "104" => BASE_W,
-        "87" => 1040.0,
-        "60" | "64" => 980.0,
+        "87" => 990.0,
+        "60" | "64" => 860.0,
         _ => {
             let u = (cfg.key_w + cfg.key_spacing) as f32;
             let gap = cfg.h_spacing as f32;
             let kbd_w = prof.units_w * u + prof.gaps * gap - cfg.key_spacing as f32;
-            (kbd_w + 60.0).max(960.0)
+            (kbd_w + 24.0).max(840.0)
         }
     }
 }
@@ -565,6 +567,7 @@ impl App {
             bottom_region_top: f32::MAX,
             content_bottom: 0.0,
             last_seen_h: 0.0,
+            last_seen_w: 0.0,
             user_sized: false,
             screenshot_prefix: std::env::var("KMCOUNTER_SCREENSHOT").ok().filter(|s| !s.is_empty()),
             frame_count: 0,
@@ -1104,18 +1107,42 @@ impl App {
         }
 
         // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
-        // 识别用户手动缩放：无待处理 resize 时窗口尺寸自己变了 → 尊重用户，不再自动贴合
-        let actual_h = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
+        let (actual_h, actual_w) = ctx.input(|i| {
+            let r = i.viewport().inner_rect;
+            (r.map(|r| r.height()), r.map(|r| r.width()))
+        });
+        // 配列默认宽度：若未手动拉伸且无处理中 resize，自动贴合当前配列宽度（杜绝右侧留白）
+        let want_w = default_width_for_layout(&self.cfg.layout.keyboard_layout, &self.cfg.layout);
+        if !self.user_sized && self.resize_target_w.is_none() {
+            if let Some(w) = actual_w {
+                if (w - want_w).abs() > 5.0 {
+                    self.resize_target_w = Some(want_w);
+                    self.resize_deadline = Instant::now() + Duration::from_secs(3);
+                }
+            }
+        }
+        // 识别用户手动缩放：无待处理 resize 时宽度变了（或收起状态下高度变了）→ 尊重用户手动设定
         if self.resize_target.is_none() && self.resize_target_w.is_none() && !self.user_sized {
-            if let (Some(h), true) = (actual_h, self.last_seen_h > 100.0) {
-                if (h - self.last_seen_h).abs() > 3.0 {
+            if let (Some(w), true) = (actual_w, self.last_seen_w > 100.0) {
+                if (w - self.last_seen_w).abs() > 4.0 {
                     self.user_sized = true;
-                    log::debug!("检测到用户手动调整窗口大小，停止自动贴合内容");
+                    log::debug!("检测到用户手动调整窗口宽度，停止自动贴合");
+                }
+            }
+            if !self.more_open {
+                if let (Some(h), true) = (actual_h, self.last_seen_h > 100.0) {
+                    if (h - self.last_seen_h).abs() > 4.0 {
+                        self.user_sized = true;
+                        log::debug!("检测到用户手动调整窗口高度，停止自动贴合");
+                    }
                 }
             }
         }
         if let Some(h) = actual_h {
             self.last_seen_h = h;
+        }
+        if let Some(w) = actual_w {
+            self.last_seen_w = w;
         }
         if self.user_sized {
             // 用户手动定过尺寸：收起时以实际高度为准
@@ -1363,11 +1390,11 @@ impl App {
                 if self.more_open {
                     let before = ui.cursor().min.y;
                     // 左右两栏：统计在左、设置在右，宽度按窗口宽度合理分配
-                    // 宽窗口（>=1200）给统计较多空间；紧凑窗口（<1200）保证右侧设置面板有充足宽度
+                    // 宽窗口（>=1200）给统计较多空间；紧凑窗口（<1200）给统计约 240px，保证右侧设置面板有充足宽度
                     let left_w = if panel_area_w >= 1200.0 {
                         (panel_area_w * 0.38 - 4.0).clamp(330.0, 480.0)
                     } else {
-                        (panel_area_w * 0.30).clamp(260.0, 310.0)
+                        (panel_area_w * 0.28).clamp(230.0, 290.0)
                     };
                     let right_w = (panel_area_w - left_w - 8.0).max(360.0);
                     geo_log("panel area", Rect::from_min_size(Pos2::ZERO, Vec2::new(panel_area_w, 0.0)));
@@ -2742,9 +2769,7 @@ impl App {
 
                 ui.strong(egui::RichText::new(s.settings_title).size(16.0).color(TEXT));
                 ui.add_space(2.0);
-                ui.columns(3, |cols| {
-                    // 左栏：历史数据 + 屏幕尺寸
-                    let ui = &mut cols[0];
+                let mut render_history_screen_lang = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_history).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_history_sub).small().color(TEXT));
                     ui.horizontal(|ui| {
@@ -2755,7 +2780,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.strong(egui::RichText::new(s.settings_screen).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_screen_sub).small().color(TEXT));
-                    egui::Grid::new("screen_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                    egui::Grid::new("screen_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
                         label(ui, s.settings_width);
                         ui.add(egui::DragValue::new(&mut self.edit.screen_w_mm).range(0..=20000).speed(1.0));
                         label(ui, s.settings_mm);
@@ -2766,15 +2791,12 @@ impl App {
                         ui.end_row();
                     });
 
-
-                    // 左栏之二：界面语言（三栏重新分配：语言挪到最矮的第一栏，第三栏不再拖得很长）
                     ui.add_space(6.0);
                     ui.strong(egui::RichText::new(s.settings_language).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_language_sub).small().color(TEXT));
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.edit.language, "auto".to_string(), s.lang_auto);
                         for (code, name) in crate::lang::LANG_CHOICES {
-                            // 没有中文字体时不提供中文选项（选了也会回退英文）
                             if code == "zh" && !self.has_cjk {
                                 continue;
                             }
@@ -2784,9 +2806,9 @@ impl App {
                     if !self.has_cjk {
                         ui.label(egui::RichText::new(s.lang_no_cjk).small().color(DELTA_DOWN));
                     }
+                };
 
-                    // 中栏：键盘布局
-                    let ui = &mut cols[1];
+                let mut render_layout = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_layout).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_layout_sub).small().color(TEXT));
                     ui.horizontal(|ui| {
@@ -2827,9 +2849,9 @@ impl App {
                         label(ui, s.settings_px);
                         ui.end_row();
                     });
+                };
 
-                    // 右栏：窗口行为 + 数据校验
-                    let ui = &mut cols[2];
+                let mut render_window_limits = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_window).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_window_sub).small().color(TEXT));
                     ui.checkbox(&mut self.edit.keep_on_top, s.settings_keep_on_top);
@@ -2837,7 +2859,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.strong(egui::RichText::new(s.settings_limits).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_limits_sub).small().color(TEXT));
-                    egui::Grid::new("limits_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+                    egui::Grid::new("limits_grid").num_columns(3).spacing([6.0, 4.0]).show(ui, |ui| {
                         label(ui, s.settings_limit_move);
                         ui.add(egui::DragValue::new(&mut self.edit.limit_move_km).range(0.0..=100000.0).speed(1.0));
                         label(ui, s.unit_km_per_hour);
@@ -2851,7 +2873,25 @@ impl App {
                         label(ui, s.unit_per_hour);
                         ui.end_row();
                     });
-                    }); // ui.columns(3)
+                };
+
+                if inner_w < 680.0 {
+                    // 紧凑小排列（60 / 64 / 87 配列，窗口宽 860~1000px）：两栏排布，宽敞舒展
+                    ui.columns(2, |cols| {
+                        render_history_screen_lang(&mut cols[0]);
+
+                        render_layout(&mut cols[1]);
+                        cols[1].add_space(6.0);
+                        render_window_limits(&mut cols[1]);
+                    });
+                } else {
+                    // 宽窗口（如 104 配列 1260px）：三栏排布
+                    ui.columns(3, |cols| {
+                        render_history_screen_lang(&mut cols[0]);
+                        render_layout(&mut cols[1]);
+                        render_window_limits(&mut cols[2]);
+                    });
+                }
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {

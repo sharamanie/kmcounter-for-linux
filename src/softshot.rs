@@ -1077,7 +1077,7 @@ mod tests {
         // ① 87 键（TKL）
         app.debug_set_layout("87");
         let w_87 = crate::gui::default_width_for_layout("87", &cfg.layout);
-        assert_eq!(w_87, 1040.0);
+        assert_eq!(w_87, 990.0);
         drive(&mut app, &ctx, w_87, 500.0, 2, vec![]);
         let strip_87 = app.debug_strip_rect();
         // 87 配列的分时条在顶部导航行：顶部 y 应小于 100px，且紧跟钟点控件（不偏离漂移到最右端）
@@ -1087,7 +1087,7 @@ mod tests {
         // ② 60 键（Poker）
         app.debug_set_layout("60");
         let w_60 = crate::gui::default_width_for_layout("60", &cfg.layout);
-        assert_eq!(w_60, 980.0);
+        assert_eq!(w_60, 860.0);
         drive(&mut app, &ctx, w_60, 500.0, 2, vec![]);
         let strip_60 = app.debug_strip_rect();
         assert!(strip_60.top() < 100.0, "60 配列分时条应在顶部导航行: {strip_60:?}");
@@ -1096,13 +1096,22 @@ mod tests {
         // ③ 64 键（带独立方向键）
         app.debug_set_layout("64");
         let w_64 = crate::gui::default_width_for_layout("64", &cfg.layout);
-        assert_eq!(w_64, 980.0);
+        assert_eq!(w_64, 860.0);
         drive(&mut app, &ctx, w_64, 500.0, 2, vec![]);
         let texts_64 = frame_texts(&ctx, &mut app, w_64, 500.0);
         assert!(texts_64.iter().any(|t| t == "Esc"), "64 配列应渲染 Esc 标签");
         assert!(texts_64.iter().any(|t| t == "Fn"), "64 配列应渲染 Fn 标签");
         let s = app.debug_strings();
         assert!(texts_64.iter().any(|t| t == s.mkey_l), "64 配列应渲染鼠标键");
+
+        // ④ 展开面板：紧凑配列（860px）下自适应为 2 栏，设置项全部正常渲染无截断
+        app.debug_open_panel();
+        drive(&mut app, &ctx, w_64, 900.0, 2, vec![]);
+        let panel_texts = frame_texts(&ctx, &mut app, w_64, 900.0);
+        assert!(panel_texts.iter().any(|t| t == s.settings_history), "应渲染历史数据");
+        assert!(panel_texts.iter().any(|t| t == s.settings_layout), "应渲染键盘布局");
+        assert!(panel_texts.iter().any(|t| t == s.settings_limits), "应渲染数据校验");
+        assert!(panel_texts.iter().any(|t| t == s.settings_save), "应渲染保存按钮");
     }
 
     /// 排行页：列出名次、点某一行跳到热力图并选中该键
