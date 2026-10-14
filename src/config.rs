@@ -57,8 +57,6 @@ pub struct Config {
     pub autostart: bool,
     /// 首次运行的欢迎横幅是否已显示过
     pub welcome_shown: bool,
-    /// 极简悬浮窗 HUD 模式（旧版兼容标志）
-    pub hud_mode: bool,
     /// 独立 APM 悬浮窗是否显示
     pub hud_apm_show: bool,
     /// APM 滑动窗口大小（秒），默认 60
@@ -67,12 +65,54 @@ pub struct Config {
     pub hud_kps_show: bool,
     /// KPS 滑动窗口大小（毫秒），默认 1000
     pub kps_window_ms: u32,
-    /// KPS 监控按键列表（逗号隔开，如 "Z, X, M1, M2"）
+    /// KPS 监控按键列表（逗号隔开，如 "Q, W, E, R"）
     pub kps_keys: String,
+    /// KPS 监控键数量（1~26）：键表按这个数量维护，默认键位取自 QWERTY 序列
+    pub kps_key_count: u8,
     /// KPS 悬浮窗是否显示按键累计次数
     pub kps_show_hits: bool,
     /// KPS 悬浮窗是否显示 Max 峰值
     pub kps_show_max: bool,
+    /// KPS 悬浮窗是否显示平均 KPS（自上次重置起）
+    pub kps_show_avg: bool,
+    /// KPS 悬浮窗：每个键也显示它自己的 KPS
+    pub kps_show_key_kps: bool,
+    /// KPS 悬浮窗缩放（百分比，60~400；对齐 osu-kps 的 Zoom 菜单）
+    pub kps_scale: u16,
+    /// APM 胶囊条缩放（百分比，60~400；对齐 KPS 的缩放）
+    pub apm_scale: u16,
+    /// KPS 键格是否让**最后一行**的键平分整行宽度（参照用户自定义的分行布局）
+    pub kps_auto_width: bool,
+    /// KPS 计算方式："hard"（严格按窗口计数）| "sensitive"（指数平滑，更跟手）
+    pub kps_method: String,
+    /// KPS 悬浮窗是否显示按键格子
+    pub kps_show_buttons: bool,
+    /// KPS 悬浮窗是否显示统计信息（当前 / Max / 平均）
+    pub kps_show_stats: bool,
+    /// KPS 悬浮窗是否显示 KPS 随时间变化的图
+    pub kps_show_graph: bool,
+    /// KPS 图的时长（秒，10~300）
+    pub kps_graph_secs: u32,
+    /// APM 悬浮窗背景不透明度（0~100）
+    pub apm_hud_opacity: u8,
+    /// APM 悬浮窗：拖动后若超出屏幕自动推回（对齐 osu-kps 的同名选项；默认开）
+    pub apm_keep_in_screen: bool,
+    /// KPS 悬浮窗：同上
+    pub kps_keep_in_screen: bool,
+    /// 上次退出时的 APM 悬浮窗位置（窗口左上角，逻辑像素；自动记录、重启恢复，无设置项）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apm_hud_pos: Option<(f32, f32)>,
+    /// 上次退出时的 KPS 悬浮窗位置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kps_hud_pos: Option<(f32, f32)>,
+    /// KPS 悬浮窗背景不透明度（0~100）
+    pub kps_hud_opacity: u8,
+    /// APM 悬浮窗是否显示键盘敲击数
+    pub apm_show_keys: bool,
+    /// APM 悬浮窗是否显示鼠标点击数
+    pub apm_show_clicks: bool,
+    /// APM 悬浮窗是否显示鼠标移动距离
+    pub apm_show_dist: bool,
     /// 鼠标移动距离阈值（公里/小时）：某个小时超过则**该小时整体作废**
     /// （原始数值仍记录在案并打上标记，只是不计入当日/总计；0 = 关闭）
     pub limit_move_km: f64,
@@ -96,14 +136,33 @@ impl Default for Config {
             screen_px_w: 0,
             font_path: String::new(),
             autostart: false,
-            hud_mode: false,
             hud_apm_show: false,
             apm_window_secs: 60,
             hud_kps_show: false,
             kps_window_ms: 1000,
-            kps_keys: "Z, X, M1, M2".into(),
+            kps_keys: "Q, W, E, R".into(),
+            kps_key_count: 4,
             kps_show_hits: true,
             kps_show_max: true,
+            kps_show_avg: true,
+            kps_show_key_kps: true,
+            kps_scale: 100,
+            apm_scale: 100,
+            kps_auto_width: false,
+            kps_method: "hard".into(),
+            kps_show_buttons: true,
+            kps_show_stats: true,
+            kps_show_graph: true,
+            kps_graph_secs: 300,
+            apm_hud_opacity: 94,
+            apm_keep_in_screen: true,
+            kps_keep_in_screen: true,
+            apm_hud_pos: None,
+            kps_hud_pos: None,
+            kps_hud_opacity: 94,
+            apm_show_keys: true,
+            apm_show_clicks: true,
+            apm_show_dist: true,
             limit_move_km: 20.0,
             limit_clicks: 0,
             limit_keystrokes: 0,
@@ -113,7 +172,155 @@ impl Default for Config {
     }
 }
 
+/// KPS 默认键位顺序：键盘上字母键从左到右、从上到下的顺序（qwerty 第一排往后）
+pub const DEFAULT_KPS_KEY_SEQUENCE: &str = "qwertyuiopasdfghjklzxcvbnm";
+
+/// KPS 键格布局里的一个格子
+#[derive(Clone, Debug, PartialEq)]
+pub struct KpsKeyCell {
+    /// 键名（空串 = 空位：占一格但不显示、不统计）
+    pub name: String,
+    /// 宽度（单位是"格"；`1.5H` / `4H` 这种写法就是 1.5 / 4）
+    pub width: f32,
+}
+
+/// KPS 键格布局：按用户写的分行，或默认每行最多 12 个自动换行
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KpsKeyLayout {
+    pub rows: Vec<Vec<KpsKeyCell>>,
+    /// 最宽一行的总格数（自适应键宽按它平分）
+    pub cols: f32,
+}
+
+impl KpsKeyLayout {
+    /// 所有非空格的键名（按布局顺序）
+    pub fn names(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .flat_map(|r| r.iter())
+            .filter(|c| !c.name.is_empty())
+            .map(|c| c.name.clone())
+            .collect()
+    }
+}
+
+/// 解析一格：`H` / `1.5H` / `4H` / 空
+fn parse_kps_cell(item: &str) -> KpsKeyCell {
+    let t = item.trim();
+    if t.is_empty() {
+        return KpsKeyCell { name: String::new(), width: 1.0 };
+    }
+    // 数字前缀 = 宽度倍数（纯数字的项是数字键本身，不当倍数）
+    let digits_end = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
+    if digits_end > 0 && digits_end < t.len() {
+        if let Ok(w) = t[..digits_end].parse::<f32>() {
+            if w.is_finite() && (0.5..=12.0).contains(&w) {
+                return KpsKeyCell { name: t[digits_end..].trim_start().to_string(), width: w };
+            }
+        }
+    }
+    KpsKeyCell { name: t.to_string(), width: 1.0 }
+}
+
 impl Config {
+    /// 默认键位的前 n 个（如 6 → Q, W, E, R, T, Y）
+    pub fn default_kps_keys_for(n: usize) -> Vec<String> {
+        DEFAULT_KPS_KEY_SEQUENCE
+            .chars()
+            .take(n.clamp(1, DEFAULT_KPS_KEY_SEQUENCE.len()))
+            .map(|c| c.to_uppercase().to_string())
+            .collect()
+    }
+
+    /// 当前键表是否还是"默认序列的前 N 个"（用户没自定义过）
+    pub fn kps_keys_is_default(&self) -> bool {
+        let cur = self.kps_key_layout().names();
+        let want = Self::default_kps_keys_for(cur.len());
+        cur.iter().map(|s| s.to_lowercase()).eq(want.iter().map(|s| s.to_lowercase()))
+    }
+
+    /// 解析「监控按键」为键格布局：
+    /// - 逗号分隔；**换行 = 分行**（不写换行时每行最多 12 个自动换行）；
+    /// - 空项（两个逗号挨着） = 空位，占一格（可以用来把后面的键挪到指定列）；
+    /// - 数字前缀 = 宽度倍数：`1.5H` = H 占 1.5 格、`4H` = 4 格；
+    /// - 行尾多余的逗号忽略。
+    pub fn kps_key_layout(&self) -> KpsKeyLayout {
+        let mut rows: Vec<Vec<KpsKeyCell>> = Vec::new();
+        for line in self.kps_keys.split('\n') {
+            let mut cells: Vec<KpsKeyCell> = line.split(',').map(parse_kps_cell).collect();
+            while cells.last().is_some_and(|c| c.name.is_empty()) {
+                cells.pop(); // "E,R," 这种行尾逗号不算空位
+            }
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+        // 没写换行 → 默认每行最多 12 个
+        if rows.len() == 1 && rows[0].len() > 12 {
+            let flat = rows.pop().unwrap_or_default();
+            let mut wrapped: Vec<Vec<KpsKeyCell>> = Vec::new();
+            let mut cur: Vec<KpsKeyCell> = Vec::new();
+            for c in flat {
+                cur.push(c);
+                if cur.len() == 12 {
+                    wrapped.push(std::mem::take(&mut cur));
+                }
+            }
+            if !cur.is_empty() {
+                wrapped.push(cur);
+            }
+            rows = wrapped;
+        }
+        if rows.is_empty() {
+            rows.push(
+                Self::default_kps_keys_for(self.kps_key_count.max(1) as usize)
+                    .into_iter()
+                    .map(|name| KpsKeyCell { name, width: 1.0 })
+                    .collect(),
+            );
+        }
+        let cols = rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.width).sum::<f32>())
+            .fold(1.0f32, f32::max);
+        // 自适应键宽：最后一行平分整行宽度（如 5 格宽的行上放 H,J → 各 2.5 格）；
+        // 该行自己写过宽度倍数时不干预。
+        if self.kps_auto_width {
+            let last = rows.len().saturating_sub(1);
+            let n = rows[last].len() as f32;
+            let explicit = rows[last].iter().any(|c| (c.width - 1.0).abs() > f32::EPSILON);
+            if n > 0.0 && !explicit {
+                for c in rows[last].iter_mut() {
+                    c.width = cols / n;
+                }
+            }
+        }
+        KpsKeyLayout { rows, cols }
+    }
+
+    /// 键数变化后调整键表：
+    /// - 还是默认表 → 直接按新数量重排（所以"6 键"就是 q, w, e, r, t, y）；
+    /// - 自定义表（用户设置过键位）→ 保留前 N 个，不足的从默认序列补（跳过已经用过的）。
+    pub fn resize_kps_keys(&mut self) {
+        let n = (self.kps_key_count.clamp(1, 26)) as usize;
+        let cur = self.kps_key_layout().names();
+        if cur.is_empty() || self.kps_keys_is_default() {
+            self.kps_keys = Self::default_kps_keys_for(n).join(", ");
+            return;
+        }
+        let mut list: Vec<String> = cur.into_iter().take(n).collect();
+        let used: std::collections::BTreeSet<String> = list.iter().map(|s| s.to_lowercase()).collect();
+        for c in DEFAULT_KPS_KEY_SEQUENCE.chars() {
+            if list.len() >= n {
+                break;
+            }
+            if !used.contains(&c.to_string()) {
+                list.push(c.to_uppercase().to_string());
+            }
+        }
+        self.kps_keys = list.join(", ");
+    }
+
     pub fn load(path: &Path) -> (Config, bool) {
         crate::fsutil::clean_stale_tmp(path);
         match std::fs::read_to_string(path) {
@@ -176,6 +383,7 @@ impl Config {
 # limit_move_km: 某小时鼠标移动超过该值（公里）则该小时作废（原始值仍记录，只是不计入当日/总计；0 = 关闭）
 # limit_clicks / limit_keystrokes: 某小时鼠标点击 / 键盘敲击超过该值则作废（0 = 关闭）
 # [layout]: 键盘热力图的尺寸(像素)
+# apm_scale / kps_scale: 悬浮窗缩放百分比; *_keep_in_screen: 拖出屏幕自动推回; *_hud_pos: 位置记忆(自动记录,勿手改)
 ";
         // 原子写：GUI 与后台 saver 可能同时保存配置，直接截断写会互相覆盖
         crate::fsutil::atomic_write(path, format!("{header}{body}").as_bytes())
@@ -313,6 +521,81 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+    /// 键格布局语法：换行=分行、逗号后无空格也行、空项=空位、数字前缀=宽度倍数、自适应键宽平分最后一行
+    #[test]
+    fn kps_key_layout_parses_rows_blanks_and_widths() {
+        let mut cfg = Config::default();
+        // 用户写的四行
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows.len(), 4, "四行：{l:?}");
+        assert_eq!(l.rows.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![5, 5, 5, 2]);
+        assert_eq!(l.names().len(), 17, "共 17 个键（行尾逗号不算空位）");
+        assert_eq!(l.cols, 5.0, "最宽一行 5 格");
+
+        // 空项 = 空位：把 H、J 挪到第 3、4 列
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n,,H,J".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[3][0].name, "");
+        assert_eq!(l.rows[3][1].name, "");
+        assert_eq!(l.rows[3][2].name, "H");
+        assert_eq!(l.rows[3][3].name, "J");
+        assert_eq!(l.names().len(), 17, "空位不参与统计");
+        assert_eq!(l.cols, 5.0, "空位也占宽度");
+
+        // 宽度倍数：1.5H / 4H
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n1.5H,J".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[3][0].width, 1.5);
+        assert_eq!(l.rows[3][0].name, "H");
+        assert_eq!(l.rows[3][1].width, 1.0);
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n4H,J".into();
+        assert_eq!(cfg.kps_key_layout().rows[3][0].width, 4.0);
+
+        // 自适应键宽（可开启）：最后一行平分整行 → H、J 各 2.5 格
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J".into();
+        cfg.kps_auto_width = true;
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[3][0].width, 2.5);
+        assert_eq!(l.rows[3][1].width, 2.5);
+        assert_eq!(l.rows[0][0].width, 1.0, "其它行不受影响");
+        // 该行自己写过倍数时不干预
+        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n1.5H,J".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[3][0].width, 1.5, "写了倍数就按用户写的");
+
+        // 不写换行 → 每行最多 12 个自动换行；纯数字项是数字键本身，不当倍数
+        cfg.kps_auto_width = false;
+        cfg.kps_keys = (0..26).map(|i| format!("K{i}")).collect::<Vec<_>>().join(", ");
+        assert_eq!(
+            cfg.kps_key_layout().rows.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            vec![12, 12, 2]
+        );
+        cfg.kps_keys = "1, 2, M1, 1.5H".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.names(), vec!["1", "2", "M1", "H"]);
+        assert_eq!(l.rows[0][3].width, 1.5);
+    }
+
+    /// 键数与默认键位：默认表按 QWERTY 序列重排（6 键 = Q..Y）；自定义表保留并补齐（跳过已用过的键）
+    #[test]
+    fn kps_key_count_rewrites_default_table() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.kps_keys, "Q, W, E, R", "默认键位是 QWERTY 前 4 个");
+        assert!(cfg.kps_keys_is_default());
+        cfg.kps_key_count = 6;
+        cfg.resize_kps_keys();
+        assert_eq!(cfg.kps_keys, "Q, W, E, R, T, Y", "默认表按新数量重排（6 键 = q..y）");
+
+        cfg.kps_keys = "Z, X, M1, M2".into();
+        cfg.kps_key_count = 6;
+        cfg.resize_kps_keys();
+        assert_eq!(cfg.kps_keys, "Z, X, M1, M2, Q, W", "自定义表补齐时跳过已经用过的键");
+        cfg.kps_key_count = 2;
+        cfg.resize_kps_keys();
+        assert_eq!(cfg.kps_keys, "Z, X", "缩短时只保留前 N 个");
+    }
     use super::*;
 
     #[test]
@@ -421,5 +704,24 @@ mod tests {
         assert_eq!(cfg.history_days, 365);
         assert!(!path.exists(), "只读加载不应写出 config.toml");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 悬浮窗位置记忆：配置可来回序列化，None 不写进文件
+    #[test]
+    fn hud_pos_config_roundtrip() {
+        let mut c = Config::default();
+        assert_eq!(c.apm_hud_pos, None);
+        assert!(c.apm_keep_in_screen && c.kps_keep_in_screen, "屏幕内限制默认开");
+        assert_eq!(c.apm_scale, 100);
+        c.apm_hud_pos = Some((12.5, 34.0));
+        c.kps_hud_pos = Some((-20.0, 8.0));
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("apm_hud_pos"), "位置要能写进配置：\n{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.apm_hud_pos, Some((12.5, 34.0)));
+        assert_eq!(back.kps_hud_pos, Some((-20.0, 8.0)));
+        // None 不落盘（老配置文件不出现空值键）
+        let t2 = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!t2.contains("hud_pos"), "None 不该写进文件：\n{t2}");
     }
 }

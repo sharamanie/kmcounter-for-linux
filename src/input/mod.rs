@@ -17,6 +17,8 @@ pub enum InEvent {
     /// 布局外按键
     KeyOther(String),
     Mouse(MouseEv),
+    /// 按住 / 松开（悬浮窗「长按保持点亮」用；只更新状态，不计次、不落盘）
+    Hold { name: String, down: bool },
 }
 
 /// 启动 applier 线程，返回生产者用的发送端
@@ -26,10 +28,17 @@ pub fn spawn_applier(shared: Arc<Shared>) -> Sender<InEvent> {
         .name("kmcounter-applier".into())
         .spawn(move || {
             while let Ok(ev) = rx.recv() {
+                // 「按住 / 松开」：只更新悬浮窗的长按点亮状态 —— 不计次、不落盘、不触发跨夜滚动
+                if let InEvent::Hold { name, down } = &ev {
+                    shared.kps.lock().set_held(name, *down);
+                    continue;
+                }
                 shared.rollover_if_needed();
                 let date = shared.today.lock().clone();
                 let hour = shared.current_hour();
                 let (is_action, kps_name) = match &ev {
+                    // Hold 已在上面拦截（这里只为穷尽性，不会执行）
+                    InEvent::Hold { .. } => (false, None),
                     InEvent::Key(idx) => {
                         let name = crate::keys::KEYS.get(*idx).map(|k| k.name).unwrap_or("");
                         (true, Some(name.to_string()))
@@ -43,11 +52,26 @@ pub fn spawn_applier(shared: Arc<Shared>) -> Sender<InEvent> {
                         _ => (false, None),
                     },
                 };
+                // 「设置键位」捕获模式：把每个动作的键名按顺序记下来（GUI 侧读取，最多留 26 个）
+                if is_action
+                    && shared
+                        .kps_capture_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(name) = kps_name.as_ref() {
+                        let mut buf = shared.kps_capture_buf.lock();
+                        if buf.len() < 26 {
+                            buf.push(name.clone());
+                        }
+                    }
+                }
                 let mut store = shared.store.lock();
                 match ev {
                     InEvent::Key(idx) => store.bump_key(&date, hour, idx),
                     InEvent::KeyOther(id) => store.bump_other_key(&date, hour, &id),
                     InEvent::Mouse(m) => store.bump_mouse(&date, hour, &m),
+                    // Hold 在上面已 continue（这里只为穷尽性，不会执行）
+                    InEvent::Hold { .. } => {}
                 }
                 if is_action {
                     let apm_w = shared.apm_window_secs.load(std::sync::atomic::Ordering::Relaxed);
@@ -110,5 +134,35 @@ mod tests {
         assert_eq!(store.total.hour(hour).expect("总计也应有分时").keystrokes, 1);
         // 只有一个小时桶有数据，其它小时不应凭空建桶
         assert_eq!(store.day(&today).unwrap().hours.len(), 1);
+    }
+
+    /// 「按住 / 松开」事件只更新悬浮窗状态：能查到按住，且不产生任何计数
+    #[test]
+    fn hold_event_updates_held_without_counting() {
+        let shared = Shared::new(Store::default(), 0, 0);
+        let tx = spawn_applier(shared.clone());
+        tx.send(InEvent::Hold { name: "Q".into(), down: true }).unwrap();
+        for _ in 0..100 {
+            if shared.kps.lock().query_keys(&["Q".into()], 1000)[0].held {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shared.kps.lock().query_keys(&["Q".into()], 1000)[0].held, "应按住中");
+        tx.send(InEvent::Hold { name: "Q".into(), down: false }).unwrap();
+        for _ in 0..100 {
+            if !shared.kps.lock().query_keys(&["Q".into()], 1000)[0].held {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!shared.kps.lock().query_keys(&["Q".into()], 1000)[0].held, "应已松开");
+        // 计数不受影响：Hold 不写任何统计
+        let store = shared.store.lock();
+        let today = shared.today.lock().clone();
+        let total = store.day(&today).map(|d| d.keystrokes).unwrap_or(0);
+        assert_eq!(total, 0, "Hold 不该产生击键计数");
+        drop(store);
+        drop(tx);
     }
 }

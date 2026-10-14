@@ -301,6 +301,24 @@ fn handle_event(dev: &mut Dev, ev: evdev::InputEvent, sink: &Sender<InEvent>) {
         return;
     }
     if ty == EV_KEY {
+        // 悬浮窗「长按点亮」：按下 / 抬起都给上层送一份（value==2 自动重复忽略，
+        // 按住状态不因重复而改变）；与下面「只计按下」的计次逻辑互不影响
+        if value == 0 || value == 1 {
+            let name = match code {
+                BTN_LEFT => Some("M1".to_string()),
+                BTN_RIGHT => Some("M2".to_string()),
+                BTN_MIDDLE => Some("M3".to_string()),
+                BTN_SIDE | BTN_EXTRA => Some("M4".to_string()),
+                _ if dev.is_keyboard => match idx_by_lin_code(code) {
+                    Some(idx) => crate::keys::KEYS.get(idx).map(|k| k.name.to_string()),
+                    None => Some(other_key_id_lin(code)),
+                },
+                _ => None,
+            };
+            if let Some(name) = name {
+                let _ = sink.send(InEvent::Hold { name, down: value == 1 });
+            }
+        }
         if value != 1 {
             return; // 只计按下（value==2 是自动重复）
         }

@@ -457,6 +457,12 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     shared.screen_px_w.store(px_w, Ordering::Relaxed);
     shared.apm_window_secs.store(cfg.apm_window_secs, Ordering::Relaxed);
     shared.kps_window_ms.store(cfg.kps_window_ms, Ordering::Relaxed);
+    // KPS 速率只统计监控键：把配置里的监控键列表装进跟踪器；计算方式也一并带上
+    {
+        let mut kps = shared.kps.lock();
+        kps.set_monitored(&cfg.kps_key_layout().names());
+        kps.set_method(crate::stats::KpsMethod::from_config(&cfg.kps_method));
+    }
 
     // 输入捕获
     input::start(shared.clone());
@@ -470,9 +476,20 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     #[cfg(target_os = "linux")]
     {
         let skip = cfg.skip_taskbar;
+        // HUD 位置记忆 + 限制在屏幕内（KDE/Wayland）：DBus 上报服务 + KWin 监听脚本
+        let (ac, kc, ap, kp) = (
+            cfg.apm_keep_in_screen,
+            cfg.kps_keep_in_screen,
+            cfg.apm_hud_pos,
+            cfg.kps_hud_pos,
+        );
         std::thread::Builder::new()
             .name("kmcounter-kwin".into())
-            .spawn(move || kwin::set_skip_taskbar(skip))
+            .spawn(move || {
+                kwin::set_skip_taskbar(skip);
+                kwin::start_hud_pos_service();
+                kwin::sync_hud_listener(ac, kc, ap, kp);
+            })
             .ok();
     }
 

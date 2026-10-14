@@ -11,7 +11,7 @@ use crate::keys::{N_KEYS, KEYS};
 use chrono::{Duration, Local, Timelike};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -212,14 +212,14 @@ impl ApmTracker {
         let now = Instant::now();
         self.actions.push_back(now);
         self.cleanup(now, date, window_secs);
-        (self.calc_apm(window_secs), self.today_peak)
+        (self.calc_apm(), self.today_peak)
     }
 
     /// 获取当前实时 APM 与当日峰值
     pub fn get(&mut self, date: &str, window_secs: u32) -> (u32, u32) {
         let now = Instant::now();
         self.cleanup(now, date, window_secs);
-        (self.calc_apm(window_secs), self.today_peak)
+        (self.calc_apm(), self.today_peak)
     }
 
     /// 清理滑动窗口外的过期动作，并维护跨天峰值
@@ -238,26 +238,18 @@ impl ApmTracker {
                 break;
             }
         }
-        let current = self.calc_apm(window_secs);
+        let current = self.calc_apm();
         if current > self.today_peak {
             self.today_peak = current;
         }
     }
 
-    fn calc_apm(&self, window_secs: u32) -> u32 {
-        let count = self.actions.len();
-        if count == 0 {
-            0
-        } else if window_secs == 60 {
-            // 60秒自然窗口：点 1 次就是 1 APM，彻底解决“点一次+12”
-            count as u32
-        } else if count <= 1 {
-            // 自定义窗口下，单次敲击直接计 1，不放大
-            count as u32
-        } else {
-            let w = (window_secs.max(1) as f64).max(1.0);
-            ((count as f64) * 60.0 / w).round() as u32
-        }
+    /// 数值 = 滑动窗口内的动作数，**不做倍率外推**：
+    /// - 60 秒窗口下就是标准 APM（点一次 = 1，不会像以前那样 ×12）；
+    /// - 更长的窗口只是更平滑；
+    /// - 窗口调短时也不会把单次动作放大（旧版 5 秒窗口 "点一次 +12" 就是这么来的）。
+    fn calc_apm(&self) -> u32 {
+        self.actions.len() as u32
     }
 
     #[allow(dead_code)]
@@ -270,129 +262,412 @@ impl ApmTracker {
     }
 }
 
+/// osu-kps 的激活插值（`main.cpp` 的 `_interpolate` 的比值部分）：
+/// `x < t1` 时 0（不激活），到 `t2` 时约 0.8，之后按 sigmoid 趋近 1。
+/// 两条颜色动画（速度→颜色、松开→淡出）都用它，保证行为和原项目一致。
+pub fn osu_ramp(x: f64, t1: f64, t2: f64) -> f32 {
+    if x < t1 || t2 <= t1 {
+        return 0.0;
+    }
+    let crt = x - t1;
+    const RATIO_T2: f64 = 0.9; // 在 t2 处 sigmoid 取到 0.9（映射后约 0.8）
+    let a = -(1.0 / RATIO_T2 - 1.0).ln() / (t2 - t1);
+    let sigmoid = 1.0 / (1.0 + (-(a * crt)).exp());
+    (((sigmoid - 0.5) * 2.0) as f32).clamp(0.0, 1.0)
+}
+
+/// 按键热度：按该键自己的 KPS 插值（对齐 osu-kps：阈值 2.0 / 4.0）
+pub fn kps_key_heat(per_key_kps: f64) -> f32 {
+    osu_ramp(per_key_kps, 2.0, 4.0)
+}
+
 /// 监控按键的实时状态
 #[derive(Clone, Debug, Default)]
 pub struct KpsKeyInfo {
     pub name: String,
+    /// 累计击打次数
     pub hits: u64,
-    pub is_active: bool,
+    /// 当前是否**按住中**（输入层的按住 / 松开事件维护；悬浮窗「长按保持点亮」用）
+    pub held: bool,
+    /// 该键自己的 KPS（按当前计算方式与统计窗口）
+    pub kps: f64,
+    /// 发光强度（0~1）：按住期间为 1；松开后沿 osu-kps 的 50→250ms 曲线淡出。
+    /// （没有松开事件来源时，退回「按下窗口内满亮」的近似）
+    pub glow: f32,
+}
+
+/// KPS 计算方式（对齐 osu-kps 的「硬算 / 灵敏」）
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KpsMethod {
+    /// 硬算：数统计窗口内的击键次数（稳定）
+    #[default]
+    Hard,
+    /// 灵敏：对齐 osu-kps 的 `kps_implement_sensitive` —— 只看最近 2.5 秒的记录，
+    /// 从新到旧累加次数 k，取 `min(k × 1.5, k / 距现在最远那次的时间)` 的最大值：
+    /// 单次击键最多显示 1.5（不会虚高），连击时贴近真实速率，停下来后立刻往下掉。
+    Sensitive,
+}
+
+impl KpsMethod {
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "sensitive" => Self::Sensitive,
+            _ => Self::Hard,
+        }
+    }
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Sensitive => "sensitive",
+        }
+    }
+}
+
+/// KPS 图的历史条数上限（一秒一条）——对齐 osu-kps 的 300 条（近 5 分钟）
+pub const KPS_HISTORY_MAX: usize = 300;
+/// 「灵敏」方式只看最近这么长的记录（对齐 osu-kps 的 considered_length = 2.5s）
+const SENSITIVE_CONSIDERED: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// 键名归一后的"规范名"：左右修饰键合并到 shift / ctrl / alt。
+/// 监控列表、单键计数、单键 KPS 都用这个口径，避免"监控 Shift 却按了 LShift 不算"。
+fn canonical_kps_key(norm: &str) -> String {
+    match norm {
+        "lshift" | "rshift" => "shift".into(),
+        "lctrl" | "rctrl" => "ctrl".into(),
+        "lalt" | "ralt" => "alt".into(),
+        _ => norm.to_string(),
+    }
 }
 
 /// KPS (Keys Per Second / 按键每秒) 跟踪器（参照 osu-kps 与 KeysPerSecond）
 pub struct KpsTracker {
     actions: VecDeque<Instant>,
-    today_peak: u32,
+    today_peak: f64,
     peak_date: String,
     /// 监控键最近按下的时间戳（用于界面发光点亮反馈）
     recent_presses: BTreeMap<String, Instant>,
+    /// 当前**按住中**的键（输入层的按住 / 松开事件维护；与计次解耦）——「长按保持点亮」用
+    held: BTreeSet<String>,
+    /// 各键最近一次**松开**的时刻 —— 松开后 50→250ms 淡出用
+    recent_releases: BTreeMap<String, Instant>,
     /// 监控键累计按压次数
     key_hits: BTreeMap<String, u64>,
+    /// 每个监控键自己的击键时刻（单键 KPS 用）
+    key_times: BTreeMap<String, VecDeque<Instant>>,
+    /// 监控键集合（规范化后的键名）。**速率只统计这些键**，与 osu-kps / KeysPerSecond
+    /// 一致：否则打字时的普通按键也会把 KPS 抬起来；
+    /// 空集合 = 不过滤（兜底，保持没有配置监控键时的旧行为）。
+    monitored: BTreeSet<String>,
+    /// 本次会话（自上次重置 / 跨天）起算的监控键动作数，用于平均 KPS
+    session_actions: u64,
+    /// 上面那个计数的起点时刻
+    session_start: Instant,
+    /// 计算方式（硬算 / 灵敏）
+    method: KpsMethod,
+    /// KPS 图：每秒一条「该秒内的最大值」（对齐 osu-kps 的 calc_kps_recent）
+    history: VecDeque<(Instant, f64)>,
+    /// 当前这一秒里见过的最大值
+    bucket_max: f64,
+    /// 上一次采样时刻
+    last_sample: Option<Instant>,
 }
 
 impl KpsTracker {
     pub fn new(today: &str) -> Self {
         KpsTracker {
             actions: VecDeque::new(),
-            today_peak: 0,
+            today_peak: 0.0,
             peak_date: today.to_string(),
             recent_presses: BTreeMap::new(),
+            held: BTreeSet::new(),
+            recent_releases: BTreeMap::new(),
             key_hits: BTreeMap::new(),
+            key_times: BTreeMap::new(),
+            monitored: BTreeSet::new(),
+            session_actions: 0,
+            session_start: Instant::now(),
+            method: KpsMethod::Hard,
+            history: VecDeque::new(),
+            bucket_max: 0.0,
+            last_sample: None,
         }
     }
 
-    /// 记录一次动作（击键或鼠标），key_id 比如 "Z", "Space", "M1"
-    pub fn record(&mut self, date: &str, key_id: &str, window_ms: u32) -> (u32, u32) {
+    /// 设置计算方式（配置变化时调用）
+    pub fn set_method(&mut self, method: KpsMethod) {
+        self.method = method;
+    }
+
+    pub fn method(&self) -> KpsMethod {
+        self.method
+    }
+
+    /// 更新监控键列表（配置变化 / 启动时调用）。键名按 [`normalize_kps_key`] 归一，空项忽略。
+    pub fn set_monitored(&mut self, keys: &[String]) {
+        let set: BTreeSet<String> = keys
+            .iter()
+            .map(|k| normalize_kps_key(k))
+            .filter(|k| !k.is_empty())
+            .collect();
+        if set != self.monitored {
+            log::debug!("KPS 监控键更新为 {set:?}");
+            self.monitored = set;
+        }
+    }
+
+    /// 记录一次动作（击键或鼠标），key_id 比如 "Z", "Space", "M1"。
+    /// 返回 (当前 KPS, 今日峰值)，两个都是 f64（灵敏方式是小数）。
+    pub fn record(&mut self, date: &str, key_id: &str, window_ms: u32) -> (f64, f64) {
         let now = Instant::now();
-        self.actions.push_back(now);
         let norm = normalize_kps_key(key_id);
+        let canon = canonical_kps_key(&norm);
+        // 速率只统计监控键（未配置监控键时退化为统计全部动作）
+        let counted =
+            self.monitored.is_empty() || self.monitored.contains(&norm) || self.monitored.contains(&canon);
+        if counted {
+            self.actions.push_back(now);
+            self.session_actions += 1;
+            if !canon.is_empty() {
+                let q = self.key_times.entry(canon.clone()).or_default();
+                q.push_back(now);
+            }
+        }
         if !norm.is_empty() {
             self.recent_presses.insert(norm.clone(), now);
             *self.key_hits.entry(norm.clone()).or_insert(0) += 1;
-            if norm == "lshift" || norm == "rshift" {
-                self.recent_presses.insert("shift".into(), now);
-                *self.key_hits.entry("shift".into()).or_insert(0) += 1;
-            } else if norm == "lctrl" || norm == "rctrl" {
-                self.recent_presses.insert("ctrl".into(), now);
-                *self.key_hits.entry("ctrl".into()).or_insert(0) += 1;
-            } else if norm == "lalt" || norm == "ralt" {
-                self.recent_presses.insert("alt".into(), now);
-                *self.key_hits.entry("alt".into()).or_insert(0) += 1;
+            if canon != norm {
+                self.recent_presses.insert(canon.clone(), now);
+                *self.key_hits.entry(canon.clone()).or_insert(0) += 1;
             }
         }
         self.cleanup(now, date, window_ms);
-        (self.calc_kps(window_ms), self.today_peak)
+        (self.calc_kps(&self.actions, now, window_ms), self.today_peak)
+    }
+
+    /// 更新某键的「按住」状态（输入层在按下 / 松开时调用）。
+    /// 与 [`record`](Self::record) 完全解耦：不计次、不动 KPS、不落盘 ——
+    /// 悬浮窗的「长按保持点亮」靠它 + `recent_releases` 实现。
+    pub fn set_held(&mut self, key_id: &str, down: bool) {
+        let now = Instant::now();
+        let norm = normalize_kps_key(key_id);
+        if norm.is_empty() {
+            return;
+        }
+        let canon = canonical_kps_key(&norm);
+        if down {
+            self.held.insert(norm.clone());
+            if canon != norm {
+                self.held.insert(canon);
+            }
+        } else {
+            // 松开：清「按住」并记下时刻（淡出起点）。
+            // 注：左右修饰键同时按住这类极端情况按「任一松开即灭」处理，与计次口径一致。
+            let distinct = canon != norm;
+            self.held.remove(&norm);
+            self.recent_releases.insert(norm, now);
+            if distinct {
+                self.held.remove(&canon);
+                self.recent_releases.insert(canon, now);
+            }
+        }
     }
 
     /// 获取当前实时 KPS 与今日峰值
-    pub fn get(&mut self, date: &str, window_ms: u32) -> (u32, u32) {
+    pub fn get(&mut self, date: &str, window_ms: u32) -> (f64, f64) {
         let now = Instant::now();
         self.cleanup(now, date, window_ms);
-        (self.calc_kps(window_ms), self.today_peak)
+        (self.calc_kps(&self.actions, now, window_ms), self.today_peak)
     }
 
-    /// 查询监控按键列表的当前状态（名称、命中次数、最近是否按下）
-    pub fn query_keys(&self, keys: &[String]) -> Vec<KpsKeyInfo> {
+    /// 查询监控按键列表的当前状态（名称、命中次数、是否刚按下、该键自己的 KPS）
+    pub fn query_keys(&self, keys: &[String], window_ms: u32) -> Vec<KpsKeyInfo> {
         let now = Instant::now();
         let active_duration = std::time::Duration::from_millis(130);
-        keys.iter().map(|k| {
-            let norm = normalize_kps_key(k);
-            let hits = self.key_hits.get(&norm).copied().unwrap_or(0);
-            let is_active = self.recent_presses.get(&norm)
-                .map(|t| now.saturating_duration_since(*t) < active_duration)
-                .unwrap_or(false);
-            KpsKeyInfo {
-                name: k.trim().to_string(),
-                hits,
-                is_active,
-            }
-        }).collect()
+        keys.iter()
+            .map(|k| {
+                let norm = normalize_kps_key(k);
+                let canon = canonical_kps_key(&norm);
+                let hits = self.key_hits.get(&norm).copied().unwrap_or(0);
+                // 按住中：输入层的按住 / 松开事件维护（长按保持点亮；含左右修饰键的规范名）
+                let held = self.held.contains(&norm) || self.held.contains(&canon);
+                let empty = VecDeque::new();
+                let times = self.key_times.get(&canon).unwrap_or(&empty);
+                // 发光（底板亮度）：按住期间保持满亮（对齐 osu-kps 的 down 状态）；
+                // 松开后沿 50→250ms 曲线渐近淡出（250ms 处约 80%）；没有松开信息时退回
+                // 「按下窗口内满亮」的近似
+                let glow = if held {
+                    1.0
+                } else if let Some(r) = self.recent_releases.get(&norm) {
+                    1.0 - osu_ramp(now.saturating_duration_since(*r).as_secs_f64(), 0.05, 0.25)
+                } else {
+                    self.recent_presses
+                        .get(&norm)
+                        .map(|t| {
+                            let dt = now.saturating_duration_since(*t).as_secs_f64();
+                            let win = active_duration.as_secs_f64(); // 按下窗口（无松开信息时的近似）
+                            if dt < win {
+                                1.0
+                            } else {
+                                1.0 - osu_ramp(dt - win, 0.05, 0.25)
+                            }
+                        })
+                        .unwrap_or(0.0)
+                };
+                KpsKeyInfo {
+                    name: k.trim().to_string(),
+                    hits,
+                    held,
+                    kps: self.calc_kps(times, now, window_ms),
+                    glow,
+                }
+            })
+            .collect()
+    }
+
+    /// 平均 KPS：自上次重置 / 跨天以来的监控键动作数 ÷ 经过秒数。
+    /// 参照 KeysPerSecond 的 "AVG" 计数器 —— 统计的是**会话平均**，不是滑动窗口速率。
+    pub fn avg(&self) -> f64 {
+        let secs = self.session_start.elapsed().as_secs_f64();
+        if self.session_actions == 0 || secs < 1.0 {
+            0.0
+        } else {
+            self.session_actions as f64 / secs
+        }
+    }
+
+    /// 今日峰值（设置窗口的重置按钮 / 测试用）
+    #[allow(dead_code)]
+    pub fn peak(&self) -> f64 {
+        self.today_peak
+    }
+
+    /// KPS 图的历史（每秒一条，最新在末尾）
+    pub fn history(&self) -> &VecDeque<(Instant, f64)> {
+        &self.history
     }
 
     fn cleanup(&mut self, now: Instant, date: &str, window_ms: u32) {
         if self.peak_date != date {
             self.peak_date = date.to_string();
-            self.today_peak = 0;
+            self.today_peak = 0.0;
             self.actions.clear();
             self.key_hits.clear();
             self.recent_presses.clear();
+            self.recent_releases.clear();
+            self.key_times.clear();
+            self.history.clear();
+            self.bucket_max = 0.0;
+            self.last_sample = None;
+            self.session_actions = 0;
+            self.session_start = now;
             return;
         }
-        let window = std::time::Duration::from_millis(window_ms.max(100) as u64);
+        // 保留长度：至少覆盖统计窗口；灵敏方式还要 2.5 秒
+        let keep = std::time::Duration::from_millis(window_ms.max(100) as u64).max(SENSITIVE_CONSIDERED);
         while let Some(&front) = self.actions.front() {
-            if now.saturating_duration_since(front) > window {
+            if now.saturating_duration_since(front) > keep {
                 self.actions.pop_front();
             } else {
                 break;
             }
         }
-        let current = self.calc_kps(window_ms);
+        for q in self.key_times.values_mut() {
+            while let Some(&front) = q.front() {
+                if now.saturating_duration_since(front) > keep {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        let current = self.calc_kps(&self.actions, now, window_ms);
         if current > self.today_peak {
             self.today_peak = current;
         }
-    }
-
-    fn calc_kps(&self, window_ms: u32) -> u32 {
-        let count = self.actions.len();
-        if count == 0 {
-            0
-        } else if window_ms == 1000 {
-            count as u32
-        } else {
-            let sec = (window_ms.max(100) as f64) / 1000.0;
-            ((count as f64) / sec).round() as u32
+        // KPS 图：每秒采一条「该秒内的最大值」（对齐 osu-kps 一秒一条的历史）
+        match self.last_sample {
+            Some(t) if now.saturating_duration_since(t) < std::time::Duration::from_millis(1000) => {
+                if current > self.bucket_max {
+                    self.bucket_max = current;
+                }
+            }
+            _ => {
+                let sample = self.bucket_max.max(current);
+                self.history.push_back((now, sample));
+                self.bucket_max = current;
+                self.last_sample = Some(now);
+                while self.history.len() > KPS_HISTORY_MAX {
+                    self.history.pop_front();
+                }
+            }
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reset_peak(&mut self) {
-        self.today_peak = 0;
+    /// 按当前计算方式算 KPS（`times` 是该口径下的击键时刻表）
+    fn calc_kps(&self, times: &VecDeque<Instant>, now: Instant, window_ms: u32) -> f64 {
+        match self.method {
+            KpsMethod::Hard => {
+                let window = std::time::Duration::from_millis(window_ms.max(100) as u64);
+                let n = times
+                    .iter()
+                    .rev()
+                    .take_while(|t| now.saturating_duration_since(**t) <= window)
+                    .count();
+                let sec = (window_ms.max(100) as f64 / 1000.0).max(1.0);
+                n as f64 / sec
+            }
+            KpsMethod::Sensitive => {
+                let mut best = 0.0f64;
+                let mut count = 0u32;
+                for t in times.iter().rev() {
+                    let dt = now.saturating_duration_since(*t);
+                    if dt > SENSITIVE_CONSIDERED {
+                        break;
+                    }
+                    count += 1;
+                    let elapsed = dt.as_secs_f64().max(0.001);
+                    let cur = ((count as f64) * 1.5).min(count as f64 / elapsed);
+                    if cur >= best {
+                        best = cur;
+                    } else {
+                        break;
+                    }
+                }
+                best
+            }
+        }
     }
 
-    #[allow(dead_code)]
-    pub fn reset_hits(&mut self) {
+    /// 只清今日峰值（设置窗口「重置 → 最大 KPS」）
+    pub fn reset_peak(&mut self) {
+        self.today_peak = 0.0;
+    }
+
+    /// 只清按键总次数（每个键的累计击打数；「重置 → 按键总次数」）
+    pub fn reset_counts(&mut self) {
         self.key_hits.clear();
     }
+
+    /// 只清 KPS 图的历史（「重置 → KPS 图」）
+    pub fn reset_graph(&mut self) {
+        self.history.clear();
+        self.bucket_max = 0.0;
+        self.last_sample = None;
+    }
+
+    /// 全部清零（「重置 → 以上所有」）：峰值 + 按键总次数 + KPS 图 + 平均 KPS 的起算点
+    pub fn reset_all(&mut self) {
+        self.reset_peak();
+        self.reset_counts();
+        self.reset_graph();
+        self.session_actions = 0;
+        self.session_start = Instant::now();
+        // 长按状态也归零（清掉可能残留的点亮）
+        self.held.clear();
+        self.recent_releases.clear();
+    }
 }
+
 
 pub fn normalize_kps_key(k: &str) -> String {
     let s = k.trim().to_lowercase();
@@ -778,6 +1053,10 @@ pub struct Shared {
     pub apm_window_secs: AtomicU32,
     /// KPS 滑动窗口大小（毫秒），默认 1000
     pub kps_window_ms: AtomicU32,
+    /// 「设置键位」捕获模式：为 true 时输入线程把每个动作的键名推进 `kps_capture_buf`
+    pub kps_capture_active: AtomicBool,
+    /// 捕获到的键名（按发生顺序，最多留 26 个）
+    pub kps_capture_buf: Mutex<Vec<String>>,
     /// 主显示器宽度（像素），用于像素→米换算
     pub screen_px_w: AtomicU32,
     /// 主显示器物理宽度（毫米），启动时解析
@@ -802,6 +1081,8 @@ impl Shared {
             kps: Mutex::new(KpsTracker::new(&today)),
             apm_window_secs: AtomicU32::new(60),
             kps_window_ms: AtomicU32::new(1000),
+            kps_capture_active: AtomicBool::new(false),
+            kps_capture_buf: Mutex::new(Vec::new()),
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
             screen_px_w: AtomicU32::new(0),
@@ -1160,15 +1441,16 @@ mod tests {
         let (apm1, _) = tracker.get("20261013", 5);
         assert_eq!(apm1, 1, "单次点击绝不能放大为 12");
 
-        // 记录 5 次操作（在 5 秒滑动窗口内）
-        // 5 次 / 5s = 1 次/s = 60 次/分 (60 APM)
+        // 数值就是"窗口内的动作数"：窗口调短也不会放大（旧版 5 秒窗口点 5 次会显示 60）
         for _ in 1..5 {
             tracker.record("20261013", 5);
         }
         let (apm, peak) = tracker.get("20261013", 5);
-        assert_eq!(apm, 60);
-        assert_eq!(peak, 60);
-        assert_eq!(tracker.peak(), 60);
+        assert_eq!(apm, 5, "窗口内动作数原样呈现，不乘 60/窗口");
+        let (apm30, _) = tracker.get("20261013", 30);
+        assert_eq!(apm30, 5, "换窗口长度只影响平滑程度，不改数值");
+        assert_eq!(peak, 5);
+        assert_eq!(tracker.peak(), 5);
 
         // 跨天重置
         let (apm_next, peak_next) = tracker.get("20261014", 5);
@@ -1180,28 +1462,151 @@ mod tests {
     fn kps_tracker_sliding_window_and_hits() {
         let mut tracker = KpsTracker::new("20261013");
         let (kps, peak) = tracker.get("20261013", 1000);
-        assert_eq!(kps, 0);
-        assert_eq!(peak, 0);
+        assert_eq!((kps, peak), (0.0, 0.0));
 
         tracker.record("20261013", "Z", 1000);
         tracker.record("20261013", "X", 1000);
         tracker.record("20261013", "M1", 1000);
         let (kps, peak) = tracker.get("20261013", 1000);
-        assert_eq!(kps, 3);
-        assert_eq!(peak, 3);
+        assert_eq!((kps, peak), (3.0, 3.0));
 
-        let query = tracker.query_keys(&["Z".into(), "X".into(), "C".into(), "M1".into(), "M2".into()]);
+        let query =
+            tracker.query_keys(&["Z".into(), "X".into(), "C".into(), "M1".into(), "M2".into()], 1000);
         assert_eq!(query.len(), 5);
         assert_eq!(query[0].name, "Z");
         assert_eq!(query[0].hits, 1);
-        assert!(query[0].is_active);
+        assert!(query[0].glow > 0.9, "刚按过应点亮");
+        assert!(!query[0].held, "没送按住事件时 held 应为 false");
+        assert_eq!(query[0].kps, 1.0, "单键也带自己的 KPS");
         assert_eq!(query[1].hits, 1);
-        assert!(query[1].is_active);
+        assert!(query[1].glow > 0.9);
         assert_eq!(query[2].hits, 0);
-        assert!(!query[2].is_active);
+        assert_eq!(query[2].glow, 0.0, "没按过不亮");
+        assert_eq!(query[2].kps, 0.0);
         assert_eq!(query[3].hits, 1);
-        assert!(query[3].is_active);
+        assert!(query[3].glow > 0.9);
         assert_eq!(query[4].hits, 0);
-        assert!(!query[4].is_active);
+        assert_eq!(query[4].glow, 0.0);
+
+        // KPS 历史：第一次取值就落一条采样（之后每秒一条），重置时清空
+        assert_eq!(tracker.history().len(), 1);
+        tracker.reset_all();
+        assert_eq!(tracker.history().len(), 0, "重置要把 KPS 图一起清掉");
+    }
+
+    /// 重置菜单的四个选项各管各的（对齐 osu-kps：按键总次数 / 最大 KPS / KPS 图 / 以上所有）
+    #[test]
+    fn kps_reset_options_are_independent() {
+        let mut t = KpsTracker::new("20261013");
+        t.set_monitored(&["Z".into()]);
+        for _ in 0..3 {
+            t.record("20261013", "Z", 1000);
+        }
+        assert_eq!(t.peak(), 3.0);
+        assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 3);
+        assert!(!t.history().is_empty(), "取值后应有历史采样");
+
+        // 只清最大 KPS
+        t.reset_peak();
+        assert_eq!(t.peak(), 0.0, "峰值被清零");
+        assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 3, "计数不受影响");
+        assert!(!t.history().is_empty(), "图不受影响");
+
+        // 只清按键总次数
+        t.reset_counts();
+        assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 0);
+        assert_eq!(t.get("20261013", 1000).0, 3.0, "当前 KPS 不受影响");
+
+        // 只清 KPS 图
+        t.reset_graph();
+        assert!(t.history().is_empty(), "历史被清掉");
+
+        // 以上所有：连平均的起算点一起归零
+        t.record("20261013", "Z", 1000);
+        t.reset_all();
+        assert_eq!(t.peak(), 0.0);
+        assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 0);
+        assert!(t.history().is_empty());
+    }
+
+    /// 计算方式的配置映射可来回转换（from_config / as_config）
+    #[test]
+    fn kps_method_config_roundtrip() {
+        for m in [KpsMethod::Hard, KpsMethod::Sensitive] {
+            assert_eq!(KpsMethod::from_config(m.as_config()), m);
+        }
+        assert_eq!(KpsMethod::from_config("别的值"), KpsMethod::Hard, "未知值退回硬算");
+    }
+
+    /// 灵敏方式（对齐 osu-kps）：单次击键被限制在 1.5 以内，连击时贴近真实速率
+    #[test]
+    fn kps_sensitive_caps_single_press() {
+        let mut t = KpsTracker::new("20261013");
+        t.set_method(KpsMethod::Sensitive);
+        let (kps, _) = t.record("20261013", "Z", 1000);
+        assert!((1.0..=1.5).contains(&kps), "单次击键最多 1.5（不虚高），实际 {kps}");
+        for _ in 0..5 {
+            t.record("20261013", "Z", 1000);
+        }
+        let (kps, _) = t.get("20261013", 1000);
+        assert!(kps > 1.5, "连击时数值应该上去：{kps}");
+        // 同批记录在硬算模式下就是"窗口内次数"
+        t.set_method(KpsMethod::Hard);
+        assert_eq!(t.get("20261013", 1000).0, 6.0);
+    }
+
+    /// KPS 速率只统计监控键：打字时的普通按键不该把 KPS 抬起来（对齐 osu-kps / KeysPerSecond）
+    #[test]
+    fn kps_rate_only_counts_monitored_keys() {
+        let mut tracker = KpsTracker::new("20261013");
+        tracker.set_monitored(&["Z".into(), "X".into(), "M1".into()]);
+        tracker.record("20261013", "Z", 1000);
+        tracker.record("20261013", "A", 1000); // 不在监控列表 → 不计入速率
+        tracker.record("20261013", "Space", 1000); // 同上
+        tracker.record("20261013", "M1", 1000);
+        let (kps, peak) = tracker.get("20261013", 1000);
+        assert_eq!((kps, peak), (2.0, 2.0), "只有 Z 与 M1 计入 KPS（A / Space 不算）");
+
+        // 单键计数照旧按"每个键各数各的"记：把某键加进监控列表后能立刻看到已有次数
+        let q = tracker.query_keys(&["Z".into(), "A".into(), "M1".into()], 1000);
+        assert_eq!((q[0].hits, q[1].hits, q[2].hits), (1, 1, 1));
+        assert_eq!(q[0].kps, 1.0, "Z 自己的 KPS");
+        assert_eq!(q[1].kps, 0.0, "没被监控的 A，速率永远是 0");
+
+        // 空列表 = 不过滤（兜底行为，配置为空时不至于永远 0）
+        let mut t2 = KpsTracker::new("20261013");
+        t2.record("20261013", "Q", 1000);
+        t2.record("20261013", "W", 1000);
+        assert_eq!(t2.get("20261013", 1000).0, 2.0, "未配置监控键时统计全部动作");
+        assert_eq!(t2.record("20261013", "Q", 1000).0, 3.0, "空监控列表不做过滤");
+    }
+
+    /// 长按：按住期间保持满亮（旧实现在 ~380ms 内就灭了），松开后 50→250ms 淡出
+    #[test]
+    fn kps_set_held_keeps_key_lit_until_release() {
+        let mut t = KpsTracker::new("20261014");
+        // 按住
+        t.set_held("Q", true);
+        let q = &t.query_keys(&["Q".into()], 1000)[0];
+        assert!(q.held, "按下后应处于按住状态");
+        assert_eq!(q.glow, 1.0, "按住期间应满亮");
+        // 按住 220ms（比旧的 130ms 激活窗更久）仍是满亮 —— 这正是旧实现的短板
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        let q = &t.query_keys(&["Q".into()], 1000)[0];
+        assert!(q.held && q.glow == 1.0, "长按中途不该灭：{q:?}");
+        // 松开：先亮着走淡出，250ms 后完全熄灭
+        t.set_held("Q", false);
+        let q = &t.query_keys(&["Q".into()], 1000)[0];
+        assert!(!q.held);
+        assert!(q.glow > 0.9, "刚松开仍在亮：{q:?}");
+        // osu-kps 的淡出是**渐近**的（250ms 处约到 80%，之后趋近 0，不精确归零）：
+        // 320ms 时应已基本熄灭（<0.15）
+        std::thread::sleep(std::time::Duration::from_millis(320));
+        let q = &t.query_keys(&["Q".into()], 1000)[0];
+        assert!(q.glow < 0.15, "松开后应基本熄灭：{q:?}");
+        // 修饰键别名：LShift 的按住会合并到 shift 口径
+        t.set_held("LShift", true);
+        let q = &t.query_keys(&["Shift".into()], 1000)[0];
+        assert!(q.held, "LShift 按住应在 Shift 口径上可见");
     }
 }

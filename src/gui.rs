@@ -19,6 +19,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub(crate) mod hud;
+pub(crate) use hud::*;
+
 pub(crate) const BG: Color32 = Color32::from_rgb(0xEE, 0xEE, 0xEE);
 const TEXT: Color32 = Color32::from_rgb(0x57, 0x57, 0x57);
 const HEAT_FROM: (u8, u8, u8) = (0xEE, 0xEE, 0xEE);
@@ -365,12 +368,25 @@ pub struct App {
     nav_title_rect: Rect,
     /// 鼠标滚轮翻页增量累加器（防微增量连发与抖动）
     wheel_delta_accum: f32,
-    /// 是否处于极简悬浮窗（HUD）模式
-    pub is_hud: bool,
     /// 独立 APM 悬浮窗是否显示
     pub hud_apm_show: bool,
     /// 独立 KPS 悬浮窗是否显示
     pub hud_kps_show: bool,
+    /// APM 悬浮窗自己的设置窗口是否打开（右键悬浮窗打开；会话级，不写配置）
+    apm_cfg_open: bool,
+    /// KPS 悬浮窗自己的设置窗口是否打开
+    kps_cfg_open: bool,
+    /// KPS「设置键位」捕获中（此时输入线程会把按下的键记进 shared.kps_capture_buf）
+    kps_capturing: bool,
+    /// KPS 悬浮窗最近一次下发的窗口尺寸（变了才发命令）
+    kps_hud_size: (f32, f32),
+    /// APM 悬浮窗最近一次下发的窗口尺寸（宽度贴合内容；变了才发命令）
+    apm_hud_size: (f32, f32),
+    /// APM / KPS 悬浮窗的位置记忆状态（恢复计数 + 待保存的稳定位置）
+    apm_pos: HudPosState,
+    kps_pos: HudPosState,
+    /// 启动后的「位置安静期」：这段时间内不保存位置（避免和恢复动作打架）
+    hud_pos_grace_until: Instant,
 }
 
 /// 极简悬浮窗 HUD 模式默认尺寸
@@ -573,9 +589,16 @@ impl App {
             cal_month: (chrono::Local::now().year(), chrono::Local::now().month()),
             nav_title_rect: Rect::NOTHING,
             wheel_delta_accum: 0.0,
-            is_hud: cfg.hud_mode,
-            hud_apm_show: cfg.hud_apm_show || cfg.hud_mode,
+            hud_apm_show: cfg.hud_apm_show,
             hud_kps_show: cfg.hud_kps_show,
+            apm_cfg_open: false,
+            kps_cfg_open: false,
+            kps_capturing: false,
+            kps_hud_size: (0.0, 0.0),
+            apm_hud_size: (0.0, 0.0),
+            apm_pos: HudPosState::default(),
+            kps_pos: HudPosState::default(),
+            hud_pos_grace_until: Instant::now() + Duration::from_secs(5),
             start_minimized,
             last_applied_h: BASE_H,
             resize_target: None,
@@ -1050,6 +1073,9 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_all();
+        // 卸载 HUD 监听脚本（KDE/Wayland），避免 KWin 里留下僵尸脚本
+        #[cfg(target_os = "linux")]
+        crate::kwin::stop_hud_listener();
     }
 }
 
@@ -1155,6 +1181,13 @@ impl App {
         }
         if self.hud_kps_show {
             self.show_kps_hud(ctx, s);
+        }
+        // 悬浮窗各自的设置窗口（右键悬浮窗打开；也是独立视口，不会被胶囊条裁掉）
+        if self.apm_cfg_open {
+            self.show_apm_settings(ctx, s);
+        }
+        if self.kps_cfg_open {
+            self.show_kps_settings(ctx, s);
         }
 
         // ---- 窗口高度与宽度自适应：底部面板展开时向下加高，配列切换时重设宽度 ----
@@ -1566,396 +1599,6 @@ impl App {
             );
         }
         ctx.request_repaint_after(Duration::from_millis(500));
-    }
-
-    #[allow(dead_code)]
-    pub fn toggle_hud(&mut self, _ctx: &egui::Context) {
-        self.toggle_apm_hud();
-    }
-
-    #[allow(dead_code)]
-    pub fn enter_hud(&mut self, _ctx: &egui::Context) {
-        self.hud_apm_show = true;
-        self.cfg.hud_apm_show = true;
-        let mut cfg = self.cfg_shared.lock();
-        cfg.hud_apm_show = true;
-        let _ = cfg.save(&self.cfg_path);
-    }
-
-    #[allow(dead_code)]
-    pub fn exit_hud(&mut self, _ctx: &egui::Context) {
-        self.hud_apm_show = false;
-        self.cfg.hud_apm_show = false;
-        let mut cfg = self.cfg_shared.lock();
-        cfg.hud_apm_show = false;
-        let _ = cfg.save(&self.cfg_path);
-    }
-
-    pub fn toggle_apm_hud(&mut self) {
-        self.hud_apm_show = !self.hud_apm_show;
-        self.is_hud = self.hud_apm_show;
-        self.cfg.hud_apm_show = self.hud_apm_show;
-        let mut cfg = self.cfg_shared.lock();
-        cfg.hud_apm_show = self.hud_apm_show;
-        let _ = cfg.save(&self.cfg_path);
-    }
-
-    pub fn toggle_kps_hud(&mut self) {
-        self.hud_kps_show = !self.hud_kps_show;
-        self.cfg.hud_kps_show = self.hud_kps_show;
-        let mut cfg = self.cfg_shared.lock();
-        cfg.hud_kps_show = self.hud_kps_show;
-        let _ = cfg.save(&self.cfg_path);
-    }
-
-    fn show_apm_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
-        let (today_keys, today_clicks, today_dist_m) = {
-            let store = self.shared.store.lock();
-            if let Some(entry) = store.days.get(&self.snap_today) {
-                (entry.keystrokes, entry.mouse_clicks(), self.shared.px_to_meters(entry.mouse.move_px))
-            } else {
-                (0, 0, 0.0)
-            }
-        };
-        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
-        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today, apm_w);
-
-        let apm_color = if cur_apm >= 200 {
-            Color32::from_rgb(0xFF, 0x55, 0x55)
-        } else if cur_apm >= 100 {
-            Color32::from_rgb(0xF5, 0xA6, 0x23)
-        } else {
-            Color32::from_rgb(0x4E, 0xC9, 0xB0)
-        };
-
-        let vp_id = egui::ViewportId::from_hash_of("kmc_apm_hud");
-        let mut close_requested = false;
-        let mut open_main_requested = false;
-        let mut open_settings_requested = false;
-        let mut reset_peak_requested = false;
-
-        ctx.show_viewport_immediate(
-            vp_id,
-            egui::ViewportBuilder::default()
-                .with_title("KMC - APM")
-                .with_inner_size([340.0, 32.0])
-                .with_resizable(false)
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_transparent(true),
-            |hud_ctx, _class| {
-                if hud_ctx.input(|i| i.viewport().close_requested()) {
-                    close_requested = true;
-                    return;
-                }
-                hud_ctx.request_repaint_after(Duration::from_millis(200));
-
-                let bg_fill = Color32::from_rgba_premultiplied(24, 26, 34, 240);
-                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(59, 66, 82, 220));
-
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(bg_fill)
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                            .stroke(border_stroke)
-                            .rounding(6.0),
-                    )
-                    .show(hud_ctx, |ui| {
-                        let full_rect = ui.max_rect();
-                        let bg_resp = ui.interact(full_rect, ui.id().with("apm_hud_drag"), Sense::click_and_drag());
-                        if bg_resp.drag_started() {
-                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if bg_resp.double_clicked() {
-                            open_main_requested = true;
-                        }
-                        bg_resp.context_menu(|ui| {
-                            if ui.button(format!("⚙ {}", s.hud_open_settings)).clicked() {
-                                open_settings_requested = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(format!("🗖 {}", s.hud_open_main)).clicked() {
-                                open_main_requested = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(format!("🔄 {}", s.hud_reset_peak)).clicked() {
-                                reset_peak_requested = true;
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(format!("✕ {}", s.hud_close)).clicked() {
-                                close_requested = true;
-                                ui.close_menu();
-                            }
-                        });
-                        bg_resp.on_hover_text(s.hud_drag_hint);
-
-                        ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
-
-                            // 键盘
-                            let k_text = format!("⌨ {}", fmt_thousands(today_keys as f64));
-                            ui.label(egui::RichText::new(k_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                                .on_hover_text(format!("{}: {}", s.keystrokes, today_keys));
-
-                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                            // 鼠标点击
-                            let c_text = format!("🖱 {}", fmt_thousands(today_clicks as f64));
-                            ui.label(egui::RichText::new(c_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                                .on_hover_text(format!("{}: {}", s.mouse_clicks, today_clicks));
-
-                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                            // 移动距离
-                            let d_text = format!("📏 {}", format_dist_m(today_dist_m));
-                            ui.label(egui::RichText::new(d_text).strong().size(12.0).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)))
-                                .on_hover_text(format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m));
-
-                            ui.label(egui::RichText::new("·").color(Color32::from_rgb(0x60, 0x68, 0x78)));
-
-                            // 实时 APM
-                            let apm_text = format!("⚡ {} APM", cur_apm);
-                            ui.label(egui::RichText::new(apm_text).strong().size(12.0).color(apm_color))
-                                .on_hover_text(format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm));
-
-                            // 靠右放置还原按钮与关闭按钮
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button(egui::RichText::new("✕").size(11.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
-                                    .on_hover_text(s.hud_close)
-                                    .clicked()
-                                {
-                                    close_requested = true;
-                                }
-                                if ui
-                                    .button(egui::RichText::new("⤢").size(12.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
-                                    .on_hover_text(s.hud_expand_btn)
-                                    .clicked()
-                                {
-                                    open_main_requested = true;
-                                }
-                            });
-                        });
-                    });
-            },
-        );
-
-        if close_requested {
-            self.toggle_apm_hud();
-        }
-        if open_main_requested {
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
-        }
-        if open_settings_requested {
-            self.edit = self.cfg.clone();
-            self.more_open = true;
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
-        }
-        if reset_peak_requested {
-            self.shared.apm.lock().reset_peak();
-        }
-    }
-
-    fn show_kps_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
-        let keys_list = self.cfg.kps_key_list();
-        let kps_w = self.shared.kps_window_ms.load(Ordering::Relaxed);
-        let (cur_kps, peak_kps) = self.shared.kps.lock().get(&self.snap_today, kps_w);
-        let key_infos = self.shared.kps.lock().query_keys(&keys_list);
-
-        let n_keys = key_infos.len().max(1);
-        let key_box_w = 34.0;
-        let meter_w = if self.cfg.kps_show_max { 64.0 } else { 50.0 };
-        let total_w = 16.0 + (n_keys as f32) * (key_box_w + 3.0) + meter_w + 24.0;
-
-        let vp_id = egui::ViewportId::from_hash_of("kmc_kps_hud");
-        let mut close_requested = false;
-        let mut open_main_requested = false;
-        let mut open_settings_requested = false;
-        let mut reset_hits_requested = false;
-
-        let kps_color = if cur_kps >= 15 {
-            Color32::from_rgb(0xFF, 0x47, 0x57)
-        } else if cur_kps >= 8 {
-            Color32::from_rgb(0xFF, 0xA5, 0x02)
-        } else {
-            Color32::from_rgb(0x2E, 0xD5, 0x73)
-        };
-
-        let show_hits = self.cfg.kps_show_hits;
-        let show_max = self.cfg.kps_show_max;
-
-        ctx.show_viewport_immediate(
-            vp_id,
-            egui::ViewportBuilder::default()
-                .with_title("KMC - KPS")
-                .with_inner_size([total_w, 36.0])
-                .with_resizable(false)
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_transparent(true),
-            |hud_ctx, _class| {
-                if hud_ctx.input(|i| i.viewport().close_requested()) {
-                    close_requested = true;
-                    return;
-                }
-                hud_ctx.request_repaint_after(Duration::from_millis(40));
-
-                let bg_fill = Color32::from_rgba_premultiplied(16, 18, 24, 240);
-                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(60, 68, 86, 220));
-
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(bg_fill)
-                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
-                            .stroke(border_stroke)
-                            .rounding(6.0),
-                    )
-                    .show(hud_ctx, |ui| {
-                        let full_rect = ui.max_rect();
-                        let bg_resp = ui.interact(full_rect, ui.id().with("kps_hud_drag"), Sense::click_and_drag());
-                        if bg_resp.drag_started() {
-                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if bg_resp.double_clicked() {
-                            open_main_requested = true;
-                        }
-                        bg_resp.context_menu(|ui| {
-                            if ui.button(format!("⚙ {}", s.hud_open_settings)).clicked() {
-                                open_settings_requested = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(format!("🗖 {}", s.hud_open_main)).clicked() {
-                                open_main_requested = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(format!("🔄 {}", s.hud_reset_peak)).clicked() {
-                                reset_hits_requested = true;
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(format!("✕ {}", s.hud_close)).clicked() {
-                                close_requested = true;
-                                ui.close_menu();
-                            }
-                        });
-                        bg_resp.on_hover_text(s.hud_drag_hint);
-
-                        ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-
-                            // 监控按键格子
-                            for k in &key_infos {
-                                let (box_bg, box_border, text_color) = if k.is_active {
-                                    (
-                                        Color32::from_rgb(0x00, 0xBD, 0xB0), // 激活高亮青绿发光
-                                        egui::Stroke::new(1.5_f32, Color32::WHITE),
-                                        Color32::WHITE,
-                                    )
-                                } else {
-                                    (
-                                        Color32::from_rgba_premultiplied(35, 38, 48, 220),
-                                        egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(70, 75, 95, 160)),
-                                        Color32::from_rgb(0xD0, 0xD4, 0xDC),
-                                    )
-                                };
-
-                                let (rect, _) = ui.allocate_exact_size(Vec2::new(key_box_w, 28.0), Sense::hover());
-                                ui.painter().rect(rect, 4.0, box_bg, box_border);
-
-                                if show_hits {
-                                    let top_pos = Pos2::new(rect.center().x, rect.min.y + 7.0);
-                                    ui.painter().text(
-                                        top_pos,
-                                        egui::Align2::CENTER_CENTER,
-                                        &k.name,
-                                        egui::FontId::proportional(10.0),
-                                        text_color,
-                                    );
-                                    let bot_pos = Pos2::new(rect.center().x, rect.min.y + 20.0);
-                                    let hit_str = format_compact_num(k.hits);
-                                    ui.painter().text(
-                                        bot_pos,
-                                        egui::Align2::CENTER_CENTER,
-                                        hit_str,
-                                        egui::FontId::proportional(8.5),
-                                        if k.is_active { Color32::WHITE } else { Color32::from_rgb(0x8E, 0x98, 0xA8) },
-                                    );
-                                } else {
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        &k.name,
-                                        egui::FontId::proportional(12.0),
-                                        text_color,
-                                    );
-                                }
-                            }
-
-                            ui.add_space(4.0);
-
-                            // KPS 读数
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(cur_kps.to_string()).size(14.0).strong().color(kps_color));
-                                    ui.label(egui::RichText::new("KPS").size(9.0).color(Color32::from_rgb(0x8E, 0x98, 0xA8)));
-                                });
-                                if show_max {
-                                    ui.label(egui::RichText::new(format!("{}: {}", s.kps_max_label, peak_kps)).size(8.5).color(Color32::from_rgb(0x7A, 0x84, 0x94)));
-                                }
-                            });
-
-                            // 关闭按钮
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button(egui::RichText::new("✕").size(11.0).color(Color32::from_rgb(0xAA, 0xBB, 0xCC)))
-                                    .on_hover_text(s.hud_close)
-                                    .clicked()
-                                {
-                                    close_requested = true;
-                                }
-                            });
-                        });
-                    });
-            },
-        );
-
-        if close_requested {
-            self.toggle_kps_hud();
-        }
-        if open_main_requested {
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
-        }
-        if open_settings_requested {
-            self.edit = self.cfg.clone();
-            self.more_open = true;
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
-        }
-        if reset_hits_requested {
-            self.shared.kps.lock().reset_peak();
-            self.shared.kps.lock().reset_hits();
-        }
-    }
-
-    #[cfg(any(test, feature = "softshot"))]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn debug_toggle_hud(&mut self) {
-        self.toggle_apm_hud();
-    }
-
-    #[cfg(feature = "softshot")]
-    #[allow(dead_code)]
-    pub(crate) fn debug_is_hud(&self) -> bool {
-        self.is_hud
-    }
-
-    #[cfg(feature = "softshot")]
-    #[allow(dead_code)]
-    pub(crate) fn debug_record_apm_action(&mut self, date: &str) {
-        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
-        self.shared.apm.lock().record(date, apm_w);
     }
 
     /// 日期 + 分时导航行（热力图页与趋势页共用，选择状态也是共用的）
@@ -3312,44 +2955,6 @@ impl App {
                     ui.add(egui::Label::new(egui::RichText::new(s.settings_keep_on_top_sub).small().color(TEXT)).wrap());
                 };
 
-                let mut render_hud = |ui: &mut egui::Ui| {
-                    ui.strong(egui::RichText::new(s.settings_hud_section).size(14.0).color(TEXT))
-                        .on_hover_text(s.settings_hud_section_sub);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.edit.hud_apm_show, s.hud_apm_title);
-                        ui.checkbox(&mut self.edit.hud_kps_show, s.hud_kps_title);
-                    });
-                    ui.horizontal(|ui| {
-                        label(ui, s.settings_apm_window);
-                        ui.add(egui::DragValue::new(&mut self.edit.apm_window_secs).range(5..=300).speed(1.0))
-                            .on_hover_text(s.settings_apm_window_sub);
-                        label(ui, "s");
-                        ui.add_space(4.0);
-                        label(ui, s.settings_kps_window);
-                        ui.add(egui::DragValue::new(&mut self.edit.kps_window_ms).range(200..=5000).speed(50.0))
-                            .on_hover_text(s.settings_kps_window_sub);
-                        label(ui, "ms");
-                    });
-                    ui.horizontal(|ui| {
-                        label(ui, s.settings_kps_keys);
-                        ui.add(egui::TextEdit::singleline(&mut self.edit.kps_keys).desired_width(65.0))
-                            .on_hover_text(s.settings_kps_keys_hint);
-                        if ui.small_button("osu!").on_hover_text(s.kps_preset_osu).clicked() {
-                            self.edit.kps_keys = "Z, X, M1, M2".into();
-                        }
-                        if ui.small_button("4K").on_hover_text(s.kps_preset_4k).clicked() {
-                            self.edit.kps_keys = "D, F, J, K".into();
-                        }
-                        if ui.small_button("FPS").on_hover_text(s.kps_preset_fps).clicked() {
-                            self.edit.kps_keys = "W, A, S, D, Space, M1, M2".into();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.edit.kps_show_hits, s.settings_kps_show_hits);
-                        ui.checkbox(&mut self.edit.kps_show_max, s.settings_kps_show_max);
-                    });
-                };
-
                 let mut render_lang = |ui: &mut egui::Ui| {
                     ui.strong(egui::RichText::new(s.settings_language).size(14.0).color(TEXT));
                     ui.label(egui::RichText::new(s.settings_language_sub).small().color(TEXT));
@@ -3450,8 +3055,6 @@ impl App {
                         render_screen(&mut cols[0]);
                         cols[0].add_space(6.0);
                         render_window(&mut cols[0]);
-                        cols[0].add_space(6.0);
-                        render_hud(&mut cols[0]);
 
                         render_layout(&mut cols[1]);
                         cols[1].add_space(6.0);
@@ -3473,8 +3076,6 @@ impl App {
                         render_lang(&mut cols[0]);
 
                         render_layout(&mut cols[1]);
-                        cols[1].add_space(6.0);
-                        render_hud(&mut cols[1]);
 
                         render_window(&mut cols[2]);
                         cols[2].add_space(6.0);
@@ -3495,6 +3096,8 @@ impl App {
                                 let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
                                 let apm_window_changed = self.cfg.apm_window_secs != self.edit.apm_window_secs;
                                 let kps_window_changed = self.cfg.kps_window_ms != self.edit.kps_window_ms;
+                                // 悬浮窗设置由各自的设置窗口管理：先抄回来，避免用面板打开时的旧副本覆盖它们
+                                copy_hud_fields(&self.cfg, &mut self.edit);
                                 {
                                     let mut cfg = self.cfg_shared.lock();
                                     *cfg = self.edit.clone();
@@ -3503,6 +3106,8 @@ impl App {
                                 self.cfg = self.edit.clone();
                                 self.hud_apm_show = self.cfg.hud_apm_show;
                                 self.hud_kps_show = self.cfg.hud_kps_show;
+                                // 监控键变化立刻生效（KPS 速率只统计这些键）
+                                self.shared.kps.lock().set_monitored(&self.cfg.kps_key_list());
                                 self.apply_language();
                                 if apm_window_changed {
                                     self.shared.apm_window_secs.store(self.cfg.apm_window_secs, Ordering::Relaxed);
@@ -3779,6 +3384,7 @@ fn arrow_points(dir: crate::keys::ArrowDir, r: Rect) -> (Pos2, Pos2, Pos2) {
 
 /// 收起窗口：Wayland 下 winit 无法隐藏窗口，用 1x1 收缩（最小化无法程序化恢复且会停止渲染帧）；
 /// X11/Windows 直接隐藏（任务栏条目随之消失）。
+
 pub fn hide_window(shared: &Arc<Shared>, ctx: &egui::Context) {
     if is_wayland() {
         // Wayland 无法隐藏窗口（winit set_visible 是空实现），且窗口被遮挡时尺寸变更无法生效
@@ -4286,11 +3892,11 @@ mod tests {
             None,
             autostart_state,
         );
-        assert!(!app.is_hud);
+        assert!(!app.hud_apm_show);
         app.debug_toggle_hud();
-        assert!(app.is_hud);
+        assert!(app.hud_apm_show);
         app.debug_toggle_hud();
-        assert!(!app.is_hud);
+        assert!(!app.hud_apm_show);
         std::fs::remove_dir_all(tmp).ok();
     }
 }

@@ -395,6 +395,16 @@ mod tests {
         }
     }
 
+    /// 右键（次级键）按下/抬起：悬浮窗用右键打开自己的设置窗口
+    fn right_click_at(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     fn headless_app(store: Store) -> (App, egui::Context) {
         headless_app_with_cfg(store, Config::default())
     }
@@ -1895,24 +1905,23 @@ mod tests {
     /// 统一键盘配列名称格式测试：所有配列均为“xx 键 (别名)”格式
     #[test]
     fn layout_names_unified_format() {
-        let (mut app, _ctx) = headless_app(Store::default());
-        let s = app.debug_strings();
-        assert_eq!(s.layout_104, "104 键 (全尺寸)");
-        assert_eq!(s.layout_98, "98 键 (紧凑全键)");
-        assert_eq!(s.layout_87, "87 键 (TKL)");
-        assert_eq!(s.layout_75, "84 键 (75%)");
-        assert_eq!(s.layout_68, "68 键 (65%)");
-        assert_eq!(s.layout_64, "64 键 (独立方向键)");
-        assert_eq!(s.layout_60, "60 键 (Poker)");
+        // 按语言直接取文案表，不要依赖运行环境的语言回退：
+        // CI（LANG=C + 无中文字体）下界面会回退英文，硬编码中文必挂
+        let zh = crate::lang::strings(crate::lang::Lang::Zh);
+        let en = crate::lang::strings(crate::lang::Lang::En);
+        assert_eq!(zh.layout_104, "104 键 (全尺寸)");
+        assert_eq!(zh.layout_98, "98 键 (紧凑全键)");
+        assert_eq!(zh.layout_87, "87 键 (TKL)");
+        assert_eq!(zh.layout_75, "84 键 (75%)");
+        assert_eq!(zh.layout_68, "68 键 (65%)");
+        assert_eq!(zh.layout_64, "64 键 (独立方向键)");
+        assert_eq!(zh.layout_60, "60 键 (Poker)");
 
-        assert_eq!(crate::keys::layout_profile("75").name_zh, "84 键 (75%)");
-        assert_eq!(crate::keys::layout_profile("75").name_en, "84-Key (75%)");
-        assert_eq!(crate::keys::layout_profile("68").name_zh, "68 键 (65%)");
-        assert_eq!(crate::keys::layout_profile("68").name_en, "68-Key (65%)");
+        assert_eq!(crate::keys::layout_profile("75").name_zh, zh.layout_75);
+        assert_eq!(crate::keys::layout_profile("75").name_en, en.layout_75);
+        assert_eq!(crate::keys::layout_profile("68").name_zh, zh.layout_68);
+        assert_eq!(crate::keys::layout_profile("68").name_en, en.layout_68);
 
-        // 切换英文模式验证
-        app.debug_set_language("en");
-        let en = app.debug_strings();
         assert_eq!(en.layout_75, "84-Key (75%)");
         assert_eq!(en.layout_68, "68-Key (65%)");
     }
@@ -1927,9 +1936,13 @@ mod tests {
         assert_eq!(w, 940.0);
         drive(&mut app, &ctx, w, 900.0, 3, vec![]);
         let panel = frame_texts_pos(&ctx, &mut app, w, 900.0);
-        // 校验数据校验副文本与单位文本均在安全右边界以内
-        let limits_sub = panel.iter().find(|(_, _, _, t)| t.contains("某个小时超过阈值"));
-        assert!(limits_sub.is_some(), "应渲染数据校验副文本");
+        // 校验数据校验副文本与单位文本均在安全右边界以内。
+        // 副文本按**当前语言**的文案表取开头几个字（长文本会被换行切开，只能按前缀找）；
+        // 硬编码中文在 CI（LANG=C + 无中文字体，界面回退英文）上必挂 —— 这是本项目的经典坑
+        let sub = app.debug_strings().settings_limits_sub;
+        let head: String = sub.chars().take(6).collect();
+        let limits_sub = panel.iter().find(|(_, _, _, t)| t.contains(&head));
+        assert!(limits_sub.is_some(), "应渲染数据校验副文本（找「{head}」）");
         for (y, x, text_w, t) in &panel {
             if *y > 350.0 && !t.trim().is_empty() {
                 assert!(*x + *text_w <= w - 12.0, "文本 '{t}' 超出安全留白边界: x={x}, w={text_w}, max={}", w - 12.0);
@@ -1985,11 +1998,262 @@ mod tests {
         assert!(hud_texts.iter().any(|t| t.contains("⌨")), "HUD 模式应显示键盘按键图标：{hud_texts:?}");
         assert!(hud_texts.iter().any(|t| t.contains("🖱")), "HUD 模式应显示鼠标点击图标：{hud_texts:?}");
         assert!(hud_texts.iter().any(|t| t.contains("📏")), "HUD 模式应显示距离图标：{hud_texts:?}");
-        assert!(hud_texts.iter().any(|t| t.contains("⤢")), "HUD 模式应有还原按钮：{hud_texts:?}");
+        assert!(
+            !hud_texts.iter().any(|t| t.contains('⤢') || t.contains('✕')),
+            "HUD 胶囊条上不应再有 ✕ / ⤢ 按钮（操作都在右键设置窗口里）：{hud_texts:?}"
+        );
 
         // 再次切换退出 HUD 模式
         app.debug_toggle_hud();
         assert!(!app.debug_is_hud());
+    }
+
+    /// 悬浮窗设置改版（需求 1/2/3/4/5）：
+    /// - 主设置面板里不再有 APM/KPS 设置段（都搬进悬浮窗自己的设置窗口）
+    /// - 右键悬浮窗打开**独立视口**的设置窗口（第二行不会被 340×32 裁掉）
+    /// - KPS 设置窗口里有平均 KPS、没有 osu!/4K/FPS 预设按钮
+    #[test]
+    fn hud_settings_windows_replace_old_panel_section() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        let s = app.debug_strings();
+
+        // 1) 主设置面板里不该再出现悬浮窗设置项
+        app.debug_open_panel();
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        let panel = frame_texts(&ctx, &mut app, 1260.0, 900.0);
+        assert!(
+            !panel.iter().any(|t| t.contains(s.settings_apm_window)),
+            "主面板不该再有「{}」：{panel:?}",
+            s.settings_apm_window
+        );
+        assert!(
+            !panel.iter().any(|t| t.contains(s.settings_kps_keys)),
+            "主面板不该再有「{}」",
+            s.settings_kps_keys
+        );
+        assert!(
+            !panel.iter().any(|t| t.contains("osu!") || t.contains("4K")),
+            "预设按钮应已移除：{panel:?}"
+        );
+
+        // 2) 打开 APM 悬浮窗 → 右键 → 出现 APM 设置窗口，字段齐全（含两个操作按钮）
+        app.debug_toggle_hud();
+        drive(&mut app, &ctx, 900.0, 600.0, 2, vec![]);
+        // 离屏环境里多视口是"内嵌"渲染的（没有真窗口），悬浮窗挂在父窗口左上角、且在
+        // 主界面控件**下面**，所以右键要点在「胶囊条内 + 主界面没有控件的空白处」。
+        // 胶囊条宽度现在贴合内容（比旧的固定 340 窄），点位由实测宽度推算：
+        // 贴右上内缘（x 内缩 12 避开内边距；y=6 在主界面页签行上方，两种语言都空）。
+        // 真机上悬浮窗是自己的窗口，右键点它任意位置都会走到同一条路径。
+        let (cap_w, _) = app.debug_apm_hud_size();
+        assert!(cap_w > 100.0, "应先量出胶囊条宽度：{cap_w}");
+        let pos = Pos2::new(cap_w - 12.0, 6.0);
+        drive(&mut app, &ctx, 900.0, 600.0, 1, vec![egui::Event::PointerMoved(pos), right_click_at(pos, true)]);
+        drive(&mut app, &ctx, 900.0, 600.0, 1, vec![right_click_at(pos, false)]);
+        let texts = frame_texts(&ctx, &mut app, 900.0, 600.0);
+        assert!(
+            texts.iter().any(|t| t.contains(s.apm_cfg_title)),
+            "右键应打开 APM 设置窗口：{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains(s.settings_apm_window)), "应有统计窗口项");
+        assert!(texts.iter().any(|t| t == s.hud_opacity), "应有不透明度项");
+        assert!(texts.iter().any(|t| t == s.hud_open_main), "应有呼出主程序按钮");
+        assert!(texts.iter().any(|t| t == s.hud_reset_peak), "应有重置按钮");
+
+        // 3) KPS 设置窗口：有平均 KPS、没有游戏预设
+        app.hud_apm_show = false;
+        app.hud_kps_show = true;
+        app.debug_set_cfg_open(false, true);
+        drive(&mut app, &ctx, 900.0, 600.0, 2, vec![]);
+        let s = app.debug_strings();
+        let texts = frame_texts(&ctx, &mut app, 900.0, 600.0);
+        assert!(texts.iter().any(|t| t.contains(s.kps_cfg_title)), "应显示 KPS 设置窗口：{texts:?}");
+        assert!(texts.iter().any(|t| t.contains(s.settings_kps_keys)), "应有监控按键项");
+        assert!(texts.iter().any(|t| t == s.kps_show_avg), "应有「{}」显示项", s.kps_show_avg);
+        assert!(texts.iter().any(|t| t == s.settings_kps_show_hits), "应有击打次数显示项");
+        assert!(
+            !texts.iter().any(|t| t.contains("osu!") || t.contains("4K") || t.contains("FPS")),
+            "KPS 设置里不该再有游戏预设按钮：{texts:?}"
+        );
+
+        // 4) KPS 悬浮窗上显示平均 KPS 读数
+        let hud = frame_texts(&ctx, &mut app, 900.0, 600.0);
+        assert!(
+            hud.iter().any(|t| t.contains(s.avg_label)),
+            "KPS 悬浮窗第二行应出现「{}」：{hud:?}",
+            s.avg_label
+        );
+    }
+
+    /// KPS 悬浮窗的缩放 / 分行 / 显示项开关（分行由键表里的换行决定）
+    #[test]
+    fn kps_hud_scale_rows_and_toggles() {
+        use crate::gui::kps_hud_metrics;
+        let mut cfg = Config::default();
+        // 键表里写换行 = 分行
+        cfg.kps_keys = "A, B\nC, D".into();
+        let layout = cfg.kps_key_layout();
+        assert_eq!(layout.rows.len(), 2);
+        let m = kps_hud_metrics(&cfg, &layout);
+        assert_eq!(m.rows, 2, "两行键格：{m:?}");
+        cfg.kps_keys = "A\nB\nC\nD".into();
+        let m4 = kps_hud_metrics(&cfg, &cfg.kps_key_layout());
+        assert_eq!(m4.rows, 4);
+        assert!(m4.h > m.h, "行数变多应该更高：{} → {}", m.h, m4.h);
+        assert_eq!(m4.w, m.w, "宽度由 KPS 图决定，分行不影响它");
+        // 缩放：200% 明显更大
+        cfg.kps_keys = "A, B".into();
+        let layout = cfg.kps_key_layout();
+        let m100 = kps_hud_metrics(&cfg, &layout);
+        cfg.kps_scale = 200;
+        let m200 = kps_hud_metrics(&cfg, &layout);
+        assert!(m200.w > m100.w * 1.8 && m200.h > m100.h * 1.8, "200% 应整体放大");
+        // 上限到 400%（设置里可拉到）：再放大一倍
+        cfg.kps_scale = 400;
+        let m400 = kps_hud_metrics(&cfg, &layout);
+        assert!(m400.w > m200.w * 1.8, "400% 应比 200% 还大：{} → {}", m200.w, m400.w);
+        // 图整宽、且够大；关掉它高度明显下降
+        cfg.kps_scale = 100;
+        let with_graph = kps_hud_metrics(&cfg, &layout);
+        assert!(with_graph.graph_h > 40.0, "KPS 图应该够大：{with_graph:?}");
+        assert!(
+            with_graph.graph_w >= with_graph.w - 2.0 * with_graph.pad - 1.0,
+            "图应该是整宽的：{with_graph:?}"
+        );
+        // 三栏竖排（键位 / 数据 / 图）：高度 = 内边距 + 三块 + 各一个间距
+        let keys_h = with_graph.rows as f32 * with_graph.box_h
+            + (with_graph.rows as f32 - 1.0) * with_graph.gap;
+        let expect = with_graph.pad * 2.0
+            + keys_h
+            + with_graph.pad
+            + with_graph.top_h
+            + with_graph.pad
+            + with_graph.graph_h;
+        assert!(
+            (with_graph.h - expect).abs() < 1.5,
+            "三栏竖排高度不对：{} vs {}（{with_graph:?}）",
+            with_graph.h,
+            expect
+        );
+        assert!(with_graph.top_h > 15.0, "数据行要有高度：{with_graph:?}");
+        cfg.kps_show_graph = false;
+        let no_graph = kps_hud_metrics(&cfg, &layout);
+        assert!(no_graph.h < with_graph.h - 40.0, "关掉 KPS 图高度应明显下降");
+        // 三块全关 → 基本只剩内边距（宽度保留最小一格，避免出现负尺寸）
+        cfg.kps_show_stats = false;
+        cfg.kps_show_buttons = false;
+        let empty = kps_hud_metrics(&cfg, &layout);
+        assert!(
+            empty.w <= 2.0 * empty.pad + empty.box_w + 1.0,
+            "全关应该基本只剩内边距：{empty:?}"
+        );
+        assert!(empty.h <= 2.0 * empty.pad + 1.0, "全关应该只有内边距那么高：{empty:?}");
+    }
+
+    /// 键行对称（用户第二十四轮第 2 条）：所有缝隙（含左右两侧边距）等宽，右侧不再空一大块
+    #[test]
+    fn kps_hud_key_row_is_symmetric() {
+        use crate::gui::{key_rows_layout, kps_hud_metrics};
+        let mut cfg = Config::default();
+        cfg.kps_keys = "Q, W, E, R".into();
+        let layout = cfg.kps_key_layout();
+        let m = kps_hud_metrics(&cfg, &layout);
+        let pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
+        let r = &pos[0];
+        assert_eq!(r.len(), 4, "默认 4 个键应铺成一行：{r:?}");
+        assert!((r[0].1 - m.box_w).abs() < 0.01, "格宽不变：{} vs {}", r[0].1, m.box_w);
+        let left = r[0].0;
+        let right = m.graph_w - (r.last().unwrap().0 + r.last().unwrap().1);
+        assert!((left - right).abs() < 0.05, "左右边距应相等：{left} vs {right}");
+        assert!(left > 1.0, "左侧不该贴边（应与键缝同宽）：{left}");
+        for w in r.windows(2) {
+            let g = w[1].0 - (w[0].0 + w[0].1);
+            assert!((g - left).abs() < 0.05, "键缝应与边距等宽：{g} vs {left}");
+        }
+    }
+
+    /// APM 胶囊条宽度贴合内容（用户第二十五轮）：明显窄于旧的固定 340，且关项会变窄
+    #[test]
+    fn apm_hud_width_fits_items() {
+        use crate::gui::apm_hud_measure;
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        drive(&mut app, &ctx, 900.0, 600.0, 1, vec![]); // 先跑一帧让字体就绪
+        let items: Vec<String> = vec![
+            "⌨ 749".into(),
+            "🖱 94".into(),
+            "📏 21.1m".into(),
+            "⚡ 11 APM".into(),
+        ];
+        let w4 = apm_hud_measure(&ctx, &items, 1.0);
+        assert!(
+            w4 > 150.0 && w4 < 340.0,
+            "宽度应贴合内容（旧的固定值 340 会空一大块）：{w4}"
+        );
+        let w3 = apm_hud_measure(&ctx, &items[..3], 1.0);
+        assert!(w3 < w4, "少一项应更窄：{w3} vs {w4}");
+        // 缩放：200% 明显更宽（APM 缩放，用户第二十六轮）
+        let w4b = apm_hud_measure(&ctx, &items, 2.0);
+        assert!(w4b > w4 * 1.8, "200% 应整体放大：{w4} → {w4b}");
+    }
+
+    /// 长按：按住期间键格保持点亮（旧实现在 ~380ms 内就灭了）——按住 300ms 后仍是满亮
+    #[test]
+    fn kps_hud_held_key_survives_long_press() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        app.hud_kps_show = true;
+        app.debug_set_cfg_open(false, false);
+        app.debug_set_kps_held("Q", true);
+        drive(&mut app, &ctx, 900.0, 600.0, 2, vec![]);
+        // 等 300ms 再查：旧实现的点亮会在 ~380ms 内衰减到 0，这里应保持满亮
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drive(&mut app, &ctx, 900.0, 600.0, 1, vec![]);
+        let (held, glow) = app.debug_kps_key_state("Q");
+        assert!(held, "长按 300ms 后应仍处于按住状态");
+        assert!(glow >= 0.999, "按住期间应保持满亮：{glow}");
+        // 松开后转为淡出（刚开始仍是亮的）
+        app.debug_set_kps_held("Q", false);
+        let (held, glow) = app.debug_kps_key_state("Q");
+        assert!(!held, "松开后不应再是按住状态");
+        assert!(glow > 0.9, "刚松开仍在亮：{glow}");
+    }
+
+    /// 单键 KPS 与 KPS 图都画在悬浮窗上（离屏帧里能找到对应文本）
+    #[test]
+    fn kps_hud_shows_per_key_kps_and_graph() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        app.hud_kps_show = true;
+        app.debug_set_cfg_open(false, false);
+        // 喂 13 次击键：硬算 + 1000ms 窗口 → 总 KPS 与单键 KPS 都是 13
+        // （默认键位是 Q/W/E/R，喂第一个 Q；用 13 是因为两位数正好能验"数字与标签不挤"）
+        for _ in 0..13 {
+            app.debug_record_kps_key(&today, "Q");
+        }
+        drive(&mut app, &ctx, 900.0, 600.0, 2, vec![]);
+        let s = app.debug_strings();
+        let texts = frame_texts(&ctx, &mut app, 900.0, 600.0);
+        assert!(texts.iter().any(|t| t.contains(s.kps_label)), "应显示 KPS 读数：{texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "13 · 13"),
+            "键格第二行应是「计数 · 该键 KPS」= 13 · 13：{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains(s.kps_max_label)), "数据行应有 Max：{texts:?}");
+        // 两位数时数字与 "KPS" 标签不能挤在一起：标签起点要在数字右边缘之后
+        let pos = frame_texts_pos(&ctx, &mut app, 900.0, 600.0);
+        let num = pos
+            .iter()
+            .find(|(_, _, _, t)| t == "13")
+            .expect("应有两根位的当前 KPS 数字");
+        let unit_label = pos
+            .iter()
+            .find(|(_, _, _, t)| t == s.kps_label)
+            .expect("应有 KPS 标签");
+        assert!(
+            unit_label.1 >= num.1 + num.2 - 0.5,
+            "KPS 标签不该压在数字上：数字 x={:.0} w={:.0}，标签 x={:.0}",
+            num.1,
+            num.2,
+            unit_label.1
+        );
     }
 
     /// 生成 README 配图（默认 ignore；用 --ignored 跑）
@@ -2078,5 +2342,97 @@ mod tests {
                 println!("[softshot] settings-en → {} ({}x{})", s.ppm.display(), s.w, s.h);
             }
         }
+    }
+
+    /// KPS 悬浮窗特写截图（默认 ignore）：视觉抽查键格对称排布与「冷热」配色。
+    /// 运行：`KMCOUNTER_HUD_SHOT_DIR=/tmp/kmc-hud cargo test --release --features softshot render_kps_hud_shot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn render_kps_hud_shot() {
+        let dir = std::env::var("KMCOUNTER_HUD_SHOT_DIR").unwrap_or_else(|_| "/tmp/kmc-hud-shot".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        app.hud_kps_show = true;
+        app.debug_set_cfg_open(false, false);
+        // 冷热都有：R 不敲（冷）、E 一下（微温）、W 3 次、Q 9 次（最热 → 青绿边框）
+        for _ in 0..9 {
+            app.debug_record_kps_key(&today, "Q");
+        }
+        for _ in 0..3 {
+            app.debug_record_kps_key(&today, "W");
+        }
+        app.debug_record_kps_key(&today, "E");
+
+        // —— 截图助手：离屏跑几帧 → 把「悬浮窗前缀」挪到最后（主窗口先画）→ 光栅化到 PPM ——
+        let dir_for_cap = dir.clone();
+        // **两张截图共用一张纹理表**：egui 只在纹理「首用」时发全量图集，
+        // 之后都是增量补丁 —— 每张截图各开一张新表的话，第二张会丢掉字体图集，
+        // 字形全变成实心色块（踩过：APM 截图就是这么变成一片白条的）。
+        let mut shot_textures: HashMap<TextureId, Tex> = HashMap::new();
+        let capture = move |app: &mut App,
+                            ctx: &egui::Context,
+                            textures: &mut HashMap<TextureId, Tex>,
+                            name: &str|
+              -> PathBuf {
+            let (w, h, ppp) = (620.0, 420.0, 2.0);
+            ctx.set_pixels_per_point(ppp);
+            let mut last_shapes = None;
+            for _ in 0..4 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+                raw.time = Some(next_time());
+                let out = ctx.run(raw, |ctx| app.draw(ctx));
+                apply_textures(textures, &out.textures_delta);
+                last_shapes = Some(out.shapes);
+            }
+            let shapes = last_shapes.unwrap_or_default();
+            // 绘制顺序：悬浮窗视口在主窗口**之前**画（主窗口随后会把它整个盖住）。
+            // 找主窗口的第一笔（铺满屏幕的浅色面板底），把「悬浮窗前缀」挪到最后再画。
+            let mut cut = shapes.len();
+            for (i, cs) in shapes.iter().enumerate() {
+                if let egui::Shape::Rect(r) = &cs.shape {
+                    let f = r.fill;
+                    if r.rect.width() > w * 0.8
+                        && r.rect.height() > h * 0.8
+                        && f.a() == 255
+                        && f.r() >= 220
+                        && f.g() >= 220
+                        && f.b() >= 220
+                    {
+                        cut = i;
+                        break;
+                    }
+                }
+            }
+            println!("[softshot] {name}：主窗口起点 = {cut}（共 {} 图元）", shapes.len());
+            let mut ordered: Vec<egui::epaint::ClippedShape> = Vec::with_capacity(shapes.len());
+            ordered.extend(shapes[cut..].iter().cloned());
+            ordered.extend(shapes[..cut].iter().cloned());
+            let prims = ctx.tessellate(ordered, ppp);
+            let mut canvas = Canvas::new((w * ppp) as usize, (h * ppp) as usize, crate::gui::BG);
+            for prim in &prims {
+                if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
+                    let tex = mesh.texture_id;
+                    draw_mesh(&mut canvas, textures.get(&tex), mesh, prim.clip_rect, ppp);
+                }
+            }
+            let ppm = PathBuf::from(format!("{dir_for_cap}/{name}.ppm"));
+            canvas.save_ppm(&ppm).unwrap();
+            println!("[softshot] {name} → {} ({}x{})", ppm.display(), canvas.w, canvas.h);
+            ppm
+        };
+        let kps_ppm = capture(&mut app, &ctx, &mut shot_textures, "kps-hud");
+        assert!(kps_ppm.exists());
+
+        // —— 再拍一张 APM 胶囊条特写（宽度贴合内容）——
+        app.hud_kps_show = false;
+        app.hud_apm_show = true;
+        app.debug_set_cfg_open(false, false);
+        for _ in 0..30 {
+            app.debug_record_apm_action(&today);
+        }
+        let apm_ppm = capture(&mut app, &ctx, &mut shot_textures, "apm-hud");
+        assert!(apm_ppm.exists());
     }
 }

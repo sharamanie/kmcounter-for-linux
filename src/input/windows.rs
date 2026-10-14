@@ -26,20 +26,33 @@ static LAST_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
-        // WM_KEYUP = 0x0101, WM_SYSKEYUP = 0x0105
+        // WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105
+        let is_down = wparam == 0x0100 || wparam == 0x0104;
         let is_up = wparam == 0x0101 || wparam == 0x0105;
-        if is_up {
+        if is_down || is_up {
             let info = &*(lparam as *const KBDLLHOOKSTRUCT);
             if (info.flags & LLKHF_INJECTED) == 0 {
                 let extended = (info.flags & LLKHF_EXTENDED) as u16;
                 let sc = (extended << 8) | (info.scanCode as u16 & 0xff);
                 if let Some(sink) = SINK.get() {
-                    match idx_by_win_sc(sc) {
-                        Some(idx) => {
-                            let _ = sink.send(InEvent::Key(idx));
-                        }
-                        None => {
-                            let _ = sink.send(InEvent::KeyOther(other_key_id_win(sc)));
+                    let idx = idx_by_win_sc(sc);
+                    // 悬浮窗「长按点亮」：按下 / 抬起都送（连发的 KEYDOWN 重复送 true 是幂等的）
+                    let hold_name = match idx {
+                        Some(i) => crate::keys::KEYS.get(i).map(|k| k.name.to_string()),
+                        None => Some(other_key_id_win(sc)),
+                    };
+                    if let Some(name) = hold_name {
+                        let _ = sink.send(InEvent::Hold { name, down: is_down });
+                    }
+                    // 计次与原版一致：只在 KEYUP
+                    if is_up {
+                        match idx {
+                            Some(i) => {
+                                let _ = sink.send(InEvent::Key(i));
+                            }
+                            None => {
+                                let _ = sink.send(InEvent::KeyOther(other_key_id_win(sc)));
+                            }
                         }
                     }
                 }
@@ -69,10 +82,27 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                             let _ = sink.send(InEvent::Mouse(MouseEv::MovePx(d)));
                         }
                     }
-                    0x0202 => { let _ = sink.send(InEvent::Mouse(MouseEv::LeftUp)); }   // WM_LBUTTONUP
-                    0x0205 => { let _ = sink.send(InEvent::Mouse(MouseEv::RightUp)); }  // WM_RBUTTONUP
-                    0x0208 => { let _ = sink.send(InEvent::Mouse(MouseEv::MiddleUp)); } // WM_MBUTTONUP
-                    0x020C => { let _ = sink.send(InEvent::Mouse(MouseEv::XUp)); }      // WM_XBUTTONUP
+                    // 「长按点亮」：按钮按下 / 抬起都送（计次仍在抬起，与原版一致）
+                    0x0201 => { let _ = sink.send(InEvent::Hold { name: "M1".into(), down: true }); } // WM_LBUTTONDOWN
+                    0x0204 => { let _ = sink.send(InEvent::Hold { name: "M2".into(), down: true }); } // WM_RBUTTONDOWN
+                    0x0207 => { let _ = sink.send(InEvent::Hold { name: "M3".into(), down: true }); } // WM_MBUTTONDOWN
+                    0x020B => { let _ = sink.send(InEvent::Hold { name: "M4".into(), down: true }); } // WM_XBUTTONDOWN
+                    0x0202 => {
+                        let _ = sink.send(InEvent::Hold { name: "M1".into(), down: false });
+                        let _ = sink.send(InEvent::Mouse(MouseEv::LeftUp));
+                    } // WM_LBUTTONUP
+                    0x0205 => {
+                        let _ = sink.send(InEvent::Hold { name: "M2".into(), down: false });
+                        let _ = sink.send(InEvent::Mouse(MouseEv::RightUp));
+                    } // WM_RBUTTONUP
+                    0x0208 => {
+                        let _ = sink.send(InEvent::Hold { name: "M3".into(), down: false });
+                        let _ = sink.send(InEvent::Mouse(MouseEv::MiddleUp));
+                    } // WM_MBUTTONUP
+                    0x020C => {
+                        let _ = sink.send(InEvent::Hold { name: "M4".into(), down: false });
+                        let _ = sink.send(InEvent::Mouse(MouseEv::XUp));
+                    } // WM_XBUTTONUP
                     0x020A => { let _ = sink.send(InEvent::Mouse(MouseEv::Wheel)); }    // WM_MOUSEWHEEL
                     0x020E => { let _ = sink.send(InEvent::Mouse(MouseEv::HWheel)); }   // WM_MOUSEHWHEEL
                     _ => {}
