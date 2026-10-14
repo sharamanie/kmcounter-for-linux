@@ -502,8 +502,18 @@ function kmcHook(w) {{
     var tag = kmcTag(w);
     if (!tag) return;
     kmcPlace(w, tag);
-    function onChanged() {{ kmcClamp(w, tag); kmcReport(w, tag); }}
+    // 用户拖动期间合成器自己在逐帧改位置，此时写 frameGeometry 会被覆盖（这正是“限制在屏幕内无效”的原因）；
+    // 所以拖动中只上报，等「拖动结束」信号再夹取。非拖动引起的几何变化（程序自己改尺寸等）仍即时夹取。
+    function onChanged() {{
+        var moving = false;
+        try {{ moving = !!(w.move || w.resize); }} catch (e) {{}}
+        if (!moving) kmcClamp(w, tag);
+        kmcReport(w, tag);
+    }}
+    function onFinished() {{ kmcClamp(w, tag); kmcReport(w, tag); }}
     try {{ w.frameGeometryChanged.connect(onChanged); }} catch (e) {{}}
+    try {{ if (w.interactiveMoveResizeFinished) w.interactiveMoveResizeFinished.connect(onFinished); }} catch (e) {{}}
+    try {{ if (w.clientFinishUserMovedResized) w.clientFinishUserMovedResized.connect(onFinished); }} catch (e) {{}}
     kmcClamp(w, tag);
     kmcReport(w, tag);
 }}
@@ -709,6 +719,10 @@ mod tests {
         assert!(js.contains("\"kps\": null"), "没有记忆位置时为 null：{js}");
         assert!(js.contains("org.kmcounter.HudPos"), "要上报到我们的 DBus 服务：{js}");
         assert!(js.contains("frameGeometryChanged"), "要订阅几何变化：{js}");
+        assert!(
+            js.contains("interactiveMoveResizeFinished"),
+            "拖动结束要再夹取一次（拖动中合成器会覆盖脚本写入的位置）：{js}"
+        );
         assert!(js.contains("windowAdded"), "要订阅新窗口：{js}");
         assert!(js.contains("KMC - APM") && js.contains("KMC - KPS"), "按标题区分两个 HUD：{js}");
         assert!(js.contains("KWin.PlacementArea"), "夹取范围用工作区：{js}");
