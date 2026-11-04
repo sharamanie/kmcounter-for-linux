@@ -29,6 +29,7 @@ pub(crate) mod debug;
 pub(crate) mod frame;
 pub(crate) mod heatmap;
 pub(crate) mod nav;
+pub(crate) mod rain;
 pub(crate) mod rank_page;
 pub(crate) mod settings;
 pub(crate) mod trend_page;

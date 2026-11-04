@@ -93,6 +93,23 @@ pub struct Config {
     pub kps_show_graph: bool,
     /// KPS 图的时长（秒，10~300）
     pub kps_graph_secs: u32,
+    /// KPS 悬浮窗是否显示**按键雨**：每次击键在键格上方升起一条轨迹
+    /// （对齐 JipperKeyViewer 的 RainLayer；与下面的 KPS 图相互独立，可只开其一）
+    pub kps_show_rain: bool,
+    /// 键雨样式："trail"（生长竖条，对齐 JipperKeyViewer）| "block"（方块串）
+    pub kps_rain_style: String,
+    /// 键雨上升速度（像素/秒，20~2000）
+    pub kps_rain_speed: u16,
+    /// 键雨区域高度（像素，0 = 自动取 KPS 图高度）
+    pub kps_rain_height: u16,
+    /// 键雨不透明度（0~100）
+    pub kps_rain_opacity: u8,
+    /// 键格按压弹跳：按下瞬间放大再回弹（对齐 JipperKeyViewer 的 KeyShapeLayer）
+    pub kps_key_bounce: bool,
+    /// 按组 KPS 分组定义：一行一组，格式 `组名=A,S,D,F`（组名可省略）
+    pub kps_groups: String,
+    /// KPS 悬浮窗是否显示分组 KPS 行
+    pub kps_show_groups: bool,
     /// APM 悬浮窗背景不透明度（0~100）
     pub apm_hud_opacity: u8,
     /// APM 悬浮窗：拖动后若超出屏幕自动推回（对齐 osu-kps 的同名选项；默认开）
@@ -154,6 +171,14 @@ impl Default for Config {
             kps_show_stats: true,
             kps_show_graph: true,
             kps_graph_secs: 300,
+            kps_show_rain: false,
+            kps_rain_style: "trail".into(),
+            kps_rain_speed: 120,
+            kps_rain_height: 0,
+            kps_rain_opacity: 85,
+            kps_key_bounce: true,
+            kps_groups: String::new(),
+            kps_show_groups: false,
             apm_hud_opacity: 94,
             apm_keep_in_screen: true,
             kps_keep_in_screen: true,

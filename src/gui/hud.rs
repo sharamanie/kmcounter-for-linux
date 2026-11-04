@@ -263,7 +263,10 @@ fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
     if hud_close_requested(ctx, &hs.events) {
         return;
     }
-    ctx.request_repaint_after(Duration::from_millis(40));
+    // 开了键雨 / 按键弹跳就按 ~60fps 重绘，全静态时退回 25fps ——
+    // 动画只在有东西动的时候才烧帧
+    let anim_ms = if cfg.kps_show_rain || cfg.kps_key_bounce { 16 } else { 40 };
+    ctx.request_repaint_after(Duration::from_millis(anim_ms));
 
     let bg_fill = hud_bg_color((16, 18, 24), cfg.kps_hud_opacity);
     let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(60, 68, 86, 220));
@@ -280,9 +283,25 @@ fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
             let content = ui.max_rect();
             hud_background_gestures(ui, ctx, content, hs, "kps_hud_drag", s.hud_drag_hint);
 
-            // ---- 上半区：键格（按布局分行 / 空位 / 宽度倍数；**每行缝隙等宽、左右对称**）----
+            // ---- 最上方：键雨（雨条从键格顶边往上飘）----
+            // body = content 去掉雨区之后的剩余部分；下面的键格 / 数据 / 图都按 body 定位
+            let body = if m.rain_h > 0.0 {
+                let rain_area = Rect::from_min_max(
+                    content.min,
+                    Pos2::new(content.right(), content.top() + m.rain_h),
+                );
+                super::rain::paint_kps_rain(ui, rain_area, &layout, &m, &kd, cfg);
+                Rect::from_min_max(
+                    Pos2::new(content.left(), content.top() + m.rain_h),
+                    content.max,
+                )
+            } else {
+                content
+            };
+
+            // ---- 键格（按布局分行 / 空位 / 宽度倍数；**每行缝隙等宽、左右对称**）----
             if cfg.kps_show_buttons {
-                paint_kps_key_cells(ui, content, &layout, &m, &kd, cfg, s);
+                paint_kps_key_cells(ui, body, &layout, &m, &kd, cfg, s);
             }
 
             // 缩放系数（度量里所有长度都按它算，这里用来算小间隙）
@@ -293,39 +312,57 @@ fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
                 0.0
             };
 
-            // ---- 第二栏：数据行（当前 KPS · Max · 平均），画在图的**上方** ----
+            // ---- 第二栏：数据行（当前 KPS · Max · 平均 + 分组 KPS），画在图的**上方** ----
             if m.meter_w > 0.0 {
-                paint_kps_meter(ui, content, &m, &kd, cfg, s, sc, keys_h);
+                paint_kps_meter(ui, body, &m, &kd, cfg, s, sc, keys_h);
             }
 
             // ---- 第三栏：整宽的 KPS 图 ----
             if m.graph_h > 0.0 {
-                paint_kps_graph_area(ui, content, &m, &kd, hs, s, keys_h, cfg.kps_graph_secs);
+                paint_kps_graph_area(ui, body, &m, &kd, hs, s, keys_h, cfg.kps_graph_secs);
             }
         });
 }
 
 /// KPS 悬浮窗每帧要读的一次性数据（当前 / 峰值 / 平均 / 算法 + 每个键格的实时信息）。
-struct KpsHudData {
-    cur_kps: f64,
-    peak_kps: f64,
-    avg_kps: f64,
-    method: crate::stats::KpsMethod,
-    key_infos: Vec<crate::stats::KpsKeyInfo>,
-    color: Color32,
+pub(crate) struct KpsHudData {
+    pub(crate) cur_kps: f64,
+    pub(crate) peak_kps: f64,
+    pub(crate) avg_kps: f64,
+    pub(crate) method: crate::stats::KpsMethod,
+    pub(crate) key_infos: Vec<crate::stats::KpsKeyInfo>,
+    /// 每个键最近一段时间内的击键时刻（秒，0 = 刚按下）；键雨按它换算高度
+    pub(crate) rain: Vec<Vec<f64>>,
+    /// 分组 KPS（配置里没写分组 / 没开显示时为空）
+    pub(crate) groups: Vec<crate::stats::KpsGroupInfo>,
+    pub(crate) color: Color32,
 }
 
 /// 取当前 KPS 数据并算好强调色（≥15 红 / ≥8 橙 / 其余绿）。
 fn kps_hud_data(hs: &HudShared, cfg: &Config, keys_list: &[String], kps_w: u32) -> KpsHudData {
-    let (cur_kps, peak_kps, avg_kps, method, key_infos) = {
+    let (cur_kps, peak_kps, avg_kps, method, key_infos, rain, groups) = {
         let mut kps = hs.shared.kps.lock();
         let (cur, peak) = kps.get(&hs.today, kps_w);
         let infos = kps.query_keys(keys_list, kps_w);
         let method = kps.method();
         let avg = if cfg.kps_show_avg { kps.avg() } else { 0.0 };
+        // 键雨：只取窗口内的击键时刻（纯读，不存粒子状态）
+        let rain = if cfg.kps_show_rain {
+            let span = std::time::Duration::from_secs_f32(super::rain::rain_lifespan_secs(cfg));
+            kps.recent_hits(keys_list, span, std::time::Instant::now())
+        } else {
+            Vec::new()
+        };
+        // 分组 KPS：配置里写了分组且开了显示才算
+        let groups = if cfg.kps_show_groups {
+            let defs = crate::stats::parse_kps_groups(&cfg.kps_groups);
+            kps.query_groups(&defs, kps_w)
+        } else {
+            Vec::new()
+        };
         // KPS 图：过去 300 秒、每秒一格（网格对齐整秒，值从按键记录反推 —— 见 stats::history_series）。
         // 数据每整秒才变一次，所以柱子是"一格一格往左跳"，同一节奏下高度稳定。
-        (cur, peak, avg, method, infos)
+        (cur, peak, avg, method, infos, rain, groups)
     };
     let color = if cur_kps >= 15.0 {
         Color32::from_rgb(0xFF, 0x47, 0x57)
@@ -341,6 +378,8 @@ fn kps_hud_data(hs: &HudShared, cfg: &Config, keys_list: &[String], kps_w: u32) 
         method,
         key_infos,
         color,
+        rain,
+        groups,
     }
 }
 
@@ -395,13 +434,22 @@ fn paint_kps_key_cell(
     // 降速时沿原路缓慢退回；按住期间底板保持满亮（长按点亮），
     // 松开后由 glow 沿 50→250ms 曲线淡出
     let press = if k.held { 1.0_f32 } else { k.glow };
+    // 按键弹跳（对齐 JipperKeyViewer 的 KeyShapeLayer）：按住时键格轻微放大，
+    // 松开后随 glow 沿 50→250ms 淡出、同步回落到原尺寸。
+    // 交互矩形仍用原 rect —— 放大时命中区域不能跟着跳，否则指针停在边上会闪。
+    let bounce = if cfg.kps_key_bounce { 0.075 * press } else { 0.0 };
+    let draw_rect = if bounce > 0.0 {
+        Rect::from_center_size(rect.center(), rect.size() * (1.0 + bounce))
+    } else {
+        rect
+    };
     let (box_bg, box_border, overlay) = key_heat_style(crate::stats::kps_key_heat(k.kps), press);
-    ui.painter().rect(rect, 4.0, box_bg, box_border);
+    ui.painter().rect(draw_rect, 4.0, box_bg, box_border);
     if let Some(ovl) = overlay {
-        ui.painter().rect_filled(rect, 4.0, ovl);
+        ui.painter().rect_filled(draw_rect, 4.0, ovl);
     }
     ui.painter().text(
-        Pos2::new(rect.center().x, rect.min.y + m.box_h * 0.28),
+        Pos2::new(draw_rect.center().x, draw_rect.min.y + m.box_h * 0.28),
         egui::Align2::CENTER_CENTER,
         &k.name,
         egui::FontId::proportional(m.font_key),
@@ -410,7 +458,7 @@ fn paint_kps_key_cell(
     let sub = kps_key_sub_text(k, cfg, kd.method);
     if !sub.is_empty() {
         ui.painter().text(
-            Pos2::new(rect.center().x, rect.max.y - m.box_h * 0.28),
+            Pos2::new(draw_rect.center().x, draw_rect.max.y - m.box_h * 0.28),
             egui::Align2::CENTER_CENTER,
             sub,
             egui::FontId::proportional(m.font_sub),
@@ -520,9 +568,52 @@ fn paint_kps_meter(
             HUD_TEXT,
         );
     }
+    // 分组 KPS 行：数据行下面一行，每个组一段「名字 值 KPS」
+    if m.group_h > 0.0 && !kd.groups.is_empty() {
+        paint_kps_group_row(ui, content, m, kd, s, sc, keys_h);
+    }
 }
 
 /// 下半区：整宽 KPS 图（柱数按实际像素宽推，每根柱 = 一个时间片的平均 KPS）。
+/// 分组 KPS 行：每个组一段「名字 值 KPS」，超出宽度就截断。
+/// 参照 JipperKeyViewer 的 GroupId：只看某几个键的合计 KPS（左手 / 右手、主键区…）。
+fn paint_kps_group_row(
+    ui: &mut egui::Ui,
+    content: Rect,
+    m: &KpsHudMetrics,
+    kd: &KpsHudData,
+    s: &'static Strings,
+    sc: f32,
+    keys_h: f32,
+) {
+    let row_top = content.top()
+        + keys_h
+        + if keys_h > 0.0 { m.pad } else { 0.0 }
+        + m.top_h
+        + m.pad;
+    let mut x = content.left();
+    let cy = row_top + m.font_sub * 0.5;
+    for (i, g) in kd.groups.iter().enumerate() {
+        let label = format!("{} {} {} ({})", g.name, fmt_kps(g.kps, kd.method), s.kps_label, g.hits);
+        let galley = ui.painter().layout_no_wrap(
+            label,
+            egui::FontId::proportional(m.font_sub),
+            HUD_TEXT,
+        );
+        let w = galley.size().x;
+        // 放不下就不再往右排（组很多时按宽度截断，纵向高度固定为一行）
+        if x + w > content.right() && i > 0 {
+            break;
+        }
+        ui.painter().galley(
+            Pos2::new(x, cy - galley.size().y * 0.5),
+            galley,
+            if i == 0 { kd.color } else { HUD_TEXT },
+        );
+        x += w + 12.0 * sc;
+    }
+}
+
 fn paint_kps_graph_area(
     ui: &mut egui::Ui,
     content: Rect,
@@ -537,7 +628,8 @@ fn paint_kps_graph_area(
     let graph_top = content.top()
         + keys_h
         + if keys_h > 0.0 { m.pad } else { 0.0 }
-        + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 };
+        + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 }
+        + m.group_h;
     let rect = Rect::from_min_max(
         Pos2::new(content.left(), graph_top),
         Pos2::new(content.right(), content.bottom()),
@@ -1022,6 +1114,14 @@ impl App {
         cfg.kps_show_stats = self.cfg.kps_show_stats;
         cfg.kps_show_graph = self.cfg.kps_show_graph;
         cfg.kps_graph_secs = self.cfg.kps_graph_secs;
+        cfg.kps_show_rain = self.cfg.kps_show_rain;
+        cfg.kps_rain_style = self.cfg.kps_rain_style.clone();
+        cfg.kps_rain_speed = self.cfg.kps_rain_speed;
+        cfg.kps_rain_height = self.cfg.kps_rain_height;
+        cfg.kps_rain_opacity = self.cfg.kps_rain_opacity;
+        cfg.kps_key_bounce = self.cfg.kps_key_bounce;
+        cfg.kps_groups = self.cfg.kps_groups.clone();
+        cfg.kps_show_groups = self.cfg.kps_show_groups;
         cfg.apm_scale = self.cfg.apm_scale;
         cfg.apm_keep_in_screen = self.cfg.apm_keep_in_screen;
         cfg.kps_keep_in_screen = self.cfg.kps_keep_in_screen;
@@ -1228,7 +1328,7 @@ impl App {
             egui::ViewportBuilder::default()
                 .with_title(format!("KMC - {}", s.kps_cfg_title))
                 // 高度按内容实测定（标签统一到正文字号 + 显示项分两行后需要 336）
-                .with_inner_size([400.0, 336.0])
+                .with_inner_size([430.0, 486.0])
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_always_on_top()
@@ -1263,6 +1363,8 @@ impl App {
         self.kps_settings_reset_menu(ui, s, act);
         self.kps_settings_capture(ui, s, act);
         self.kps_settings_display_toggles(ui, s, act);
+        self.kps_settings_rain(ui, s, act);
+        self.kps_settings_groups(ui, s, act);
         self.kps_settings_footer(ui, s, act);
     }
 
@@ -1544,6 +1646,111 @@ impl App {
         ui.label(egui::RichText::new("s").color(HUD_TEXT));
     }
 
+
+    /// 键雨（Key Rain）与按键弹跳的设置块（对齐 JipperKeyViewer 的雨滴参数）。
+    /// 键雨与 KPS 图是**两个独立开关**：只开图 ≈ osu-kps，只开雨 ≈ JipperKeyViewer，
+    /// 都开则上下叠放，一屏看到更多。
+    fn kps_settings_rain(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_rain, s.kps_show_rain, act);
+            hud_check(ui, &mut self.cfg.kps_key_bounce, s.kps_key_bounce, act);
+        });
+        if !self.cfg.kps_show_rain {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_rain_style).color(HUD_TEXT));
+            let cur = if self.cfg.kps_rain_style == "block" {
+                s.kps_rain_style_block
+            } else {
+                s.kps_rain_style_trail
+            };
+            egui::ComboBox::from_id_salt("kps_rain_style")
+                .selected_text(egui::RichText::new(cur).color(HUD_TEXT))
+                .show_ui(ui, |ui| {
+                    let mut is_block = self.cfg.kps_rain_style == "block";
+                    if ui
+                        .selectable_value(&mut is_block, false, s.kps_rain_style_trail)
+                        .changed()
+                    {
+                        self.cfg.kps_rain_style = "trail".into();
+                        act.dirty = true;
+                    }
+                    if ui
+                        .selectable_value(&mut is_block, true, s.kps_rain_style_block)
+                        .changed()
+                    {
+                        self.cfg.kps_rain_style = "block".into();
+                        act.dirty = true;
+                    }
+                });
+            ui.label(egui::RichText::new(s.kps_rain_speed).color(HUD_TEXT));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.kps_rain_speed).range(20..=2000).speed(10.0))
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("px/s").color(HUD_TEXT));
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_rain_height).color(HUD_TEXT));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.kps_rain_height).range(0..=400).speed(4.0))
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(format!("px ({} 0)", s.kps_rain_height_auto))
+                    .small()
+                    .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+            );
+            ui.label(egui::RichText::new(s.kps_rain_opacity).color(HUD_TEXT));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.kps_rain_opacity).range(0..=100).speed(1.0))
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("%").color(HUD_TEXT));
+        });
+    }
+
+    /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
+    /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
+    fn kps_settings_groups(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_groups, s.kps_groups, act);
+            ui.label(
+                egui::RichText::new(s.kps_show_groups)
+                    .small()
+                    .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+            );
+        });
+        if !self.cfg.kps_show_groups {
+            return;
+        }
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut self.cfg.kps_groups)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(format!("{}: A,S,D,F", s.kps_group_empty)),
+            )
+            .changed()
+        {
+            act.dirty = true;
+        }
+        ui.label(
+            egui::RichText::new(s.kps_groups_hint)
+                .small()
+                .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+        );
+    }
+
     /// 底栏：打开主窗口、显示/隐藏悬浮窗、限制在屏幕内与说明文字
     fn kps_settings_footer(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
         ui.add_space(6.0);
@@ -1640,6 +1847,40 @@ impl App {
         self.shared.kps.lock().record(date, key, w);
     }
 
+    /// 给 KPS 跟踪器喂养一次「距今 age_ms 的击键」（键雨截图用，制造层次）
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_push_kps_aged(&mut self, key: &str, age_ms: u64) {
+        let age = Duration::from_millis(age_ms);
+        self.shared.kps.lock().debug_push_key_aged(key, age);
+    }
+
+    /// 给 KPS 图喂一条「距今 age_ms 的历史动作」（截图铺历史柱用，不影响键格）
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_push_kps_hist(&mut self, age_ms: u64) {
+        let age = Duration::from_millis(age_ms);
+        self.shared.kps.lock().debug_push_action_aged(age);
+    }
+
+    /// 清空 KPS 时间轴（截图脚本每帧重建场景用）
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_reset_kps(&mut self) {
+        self.shared.kps.lock().debug_reset_kps();
+    }
+
+    /// 直接改共享配置里的键雨/图开关（截图用；改 cfg_shared 才不会被每帧同步覆盖）
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_set_kps_rain(&mut self, show: bool, style: &str, graph: bool, speed: u16) {
+        let mut c = self.cfg_shared.lock();
+        c.kps_show_rain = show;
+        c.kps_rain_style = style.to_string();
+        c.kps_show_graph = graph;
+        c.kps_rain_speed = speed;
+    }
+
     #[cfg(feature = "softshot")]
     #[allow(dead_code)]
     pub(crate) fn debug_record_apm_action(&mut self, date: &str) {
@@ -1669,6 +1910,19 @@ impl App {
     pub(crate) fn debug_apm_hud_size(&self) -> (f32, f32) {
         *self.apm_hud_size.lock()
     }
+
+    /// 悬浮窗截图的目标尺寸与清屏色（测试用）：
+    /// 尺寸是「贴合内容」的真值，要跑过一帧才能取到（APM 的宽度是实测文字得来的）。
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_hud_shot_spec(&self) -> ((f32, f32), Color32) {
+        if self.hud_kps_show {
+            let m = kps_hud_metrics(&self.cfg, &self.cfg.kps_key_layout());
+            ((m.w, m.h), hud_bg_color((16, 18, 24), 100))
+        } else {
+            (*self.apm_hud_size.lock(), hud_bg_color((24, 26, 34), 100))
+        }
+    }
 }
 
 /// KPS 悬浮窗的尺寸与字号（缩放后的像素值）——抽成纯函数，便于测试与排查布局
@@ -1692,6 +1946,10 @@ pub(crate) struct KpsHudMetrics {
     pub font_key: f32,
     pub font_sub: f32,
     pub font_cur: f32,
+    /// 键雨区高度（0 = 不显示键雨）
+    pub rain_h: f32,
+    /// 分组 KPS 行高度（0 = 不显示分组）
+    pub group_h: f32,
 }
 
 /// 计算 KPS 悬浮窗尺寸：**三栏竖排 —— 键位 / 数据 / 图**。
@@ -1733,12 +1991,28 @@ pub(crate) fn kps_hud_metrics(
     let stats_w = if cfg.kps_show_stats { 210.0 * s } else { 0.0 };
     let stats_h = if cfg.kps_show_stats { font_cur * 1.3 } else { 0.0 };
     let graph_h = if cfg.kps_show_graph { 64.0 * s } else { 0.0 };
+    let rain_h = if cfg.kps_show_rain { super::rain::rain_area_h(cfg) } else { 0.0 };
+    // 分组 KPS 行：只在「开了显示」且「配置里确实写了分组」时占高度
+    let group_h = if cfg.kps_show_groups && !crate::stats::parse_kps_groups(&cfg.kps_groups).is_empty() {
+        font_sub * 2.0
+    } else {
+        0.0
+    };
     let min_graph_w = 200.0 * s;
 
     let content_w = keys_w.max(stats_w).max(if graph_h > 0.0 { min_graph_w } else { 0.0 }).max(unit);
     let mut h = pad * 2.0;
     let mut blocks = 0;
+    // 键雨在**最上方**（雨从键格往上飘），所以先算它
+    if rain_h > 0.0 {
+        h += rain_h;
+        blocks += 1;
+    }
     if keys_h > 0.0 {
+        // 键雨紧贴键格顶边（不加 v_gap），雨条的根部才落在键格边缘
+        if blocks > 0 && rain_h <= 0.0 {
+            h += v_gap;
+        }
         h += keys_h;
         blocks += 1;
     }
@@ -1747,6 +2021,10 @@ pub(crate) fn kps_hud_metrics(
             h += v_gap;
         }
         h += stats_h;
+        blocks += 1;
+    }
+    if group_h > 0.0 {
+        h += group_h;
         blocks += 1;
     }
     if graph_h > 0.0 {
@@ -1772,6 +2050,8 @@ pub(crate) fn kps_hud_metrics(
         font_key: 11.0 * s,
         font_sub,
         font_cur,
+        rain_h,
+        group_h,
     }
 }
 
@@ -2051,6 +2331,14 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.kps_show_stats = from.kps_show_stats;
     to.kps_show_graph = from.kps_show_graph;
     to.kps_graph_secs = from.kps_graph_secs;
+    to.kps_show_rain = from.kps_show_rain;
+    to.kps_rain_style = from.kps_rain_style.clone();
+    to.kps_rain_speed = from.kps_rain_speed;
+    to.kps_rain_height = from.kps_rain_height;
+    to.kps_rain_opacity = from.kps_rain_opacity;
+    to.kps_key_bounce = from.kps_key_bounce;
+    to.kps_groups = from.kps_groups.clone();
+    to.kps_show_groups = from.kps_show_groups;
     to.apm_scale = from.apm_scale;
     to.apm_keep_in_screen = from.apm_keep_in_screen;
     to.kps_keep_in_screen = from.kps_keep_in_screen;

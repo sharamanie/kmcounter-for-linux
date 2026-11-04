@@ -1354,7 +1354,7 @@ mod tests {
         // 模拟 WM：把窗口尺寸调成 App 下发的目标（尺寸到位后目标才会清空）
         let mut w = 1260.0f32;
         let mut h = 900.0f32;
-        let mut settle = |app: &mut App, ctx: &egui::Context, frames: usize, w: &mut f32, h: &mut f32| {
+        let settle = |app: &mut App, ctx: &egui::Context, frames: usize, w: &mut f32, h: &mut f32| {
             for _ in 0..frames {
                 drive(app, ctx, *w, *h, 1, vec![]);
                 if let Some(t) = app.debug_resize_target() {
@@ -2511,14 +2511,51 @@ mod tests {
         let today = chrono::Local::now().format("%Y%m%d").to_string();
         app.hud_kps_show = true;
         app.debug_set_cfg_open(false, false);
-        // 冷热都有：R 不敲（冷）、E 一下（微温）、W 3 次、Q 9 次（最热 → 青绿边框）
-        for _ in 0..9 {
-            app.debug_record_kps_key(&today, "Q");
-        }
-        for _ in 0..3 {
-            app.debug_record_kps_key(&today, "W");
-        }
-        app.debug_record_kps_key(&today, "E");
+        // —— 场景重建闭包 ——
+        // capture 的循环跑的是**真实时间**（软光栅化每帧几十到几百毫秒），所以场景必须
+        // **每帧重建一次**：不重建的话雨滴早飘出雨区（block/both 一片空白），
+        // 而重复喂击键又会让 KPS 时间轴越叠越高（踩过：KPS 虚高到 112、最新一根柱顶满）。
+        // 顺序固定：清空 → 键格基础打点 → 图的历史柱 → 键雨的击键。
+        let today_feed = today.clone();
+        let feed_scene = move |app: &mut App| {
+            app.debug_reset_kps();
+            // 键格的冷热（Q 最热 → 青绿边框）
+            for _ in 0..9 {
+                app.debug_record_kps_key(&today_feed, "Q");
+            }
+            for _ in 0..3 {
+                app.debug_record_kps_key(&today_feed, "W");
+            }
+            app.debug_record_kps_key(&today_feed, "E");
+            // 图的历史柱：300 秒跨度，从「稀疏」渐强到「密集」再回落，
+            // 「只开图」的那张才看得出柱形（图是现算的，没有历史就真没有柱子）。
+            // 时间片 ≈ 2.48 秒/根（与 GUI 的 bars 同量级），115 根 ≈ 285 秒，留在 300 秒窗口内。
+            // 只动图的时间轴（debug_push_kps_hist），不碰键格次数与单键 KPS。
+            let period_ms = 2_480.0_f64;
+            for i in 0..115u64 {
+                let frac = i as f64 / 114.0;
+                // 中段最密、两端稀疏：像一段练习里的「热身 → 高潮 → 收尾」
+                let swell = 1.0 - (frac * 2.0 - 0.72).abs().min(1.0);
+                let jitter = ((i.wrapping_mul(2_654_435_761) >> 11) % 100) as f64 / 100.0;
+                let n = (1.0 + swell * 15.0 * (0.55 + 0.75 * jitter)).round() as u64;
+                for k in 0..n {
+                    let base = (114 - i) as f64 * period_ms;
+                    let age = (base + k as f64 * period_ms / (n as f64 + 1.0)) as u64;
+                    app.debug_push_kps_hist(age);
+                }
+            }
+            // 键雨要「层次」：同一把键喂不同年龄的击键，雨条高低错落才看得出版式。
+            // 年龄单位毫秒，寿命 = 64 / 120 * 1.6 ≈ 0.85 秒（见 gui::rain::rain_lifespan_secs）。
+            for (key, ages) in [
+                ("Q", &[40u64, 120, 220, 340, 470, 600][..]),
+                ("W", &[70, 200, 380, 540][..]),
+                ("E", &[150, 450][..]),
+            ] {
+                for &a in ages {
+                    app.debug_push_kps_aged(key, a);
+                }
+            }
+        };
 
         // —— 截图助手：离屏跑几帧 → 把「悬浮窗前缀」挪到最后（主窗口先画）→ 光栅化到 PPM ——
         let dir_for_cap = dir.clone();
@@ -2526,21 +2563,46 @@ mod tests {
         // 之后都是增量补丁 —— 每张截图各开一张新表的话，第二张会丢掉字体图集，
         // 字形全变成实心色块（踩过：APM 截图就是这么变成一片白条的）。
         let mut shot_textures: HashMap<TextureId, Tex> = HashMap::new();
+        // 每张图都裁到悬浮窗自己的尺寸：清屏色取面板底色，圆角处不会露浅灰。
+        let hud_spec = |app: &App| app.debug_hud_shot_spec();
         let capture = move |app: &mut App,
                             ctx: &egui::Context,
                             textures: &mut HashMap<TextureId, Tex>,
-                            name: &str|
+                            name: &str,
+                            animate: bool,
+                            feed: &dyn Fn(&mut App),
+                            under: bool,
+                            hud_spec: &dyn Fn(&App) -> ((f32, f32), Color32)|
               -> PathBuf {
-            let (w, h, ppp) = (620.0, 420.0, 2.0);
+            // 先按当前状态重建一遍，保证这张图不是上一张留下的现场
+            feed(app);
+            let ppp = 2.0;
             ctx.set_pixels_per_point(ppp);
-            let mut last_shapes = None;
-            for _ in 0..4 {
+            // 一帧探测：悬浮窗的「贴合内容」尺寸要实测文字宽度，跑过一帧才拿得到。
+            // 先按整块画布跑，读出目标尺寸再按它重建 —— 否则画布四周会留一大圈清屏灰
+            //（直接进 README 很难看），APM 的垂直居中也会偏到画布正中间。
+            let probe = |app: &mut App, textures: &mut HashMap<TextureId, Tex>, w: f32, h: f32| {
                 let mut raw = egui::RawInput::default();
                 raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
                 raw.time = Some(next_time());
                 let out = ctx.run(raw, |ctx| app.draw(ctx));
                 apply_textures(textures, &out.textures_delta);
-                last_shapes = Some(out.shapes);
+                out.shapes
+            };
+            let _ = probe(app, textures, 620.0, 420.0);
+            let ((tw, th), clear) = hud_spec(app);
+            // 面板描边（rounding 6.0 + stroke 1.0）压在边界上，留 2px 免得被裁掉一圈。
+            let (w, h, clear) = if tw > 0.0 && th > 0.0 {
+                (tw + 2.0, th + 2.0, clear)
+            } else {
+                (620.0, 420.0, crate::gui::BG)
+            };
+            let mut last_shapes = None;
+            for _ in 0..4 {
+                if animate {
+                    feed(app);
+                }
+                last_shapes = Some(probe(app, textures, w, h));
             }
             let shapes = last_shapes.unwrap_or_default();
             // 绘制顺序：悬浮窗视口在主窗口**之前**画（主窗口随后会把它整个盖住）。
@@ -2562,11 +2624,17 @@ mod tests {
                 }
             }
             println!("[softshot] {name}：主窗口起点 = {cut}（共 {} 图元）", shapes.len());
+            // under=true：主窗口先画、悬浮窗后画（浮在上面，能看出它叠在界面上的样子）。
+            // under=false：只画悬浮窗那段前缀，主窗口整块丢掉 —— 特写图才干净。
             let mut ordered: Vec<egui::epaint::ClippedShape> = Vec::with_capacity(shapes.len());
-            ordered.extend(shapes[cut..].iter().cloned());
-            ordered.extend(shapes[..cut].iter().cloned());
+            if under {
+                ordered.extend(shapes[cut..].iter().cloned());
+                ordered.extend(shapes[..cut].iter().cloned());
+            } else {
+                ordered.extend(shapes[..cut].iter().cloned());
+            }
             let prims = ctx.tessellate(ordered, ppp);
-            let mut canvas = Canvas::new((w * ppp) as usize, (h * ppp) as usize, crate::gui::BG);
+            let mut canvas = Canvas::new((w * ppp) as usize, (h * ppp) as usize, clear);
             for prim in &prims {
                 if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
                     let tex = mesh.texture_id;
@@ -2578,8 +2646,27 @@ mod tests {
             println!("[softshot] {name} → {} ({}x{})", ppm.display(), canvas.w, canvas.h);
             ppm
         };
-        let kps_ppm = capture(&mut app, &ctx, &mut shot_textures, "kps-hud");
-        assert!(kps_ppm.exists());
+
+        // —— 四种组合：图/雨 各自独立开关（产品的差异点，必须每种都看得见）——
+        // 1) 只有图（等价 osu-kps 的观感）
+        app.debug_set_kps_rain(false, "trail", true, 120);
+        let p1 = capture(&mut app, &ctx, &mut shot_textures, "kps-hud", false, &feed_scene, false, &hud_spec);
+        assert!(p1.exists());
+
+        // 2) 只有雨（等价 JipperKeyViewer 的观感）：生长竖条
+        app.debug_set_kps_rain(true, "trail", false, 120);
+        let p2 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-trail", true, &feed_scene, false, &hud_spec);
+        assert!(p2.exists());
+
+        // 3) 只有雨：方块串
+        app.debug_set_kps_rain(true, "block", false, 120);
+        let p3 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-block", true, &feed_scene, false, &hud_spec);
+        assert!(p3.exists());
+
+        // 4) 图 + 雨同开（本项目的组合）
+        app.debug_set_kps_rain(true, "trail", true, 120);
+        let p4 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-both", true, &feed_scene, false, &hud_spec);
+        assert!(p4.exists());
 
         // —— 再拍一张 APM 胶囊条特写（宽度贴合内容）——
         app.hud_kps_show = false;
@@ -2588,7 +2675,7 @@ mod tests {
         for _ in 0..30 {
             app.debug_record_apm_action(&today);
         }
-        let apm_ppm = capture(&mut app, &ctx, &mut shot_textures, "apm-hud");
+        let apm_ppm = capture(&mut app, &ctx, &mut shot_textures, "apm-hud", false, &feed_scene, false, &hud_spec);
         assert!(apm_ppm.exists());
     }
 }

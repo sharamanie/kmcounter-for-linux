@@ -281,6 +281,53 @@ pub fn kps_key_heat(per_key_kps: f64) -> f32 {
     osu_ramp(per_key_kps, 2.0, 4.0)
 }
 
+/// 一组被一起统计的键（对齐 JipperKeyViewer 的 GroupId）：
+/// 只看这几键的合计 KPS，用来分开看左手 / 右手、主键区 / 副键区。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KpsGroup {
+    /// 组名（用户写 `左手=A,S,D,F` 时是 "左手"；只写 `A,S,D,F` 时自动取 "A,S,D,F"）
+    pub name: String,
+    /// 组内键名（原始写法，查询时再规范化）
+    pub keys: Vec<String>,
+}
+
+/// 一组键的实时状态
+#[derive(Clone, Debug, Default)]
+pub struct KpsGroupInfo {
+    pub name: String,
+    /// 组内累计击打次数
+    pub hits: u64,
+    /// 组内合计 KPS（按当前计算方式与统计窗口）
+    pub kps: f64,
+}
+
+/// 解析分组定义：一行一组，`组名=A,S,D,F` 或 `A,S,D,F`（组名省略时用键名拼出来）。
+/// 空行 / 空组忽略；组名两侧空白去掉。
+pub fn parse_kps_groups(spec: &str) -> Vec<KpsGroup> {
+    let mut out: Vec<KpsGroup> = Vec::new();
+    for line in spec.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, rest) = match line.split_once('=') {
+            Some((n, r)) => (n.trim().to_string(), r),
+            None => (String::new(), line),
+        };
+        let keys: Vec<String> = rest
+            .split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let name = if name.is_empty() { keys.join(",") } else { name };
+        out.push(KpsGroup { name, keys });
+    }
+    out
+}
+
 /// 监控按键的实时状态
 #[derive(Clone, Debug, Default)]
 pub struct KpsKeyInfo {
@@ -460,6 +507,47 @@ impl KpsTracker {
     /// 更新某键的「按住」状态（输入层在按下 / 松开时调用）。
     /// 与 [`record`](Self::record) 完全解耦：不计次、不动 KPS、不落盘 ——
     /// 悬浮窗的「长按保持点亮」靠它 + `recent_releases` 实现。
+    /// 测试专用：把一次击键按「距今 age」写入时间轴（键雨截图要层次，不能全顶在最底下）。
+    /// 走插入排序保持队列升序 —— `recent_hits` / `calc_kps` 都依赖这个前提。
+    #[cfg(feature = "softshot")]
+    pub fn debug_push_key_aged(&mut self, key_id: &str, age: std::time::Duration) {
+        let now = Instant::now();
+        let t = now.checked_sub(age).unwrap_or(now);
+        let norm = normalize_kps_key(key_id);
+        let canon = canonical_kps_key(&norm);
+        if !canon.is_empty() {
+            let q = self.key_times.entry(canon).or_default();
+            let pos = q.iter().position(|x| *x > t).unwrap_or(q.len());
+            q.insert(pos, t);
+        }
+        if !norm.is_empty() {
+            *self.key_hits.entry(norm).or_insert(0) += 1;
+        }
+        let pos = self.actions.iter().position(|x| *x > t).unwrap_or(self.actions.len());
+        self.actions.insert(pos, t);
+    }
+
+    /// 测试专用：只往 KPS 图的动作时间轴补一条「距今 age」的记录，
+    /// **不动**键格的次数 / 单键 KPS（截图要给历史图铺数据，又不希望键格数字失真）。
+    #[cfg(feature = "softshot")]
+    pub fn debug_push_action_aged(&mut self, age: std::time::Duration) {
+        let now = Instant::now();
+        let t = now.checked_sub(age).unwrap_or(now);
+        let pos = self.actions.iter().position(|x| *x > t).unwrap_or(self.actions.len());
+        self.actions.insert(pos, t);
+        self.graph_cache = None;
+    }
+
+    /// 测试专用：清空 KPS 的全部时间轴（动作 / 单键时间 / 次数）与图缓存。
+    /// 截图脚本每帧要「重建同一场景」，不清就会一帧叠一帧，KPS 越拍越高。
+    #[cfg(feature = "softshot")]
+    pub fn debug_reset_kps(&mut self) {
+        self.actions.clear();
+        self.key_times.clear();
+        self.key_hits.clear();
+        self.graph_cache = None;
+    }
+
     pub fn set_held(&mut self, key_id: &str, down: bool) {
         let now = Instant::now();
         let norm = normalize_kps_key(key_id);
@@ -537,6 +625,77 @@ impl KpsTracker {
             .collect()
     }
 
+    /// 每个键**最近一段时间内的击键时刻**，按「距今多少秒」返回（0 = 刚按下），
+    /// 用于键雨动画：调用方按 age × 速度 换算成上升高度，不需要保存任何粒子状态。
+    ///
+    /// 返回值与入参 `keys` 一一对应；窗口内没有击键的键给空 Vec。
+    pub fn recent_hits(
+        &self,
+        keys: &[String],
+        within: std::time::Duration,
+        now: Instant,
+    ) -> Vec<Vec<f64>> {
+        let within_s = within.as_secs_f64();
+        keys.iter()
+            .map(|k| {
+                let norm = normalize_kps_key(k);
+                let canon = canonical_kps_key(&norm);
+                let Some(times) = self.key_times.get(&canon) else {
+                    return Vec::new();
+                };
+                // 队列按时间升序：从新往旧扫，超出窗口就停
+                let mut ages: Vec<f64> = Vec::new();
+                for t in times.iter().rev() {
+                    if *t > now {
+                        continue;
+                    }
+                    let age = now.saturating_duration_since(*t).as_secs_f64();
+                    if age > within_s {
+                        break;
+                    }
+                    ages.push(age);
+                }
+                ages.reverse(); // 由旧到新，画的时候后画的压在上面
+                ages
+            })
+            .collect()
+    }
+
+    /// 分组 KPS：组内各键合计（对齐 JipperKeyViewer 的组队列）。
+    /// 与单键 KPS 同一口径 —— 组 KPS = 组内击键数 ÷ 窗口秒数（硬算）或灵敏方式现算。
+    pub fn query_groups(&self, groups: &[KpsGroup], window_ms: u32) -> Vec<KpsGroupInfo> {
+        let now = Instant::now();
+        groups
+            .iter()
+            .map(|g| {
+                let mut hits = 0u64;
+                // 组内键可能重复（LShift, Shift 规范化后同名）：按 canonical 名去重，
+                // 否则同一次击键会被算两遍
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                let mut v: Vec<Instant> = Vec::new();
+                for k in &g.keys {
+                    let norm = normalize_kps_key(k);
+                    let canon = canonical_kps_key(&norm);
+                    hits += self.key_hits.get(&norm).copied().unwrap_or(0);
+                    if !seen.insert(canon.clone()) {
+                        continue;
+                    }
+                    if let Some(times) = self.key_times.get(&canon) {
+                        v.extend(times.iter().copied());
+                    }
+                }
+                // 合并后按时间升序（calc_kps 依赖有序）
+                v.sort_unstable();
+                let merged: VecDeque<Instant> = v.into();
+                KpsGroupInfo {
+                    name: g.name.clone(),
+                    hits,
+                    kps: self.calc_kps(&merged, now, window_ms),
+                }
+            })
+            .collect()
+    }
+
     /// 平均 KPS：自上次重置 / 跨天以来的监控键动作数 ÷ 经过秒数。
     /// 参照 KeysPerSecond 的 "AVG" 计数器 —— 统计的是**会话平均**，不是滑动窗口速率。
     pub fn avg(&self) -> f64 {
@@ -573,7 +732,7 @@ impl KpsTracker {
         let period = std::time::Duration::from_secs_f64(period_s);
         let end = grid_floor(now, period); // 当前片的对齐右边界（挂钟相位）
         if let Some((cached_end, series)) = &self.graph_cache {
-            if *cached_end == end {
+            if *cached_end == end && series.len() == bars {
                 return series.clone();
             }
         }
