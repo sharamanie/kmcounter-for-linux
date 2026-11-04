@@ -396,7 +396,12 @@ fn paint_kps_key_cells(
     cfg: &Config,
     s: &'static Strings,
 ) {
-    let row_pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
+    // 键格行要**与上下两块（数据胶囊 / KPS 图）左右对齐**。
+    // key_rows_layout 把行按「可用宽度」居中放置，两侧各留半个 gap，
+    // 于是整行比 content 窄 2*gap —— 三块宽度不一致就是这么来的。
+    // 这里改用 key_rows_layout_for_width：按「行本身应该多宽」排，
+    // 排出来最宽的一行恰好等于 content 的宽度，左右边与胶囊 / 图严格齐平。
+    let row_pos = key_rows_layout_for_width(&layout.rows, m.box_w, content.width());
     let mut info_idx = 0usize;
     for (row, cells) in layout.rows.iter().enumerate() {
         for (cell_idx, cell) in cells.iter().enumerate() {
@@ -599,24 +604,32 @@ fn paint_kps_meter(
     total_w += 4.0 * sc;
     let pill = egui::Frame::none()
         .fill(hud_bg_color((22, 24, 32), 96))
-        .inner_margin(egui::Margin::symmetric(6.0 * sc, 2.0 * sc))
+        // 整宽胶囊：外框不再需要左右内边距（文字位置由上面的居中逻辑决定）
+        .inner_margin(egui::Margin::symmetric(0.0, 2.0 * sc))
         .stroke(egui::Stroke::new(
             1.0_f32,
             Color32::from_rgba_unmultiplied(60, 68, 86, 220),
         ))
         .rounding(6.0);
-    // 居中放在行的可用宽度里（窗口比胶囊宽时左右留白对称）
+    // 胶囊**整宽**（与键格行、KPS 图左右对齐），文字整组水平居中。
+    //
+    // 以前是"宽度贴合文字"的胶囊：它居中放在行里，而上面的键格行与下面的 KPS 图都是整宽，
+    // 于是三条边（键格 / 数据 / 图）左右都不齐，窄窄一块浮在中间很难看（用户反馈）。
+    // 现在统一成「三块等宽」：胶囊铺满 content 宽度，文字在其中居中。
+    // 文字总宽超过可用宽度时（缩放很大 / 窗口很窄）不缩放字体，只把超出部分均分到两侧内边距，
+    // 配合下面的 clip 不至于画到窗格外。
     let avail_w = content.width();
-    let pill_w = total_w + 12.0 * sc;
-    let px = if avail_w > pill_w {
-        content.left() + (avail_w - pill_w) * 0.5
-    } else {
-        content.left()
-    };
-    let pill_rect = Rect::from_min_size(Pos2::new(px, row_top), Vec2::new(pill_w, pill_h));
-    // 先画胶囊底，再把文字排在里面（居中一行）
+    let pad_x = ((avail_w - total_w) * 0.5).max(4.0 * sc);
+    let pill_rect = Rect::from_min_size(Pos2::new(content.left(), row_top), Vec2::new(avail_w, pill_h));
     ui.painter().add(pill.paint(pill_rect));
-    let mut x = px + 4.0 * sc;
+
+    // 文字起始位置：有富余就居中，没富余就贴左内边距
+    let text_start = if avail_w > total_w {
+        content.left() + (avail_w - total_w) * 0.5
+    } else {
+        content.left() + pad_x
+    };
+    let mut x = text_start;
     let cy = row_top + pill_h * 0.5;
     for galley in &texts {
         ui.painter().galley(
@@ -2235,6 +2248,67 @@ pub(crate) fn key_heat_style(heat: f32, press: f32) -> (Color32, egui::Stroke, O
     (fill, egui::Stroke::new(1.0 + 0.5 * heat, border), overlay)
 }
 
+/// 按「**目标行宽**」排版：最宽一行恰好从 x=0 铺到 x=target_w。
+///
+/// 与 key_rows_layout 的区别只在语义：
+/// - key_rows_layout 的参数是「可用宽度」，行会在里面居中，两侧各留半个 gap；
+/// - 这个函数的参数是「行本身应该多宽」，用于让键格行与数据胶囊、KPS 图
+///   **左右严格对齐**（三块同宽同边，用户反馈三块宽度不一致）。
+///
+/// 排布规则与 key_rows_layout 一致：缝宽相等、支持宽度倍数、空位占位；
+/// 只是把缝宽反推出来，使最宽那行等于 target_w，再从 x=0 开始排。
+pub(crate) fn key_rows_layout_for_width(
+    rows: &[Vec<crate::config::KpsKeyCell>],
+    box_w: f32,
+    target_w: f32,
+) -> Vec<Vec<(f32, f32)>> {
+    let units_of = |cells: &[crate::config::KpsKeyCell]| -> f32 {
+        cells.iter().map(|c| c.width.max(0.1)).sum()
+    };
+    let max_u = rows.iter().map(|r| units_of(r)).fold(0.0f32, f32::max);
+    if max_u <= 0.0 {
+        return rows.iter().map(|_| Vec::new()).collect();
+    }
+    // row_w = box_w*u + gap*(u-1) = target_w  =>  gap = (target_w - box_w*u) / (u - 1)
+    // u == 1 的退化情形没有缝，整行就是一格，宽度由格宽决定，取 gap = 0。
+    // 出现两种情况：
+    // 1) 目标宽度宽于键格总宽 → 差额全分给缝；
+    // 2) 目标宽度窄于键格总宽 → 缝取 0，并把格宽等比压缩，
+    //    否则行会溢出目标区域、与胶囊 / 图对不齐。
+    let natural = box_w * max_u;
+    let (gap, box_w) = if target_w >= natural {
+        let g = if max_u > 1.0 + 1e-3 {
+            (target_w - natural) / (max_u - 1.0)
+        } else {
+            0.0
+        };
+        (g, box_w)
+    } else {
+        // 等比压缩格宽，保持比例
+        (0.0, (target_w / max_u).max(1.0))
+    };
+    rows.iter()
+        .map(|r| {
+            let u = units_of(r);
+            if u <= 0.0 {
+                return Vec::new();
+            }
+            let row_w = box_w * u + gap * (u - 1.0);
+            // 少行在目标宽度内居中（与 key_rows_layout 的行为一致）
+            let mut x = (target_w - row_w).max(0.0) * 0.5;
+            let mut out = Vec::with_capacity(r.len());
+            for c in r {
+                let w = c.width.max(0.1);
+                let bw = w * box_w + (w - 1.0).max(0.0) * gap;
+                out.push((x, bw));
+                x += bw + gap;
+            }
+            out
+        })
+        .collect()
+}
+
+
 /// 一行键格的对称排布：**每条缝等宽（含左右两侧的边距）** ——
 /// 把内容区的富余宽度平均分给每条缝，右侧不再空一大块（用户第二十四轮第 2 条）。
 /// 多行时取「各行都铺得下」的最紧缝宽，其余行整体居中，行内仍左右对称。
@@ -2571,6 +2645,24 @@ mod tests {
 
     fn cell(name: &str) -> crate::config::KpsKeyCell {
         crate::config::KpsKeyCell { name: name.into(), width: 1.0 }
+    }
+
+    /// 按目标宽度排版时，最宽一行必须**恰好等于目标宽度**、且起点为 0。
+    /// 这是「键格行与数据胶囊 / KPS 图左右对齐」的数学保证（用户反馈三块宽度不一致）。
+    #[test]
+    fn key_rows_layout_for_width_fills_target() {
+        let rows = vec![vec![cell("Q"), cell("W"), cell("E"), cell("R")]];
+        for target in [300.0f32, 428.0, 500.0] {
+            let pos = key_rows_layout_for_width(&rows, 90.75, target);
+            let r = &pos[0];
+            let left = r[0].0;
+            let right = r.last().map(|(x, w)| x + w).unwrap_or(0.0);
+            assert!(left.abs() < 1.0, "target={target} 左边应为 0，实际 {left}");
+            assert!(
+                (right - target).abs() < 1.0,
+                "target={target} 右边应为 {target}，实际 {right}"
+            );
+        }
     }
 
     /// 键行对称：每条缝（含左右两侧边距）等宽 —— 右侧不再空一大块（用户第二十四轮第 2 条）
