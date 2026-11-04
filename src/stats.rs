@@ -412,6 +412,10 @@ pub struct KpsTracker {
     held: BTreeSet<String>,
     /// 各键最近一次**松开**的时刻 —— 松开后 50→250ms 淡出用
     recent_releases: BTreeMap<String, Instant>,
+    /// 键雨：每个键的按压区间队列（按下时刻, 松开时刻；None = 还按着）。
+    /// 渲染层按住期间以固定距离间隔持续发射短条、松手即停 ——
+    /// 区间彼此独立，快速连击是两串而不是连成一串。
+    press_spans: BTreeMap<String, VecDeque<(Instant, Option<Instant>)>>,
     /// 监控键累计按压次数
     key_hits: BTreeMap<String, u64>,
     /// 每个监控键自己的击键时刻（单键 KPS 用）
@@ -442,6 +446,7 @@ impl KpsTracker {
             recent_presses: BTreeMap::new(),
             held: BTreeSet::new(),
             recent_releases: BTreeMap::new(),
+            press_spans: BTreeMap::new(),
             key_hits: BTreeMap::new(),
             key_times: BTreeMap::new(),
             monitored: BTreeSet::new(),
@@ -545,7 +550,30 @@ impl KpsTracker {
         self.actions.clear();
         self.key_times.clear();
         self.key_hits.clear();
+        self.press_spans.clear();
         self.graph_cache = None;
+    }
+
+    /// 测试专用：按「距今 start_age_ms 按下、距今 end_age_ms 松开」喂一段按压区间
+    /// （end 为 None 表示还按着）。键雨截图的现场铺设用。
+    #[cfg(feature = "softshot")]
+    pub fn debug_push_hold_aged(&mut self, key_id: &str, start_age_ms: u64, end_age_ms: Option<u64>) {
+        let now = Instant::now();
+        let norm = normalize_kps_key(key_id);
+        if norm.is_empty() {
+            return;
+        }
+        let start = now
+            .checked_sub(std::time::Duration::from_millis(start_age_ms))
+            .unwrap_or(now);
+        let end = end_age_ms.map(|ms| {
+            now.checked_sub(std::time::Duration::from_millis(ms))
+                .unwrap_or(now)
+        });
+        self.press_spans
+            .entry(norm)
+            .or_default()
+            .push_back((start, end));
     }
 
     pub fn set_held(&mut self, key_id: &str, down: bool) {
@@ -560,15 +588,25 @@ impl KpsTracker {
             if canon != norm {
                 self.held.insert(canon);
             }
+            // 键雨：开一段新按压区间（None = 还按着；连发 down 幂等，只是多一段零长区间，无害）
+            self.press_spans.entry(norm).or_default().push_back((now, None));
         } else {
             // 松开：清「按住」并记下时刻（淡出起点）。
             // 注：左右修饰键同时按住这类极端情况按「任一松开即灭」处理，与计次口径一致。
             let distinct = canon != norm;
             self.held.remove(&norm);
-            self.recent_releases.insert(norm, now);
+            self.recent_releases.insert(norm.clone(), now);
             if distinct {
                 self.held.remove(&canon);
                 self.recent_releases.insert(canon, now);
+            }
+            // 键雨：闭合最近的未闭合区间（没有起点就忽略 —— 程序启动前就按着的键）
+            if let Some(spans) = self.press_spans.get_mut(&norm) {
+                if let Some(last) = spans.back_mut() {
+                    if last.1.is_none() {
+                        last.1 = Some(now);
+                    }
+                }
             }
         }
     }
@@ -625,10 +663,8 @@ impl KpsTracker {
             .collect()
     }
 
-    /// 每个键**最近一段时间内的击键时刻**，按「距今多少秒」返回（0 = 刚按下），
-    /// 用于键雨动画：调用方按 age × 速度 换算成上升高度，不需要保存任何粒子状态。
-    ///
-    /// 返回值与入参 `keys` 一一对应；窗口内没有击键的键给空 Vec。
+    /// （已由 rain_spans 取代，保留骨架仅作参考 —— 2026-11 键雨 v2）
+    #[allow(dead_code)]
     pub fn recent_hits(
         &self,
         keys: &[String],
@@ -657,6 +693,56 @@ impl KpsTracker {
                 }
                 ages.reverse(); // 由旧到新，画的时候后画的压在上面
                 ages
+            })
+            .collect()
+    }
+
+    /// 每个键**最近的按压区间**（键雨用）：返回 `(按下距今秒, 松开距今秒)`，
+    /// 松开距今 = 0 表示**还按着**（渲染层的串前沿贴在键格上、持续发射）。
+    ///
+    /// 区间按时间升序；整段都超出 `within` 的丢弃（已经飘出轨道）。
+    /// 返回值与入参 `keys` 一一对应。
+    pub fn rain_spans(
+        &self,
+        keys: &[String],
+        within: std::time::Duration,
+        now: Instant,
+    ) -> Vec<Vec<(f64, f64)>> {
+        let within_s = within.as_secs_f64();
+        keys.iter()
+            .map(|k| {
+                let norm = normalize_kps_key(k);
+                let canon = canonical_kps_key(&norm);
+                let empty = VecDeque::new();
+                let spans = self
+                    .press_spans
+                    .get(&norm)
+                    .or_else(|| self.press_spans.get(&canon))
+                    .unwrap_or(&empty);
+                let mut out: Vec<(f64, f64)> = Vec::new();
+                for (start, end) in spans.iter().rev() {
+                    if *start > now {
+                        continue;
+                    }
+                    let start_age = now.saturating_duration_since(*start).as_secs_f64();
+                    // 还按着（end = None）的区间必须保留：长按要能看到整条串铺满轨道，
+                    // 否则按超过取样窗口就"雨突然消失"。只有已松开的才按窗口截断。
+                    let still_held = end.is_none();
+                    if !still_held && start_age > within_s {
+                        break;
+                    }
+                    // 兜底：按住不放到极端的（异常未闭合）也只保留 within 的 20 倍
+                    if still_held && start_age > within_s * 20.0 {
+                        break;
+                    }
+                    let end_age = end
+                        .filter(|e| *e <= now)
+                        .map(|e| now.saturating_duration_since(e).as_secs_f64())
+                        .unwrap_or(0.0);
+                    out.push((start_age, end_age));
+                }
+                out.reverse(); // 由旧到新，后画的串压在上面
+                out
             })
             .collect()
     }
@@ -762,6 +848,7 @@ impl KpsTracker {
             self.recent_presses.clear();
             self.recent_releases.clear();
             self.key_times.clear();
+            self.press_spans.clear();
             self.graph_cache = None;
             self.graph_reset_at = None;
             self.session_actions = 0;
@@ -783,6 +870,20 @@ impl KpsTracker {
         for q in self.key_times.values_mut() {
             while let Some(&front) = q.front() {
                 if now.saturating_duration_since(front) > keep {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        // 键雨区间：已闭合且整段超出保留窗的弹掉（还按着的 / 仍压窗内的留下）
+        for q in self.press_spans.values_mut() {
+            while let Some(&(start, end)) = q.front() {
+                let done = end
+                    .filter(|e| now.saturating_duration_since(*e) > keep)
+                    .is_some()
+                    && now.saturating_duration_since(start) > keep;
+                if done {
                     q.pop_front();
                 } else {
                     break;

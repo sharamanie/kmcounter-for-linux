@@ -268,8 +268,11 @@ fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
     let anim_ms = if cfg.kps_show_rain || cfg.kps_key_bounce { 16 } else { 40 };
     ctx.request_repaint_after(Duration::from_millis(anim_ms));
 
+    // 背景与外框都跟随 kps_hud_opacity：调到 0 时整块底板与边框消失，
+    // 只剩键格 / 键雨 / 数据胶囊（用户拍板：边框也跟着走，数据胶囊的边框除外）
     let bg_fill = hud_bg_color((16, 18, 24), cfg.kps_hud_opacity);
-    let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(60, 68, 86, 220));
+    let border_alpha = ((cfg.kps_hud_opacity.min(100) as u32 * 220) / 100) as u8;
+    let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(60, 68, 86, border_alpha));
 
     egui::CentralPanel::default()
         .frame(
@@ -331,8 +334,9 @@ pub(crate) struct KpsHudData {
     pub(crate) avg_kps: f64,
     pub(crate) method: crate::stats::KpsMethod,
     pub(crate) key_infos: Vec<crate::stats::KpsKeyInfo>,
-    /// 每个键最近一段时间内的击键时刻（秒，0 = 刚按下）；键雨按它换算高度
-    pub(crate) rain: Vec<Vec<f64>>,
+    /// 每个键最近的按压区间（按下距今秒, 松开距今秒；松开=0 表示还按着）。
+    /// 键雨按它纯几何重建整条串（见 gui::rain）
+    pub(crate) rain: Vec<Vec<(f64, f64)>>,
     /// 分组 KPS（配置里没写分组 / 没开显示时为空）
     pub(crate) groups: Vec<crate::stats::KpsGroupInfo>,
     pub(crate) color: Color32,
@@ -346,10 +350,10 @@ fn kps_hud_data(hs: &HudShared, cfg: &Config, keys_list: &[String], kps_w: u32) 
         let infos = kps.query_keys(keys_list, kps_w);
         let method = kps.method();
         let avg = if cfg.kps_show_avg { kps.avg() } else { 0.0 };
-        // 键雨：只取窗口内的击键时刻（纯读，不存粒子状态）
+        // 键雨：只取窗口内的按压区间（纯读，不存粒子状态）
         let rain = if cfg.kps_show_rain {
             let span = std::time::Duration::from_secs_f32(super::rain::rain_lifespan_secs(cfg));
-            kps.recent_hits(keys_list, span, std::time::Instant::now())
+            kps.rain_spans(keys_list, span, std::time::Instant::now())
         } else {
             Vec::new()
         };
@@ -511,7 +515,9 @@ fn kps_key_sub_text(k: &crate::stats::KpsKeyInfo, cfg: &Config, method: crate::s
     }
 }
 
-/// 数据行：当前 KPS · Max · 平均，按实测宽度依次排下去。
+/// 数据行（v2）：当前 KPS · Max · 平均做成**一个独立胶囊**（深底圆角 + 自带描边），
+/// 与主面板背景解耦 —— 主面板透明度调到 0 时数据仍完整可读（用户拍板的设计）。
+/// 胶囊边框**不**跟随 kps_hud_opacity（对齐 JipperKeyViewer：胶囊自成一体）。
 #[allow(clippy::too_many_arguments)]
 fn paint_kps_meter(
     ui: &mut egui::Ui,
@@ -523,54 +529,80 @@ fn paint_kps_meter(
     sc: f32,
     keys_h: f32,
 ) {
-    let stats_cy = content.top()
+    let row_top = content.top()
         + keys_h
-        + if keys_h > 0.0 { m.pad } else { 0.0 }
-        + m.top_h * 0.5;
-    // 文字按**实测宽度**依次排下去：KPS 到两位数、三位数都不会和标签挤在一起
-    let mut x = content.left();
-    x = text_advance(
-        ui,
-        x,
-        stats_cy,
+        + if keys_h > 0.0 { m.pad } else { 0.0 };
+    let pill_h = m.top_h;
+    if pill_h <= 0.0 {
+        return;
+    }
+    // 胶囊内文字（横向排）：当前 KPS（大字强调色）+ 可选 Max + 可选平均
+    let mut items: Vec<(String, f32, Color32)> = Vec::new();
+    items.push((
         fmt_kps(kd.cur_kps, kd.method),
-        egui::FontId::proportional(m.font_cur),
+        m.font_cur,
         kd.color,
-    );
-    x += 4.0 * sc;
-    x = text_advance(
-        ui,
-        x,
-        stats_cy + m.font_cur * 0.14,
-        s.kps_label.to_string(),
-        egui::FontId::proportional(m.font_sub),
-        HUD_TEXT,
-    );
+    ));
+    items.push((s.kps_label.to_string(), m.font_sub, HUD_TEXT));
     if cfg.kps_show_max {
-        x += 16.0 * sc;
-        x = text_advance(
-            ui,
-            x,
-            stats_cy + m.font_cur * 0.14,
+        items.push((
             format!("{}: {}", s.kps_max_label, fmt_kps(kd.peak_kps, kd.method)),
-            egui::FontId::proportional(m.font_sub),
+            m.font_sub,
             HUD_TEXT,
-        );
+        ));
     }
     if cfg.kps_show_avg {
-        x += 16.0 * sc;
-        let _ = text_advance(
-            ui,
-            x,
-            stats_cy + m.font_cur * 0.14,
+        items.push((
             format!("{}: {}", s.avg_label, fmt_kps(kd.avg_kps, kd.method)),
-            egui::FontId::proportional(m.font_sub),
+            m.font_sub,
+            HUD_TEXT,
+        ));
+    }
+    // 实测总宽（含间隔）
+    let mut texts = Vec::new();
+    let mut total_w = 4.0 * sc;
+    for (text, size, color) in &items {
+        let galley = ui.painter().layout_no_wrap(
+            text.clone(),
+            egui::FontId::proportional(*size),
+            *color,
+        );
+        total_w += galley.size().x + 4.0 * sc;
+        texts.push(galley);
+    }
+    total_w += 4.0 * sc;
+    let pill = egui::Frame::none()
+        .fill(hud_bg_color((22, 24, 32), 96))
+        .inner_margin(egui::Margin::symmetric(6.0 * sc, 2.0 * sc))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(60, 68, 86, 220),
+        ))
+        .rounding(6.0);
+    // 居中放在行的可用宽度里（窗口比胶囊宽时左右留白对称）
+    let avail_w = content.width();
+    let pill_w = total_w + 12.0 * sc;
+    let px = if avail_w > pill_w {
+        content.left() + (avail_w - pill_w) * 0.5
+    } else {
+        content.left()
+    };
+    let pill_rect = Rect::from_min_size(Pos2::new(px, row_top), Vec2::new(pill_w, pill_h));
+    // 先画胶囊底，再把文字排在里面（居中一行）
+    ui.painter().add(pill.paint(pill_rect));
+    let mut x = px + 4.0 * sc;
+    let cy = row_top + pill_h * 0.5;
+    for galley in &texts {
+        ui.painter().galley(
+            Pos2::new(x, cy - galley.size().y * 0.5),
+            galley.clone(),
             HUD_TEXT,
         );
+        x += galley.size().x + 4.0 * sc;
     }
-    // 分组 KPS 行：数据行下面一行，每个组一段「名字 值 KPS」
+    // 分组 KPS 行：胶囊下面一行，每个组一段「名字 值 KPS」
     if m.group_h > 0.0 && !kd.groups.is_empty() {
-        paint_kps_group_row(ui, content, m, kd, s, sc, keys_h);
+        paint_kps_group_row(ui, content, m, kd, s, sc, keys_h + pill_h);
     }
 }
 
@@ -1687,12 +1719,12 @@ impl App {
                 });
             ui.label(egui::RichText::new(s.kps_rain_speed).color(HUD_TEXT));
             if ui
-                .add(egui::DragValue::new(&mut self.cfg.kps_rain_speed).range(20..=2000).speed(10.0))
+                .add(egui::DragValue::new(&mut self.cfg.kps_rain_speed).range(200..=20000).speed(20.0))
                 .changed()
             {
                 act.dirty = true;
             }
-            ui.label(egui::RichText::new("px/s").color(HUD_TEXT));
+            ui.label(egui::RichText::new("ms").color(HUD_TEXT));
         });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(s.kps_rain_height).color(HUD_TEXT));
@@ -1703,7 +1735,7 @@ impl App {
                 act.dirty = true;
             }
             ui.label(
-                egui::RichText::new(format!("px ({} 0)", s.kps_rain_height_auto))
+                egui::RichText::new(format!("px ({} 96)", s.kps_rain_height_auto))
                     .small()
                     .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
             );
@@ -1871,6 +1903,16 @@ impl App {
     }
 
     /// 直接改共享配置里的键雨/图开关（截图用；改 cfg_shared 才不会被每帧同步覆盖）
+    /// 截图用：喂一段按压区间（按下距今 ms，松开距今 ms；None = 还按着）
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_push_hold(&mut self, key: &str, start_age_ms: u64, end_age_ms: Option<u64>) {
+        self.shared
+            .kps
+            .lock()
+            .debug_push_hold_aged(key, start_age_ms, end_age_ms);
+    }
+
     #[cfg(feature = "softshot")]
     #[allow(dead_code)]
     pub(crate) fn debug_set_kps_rain(&mut self, show: bool, style: &str, graph: bool, speed: u16) {
@@ -2201,22 +2243,6 @@ pub(crate) fn apm_hud_measure(ctx: &egui::Context, texts: &[String], scale: f32)
     apm_hud_width(&item_w, dot_w, scale)
 }
 
-/// 画一段文字并返回它的右边缘 x —— 横向排布时按实测宽度接下去，
-/// 数字变长（比如 KPS 到两位数）也不会和后面的标签挤在一起。
-pub(crate) fn text_advance(
-    ui: &egui::Ui,
-    left: f32,
-    center_y: f32,
-    text: String,
-    font: egui::FontId,
-    color: Color32,
-) -> f32 {
-    let galley = ui.painter().layout_no_wrap(text, font, color);
-    let w = galley.size().x;
-    let h = galley.size().y;
-    ui.painter().galley(Pos2::new(left, center_y - h * 0.5), galley, color);
-    left + w
-}
 
 /// KPS 数值的显示格式：硬算是整数，灵敏方式是 1 位小数
 pub(crate) fn fmt_kps(v: f64, method: crate::stats::KpsMethod) -> String {

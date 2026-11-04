@@ -2544,16 +2544,17 @@ mod tests {
                     app.debug_push_kps_hist(age);
                 }
             }
-            // 键雨要「层次」：同一把键喂不同年龄的击键，雨条高低错落才看得出版式。
-            // 年龄单位毫秒，寿命 = 64 / 120 * 1.6 ≈ 0.85 秒（见 gui::rain::rain_lifespan_secs）。
-            for (key, ages) in [
-                ("Q", &[40u64, 120, 220, 340, 470, 600][..]),
-                ("W", &[70, 200, 380, 540][..]),
-                ("E", &[150, 450][..]),
+            // 键雨 v2 喂**按压区间**：(按下距今 ms, 松开距今 ms)。None = 还按着。
+            // 速度 1200ms/轨道（96px ≈ 80px/s），0.8s 前沿能爬约 64px，层次刚好。
+            // 场景：Q 按住中（前沿贴键格、串持续生长）+ Q 两段历史按压（松手后整串上飘）
+            //      + W 一段长按已松 + E 一段短击 —— 覆盖三种形态。
+            for (key, start, end) in [
+                ("Q", 2600u64, None),
+                ("Q", 1500, Some(1180)),
+                ("W", 1100, Some(600)),
+                ("E", 700, Some(560)),
             ] {
-                for &a in ages {
-                    app.debug_push_kps_aged(key, a);
-                }
+                app.debug_push_hold(key, start, end);
             }
         };
 
@@ -2649,22 +2650,22 @@ mod tests {
 
         // —— 四种组合：图/雨 各自独立开关（产品的差异点，必须每种都看得见）——
         // 1) 只有图（等价 osu-kps 的观感）
-        app.debug_set_kps_rain(false, "trail", true, 120);
+        app.debug_set_kps_rain(false, "trail", true, 1200);
         let p1 = capture(&mut app, &ctx, &mut shot_textures, "kps-hud", false, &feed_scene, false, &hud_spec);
         assert!(p1.exists());
 
         // 2) 只有雨（等价 JipperKeyViewer 的观感）：生长竖条
-        app.debug_set_kps_rain(true, "trail", false, 120);
+        app.debug_set_kps_rain(true, "trail", false, 1200);
         let p2 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-trail", true, &feed_scene, false, &hud_spec);
         assert!(p2.exists());
 
         // 3) 只有雨：方块串
-        app.debug_set_kps_rain(true, "block", false, 120);
+        app.debug_set_kps_rain(true, "block", false, 1200);
         let p3 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-block", true, &feed_scene, false, &hud_spec);
         assert!(p3.exists());
 
         // 4) 图 + 雨同开（本项目的组合）
-        app.debug_set_kps_rain(true, "trail", true, 120);
+        app.debug_set_kps_rain(true, "trail", true, 1200);
         let p4 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-both", true, &feed_scene, false, &hud_spec);
         assert!(p4.exists());
 

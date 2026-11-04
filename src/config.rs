@@ -98,9 +98,11 @@ pub struct Config {
     pub kps_show_rain: bool,
     /// 键雨样式："trail"（生长竖条，对齐 JipperKeyViewer）| "block"（方块串）
     pub kps_rain_style: String,
-    /// 键雨上升速度（像素/秒，20~2000）
+    /// 键雨上升速度：**走完整个轨道要多少毫秒**（200~20000；越小越快）。
+    /// 旧语义是像素/秒 —— 高度一改速度观感就变，改按轨道时间后同一速度值在任何
+    /// 高度下观感一致（对齐 JipperKeyViewer 的「按秒配置」习惯）。
     pub kps_rain_speed: u16,
-    /// 键雨区域高度（像素，0 = 自动取 KPS 图高度）
+    /// 键雨轨道高度（像素，16~400；0 = 自动取 96px）
     pub kps_rain_height: u16,
     /// 键雨不透明度（0~100）
     pub kps_rain_opacity: u8,
@@ -173,8 +175,8 @@ impl Default for Config {
             kps_graph_secs: 300,
             kps_show_rain: false,
             kps_rain_style: "trail".into(),
-            kps_rain_speed: 120,
-            kps_rain_height: 0,
+            kps_rain_speed: 1200,
+            kps_rain_height: 96,
             kps_rain_opacity: 85,
             kps_key_bounce: true,
             kps_groups: String::new(),
