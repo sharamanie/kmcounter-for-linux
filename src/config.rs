@@ -96,14 +96,14 @@ pub struct Config {
     /// KPS 悬浮窗是否显示**按键雨**：每次击键在键格上方升起一条轨迹
     /// （对齐 JipperKeyViewer 的 RainLayer；与下面的 KPS 图相互独立，可只开其一）
     pub kps_show_rain: bool,
-    /// 键雨样式："trail"（生长竖条，对齐 JipperKeyViewer）| "block"（方块串）
-    pub kps_rain_style: String,
     /// 键雨上升速度：**走完整个轨道要多少毫秒**（200~20000；越小越快）。
     /// 旧语义是像素/秒 —— 高度一改速度观感就变，改按轨道时间后同一速度值在任何
     /// 高度下观感一致（对齐 JipperKeyViewer 的「按秒配置」习惯）。
     pub kps_rain_speed: u16,
     /// 键雨轨道高度（像素，16~400；0 = 自动取 96px）
     pub kps_rain_height: u16,
+    /// 键雨条宽占键格宽的比例（百分比，20~100）。默认 72 = 略窄于键格。
+    pub kps_rain_width_pct: u8,
     /// 键雨不透明度（0~100）
     pub kps_rain_opacity: u8,
     /// 键格按压弹跳：按下瞬间放大再回弹（对齐 JipperKeyViewer 的 KeyShapeLayer）
@@ -174,9 +174,9 @@ impl Default for Config {
             kps_show_graph: true,
             kps_graph_secs: 300,
             kps_show_rain: false,
-            kps_rain_style: "trail".into(),
             kps_rain_speed: 1200,
             kps_rain_height: 96,
+            kps_rain_width_pct: 72,
             kps_rain_opacity: 85,
             kps_key_bounce: true,
             kps_groups: String::new(),

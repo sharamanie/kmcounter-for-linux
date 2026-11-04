@@ -2649,24 +2649,19 @@ mod tests {
             ppm
         };
 
-        // —— 四种组合：图/雨 各自独立开关（产品的差异点，必须每种都看得见）——
+        // —— 三种组合：图/雨 各自独立开关（产品的差异点，必须每种都看得见）——
         // 1) 只有图（等价 osu-kps 的观感）
-        app.debug_set_kps_rain(false, "trail", true, 1200);
+        app.debug_set_kps_rain(false, true, 1200);
         let p1 = capture(&mut app, &ctx, &mut shot_textures, "kps-hud", false, &feed_scene, false, &hud_spec);
         assert!(p1.exists());
 
-        // 2) 只有雨（等价 JipperKeyViewer 的观感）：生长竖条
-        app.debug_set_kps_rain(true, "trail", false, 1200);
+        // 2) 只有雨（等价 JipperKeyViewer 的观感）
+        app.debug_set_kps_rain(true, false, 1200);
         let p2 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-trail", true, &feed_scene, false, &hud_spec);
         assert!(p2.exists());
 
-        // 3) 只有雨：方块串
-        app.debug_set_kps_rain(true, "block", false, 1200);
-        let p3 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-block", true, &feed_scene, false, &hud_spec);
-        assert!(p3.exists());
-
-        // 4) 图 + 雨同开（本项目的组合）
-        app.debug_set_kps_rain(true, "trail", true, 1200);
+        // 3) 图 + 雨同开（本项目的组合）
+        app.debug_set_kps_rain(true, true, 1200);
         let p4 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-both", true, &feed_scene, false, &hud_spec);
         assert!(p4.exists());
 
@@ -2679,5 +2674,48 @@ mod tests {
         }
         let apm_ppm = capture(&mut app, &ctx, &mut shot_textures, "apm-hud", false, &feed_scene, false, &hud_spec);
         assert!(apm_ppm.exists());
+    }
+
+    /// KPS 设置窗口的离屏截图。
+    /// 存在意义只有一个：**把「下拉框 / 数值框的文字看不看得清」变成可量化的像素指标**
+    /// （白字画在浅色主题的按钮底上＝几乎不可见，这个坑踩过两次）。
+    #[test]
+    #[ignore]
+    fn render_kps_settings_shot() {
+        let dir = std::env::var("KMCOUNTER_HUD_SHOT_DIR").unwrap_or_else(|_| "/tmp/kmc-hud-shot".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, ctx) = headless_app(store_with_days(5));
+        app.hud_kps_show = false;
+        app.debug_set_cfg_open(false, true);
+        let s: &'static crate::lang::Strings = crate::lang::strings(crate::lang::Lang::En);
+        let ppp = 2.0;
+        ctx.set_pixels_per_point(ppp);
+        let (w, h) = (430.0_f32, 486.0_f32);
+        let mut textures: HashMap<TextureId, Tex> = HashMap::new();
+        let mut last = Vec::new();
+        for _ in 0..4 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+            raw.time = Some(next_time());
+            let out = ctx.run(raw, |ctx| app.show_kps_settings(ctx, s));
+            apply_textures(&mut textures, &out.textures_delta);
+            last = out.shapes;
+        }
+        println!("[softshot] kps-settings：{} 图元", last.len());
+        let prims = ctx.tessellate(last, ppp);
+        let mut canvas = Canvas::new(
+            (w * ppp) as usize,
+            (h * ppp) as usize,
+            Color32::from_rgb(0x14, 0x16, 0x1C),
+        );
+        for prim in &prims {
+            if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
+                let tex = mesh.texture_id;
+                draw_mesh(&mut canvas, textures.get(&tex), mesh, prim.clip_rect, ppp);
+            }
+        }
+        let ppm = std::path::PathBuf::from(&dir).join("kps-settings.ppm");
+        canvas.save_ppm(&ppm).unwrap();
+        println!("[softshot] → {} ({}x{})", ppm.display(), canvas.w, canvas.h);
     }
 }

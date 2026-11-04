@@ -1147,7 +1147,7 @@ impl App {
         cfg.kps_show_graph = self.cfg.kps_show_graph;
         cfg.kps_graph_secs = self.cfg.kps_graph_secs;
         cfg.kps_show_rain = self.cfg.kps_show_rain;
-        cfg.kps_rain_style = self.cfg.kps_rain_style.clone();
+        cfg.kps_rain_width_pct = self.cfg.kps_rain_width_pct;
         cfg.kps_rain_speed = self.cfg.kps_rain_speed;
         cfg.kps_rain_height = self.cfg.kps_rain_height;
         cfg.kps_rain_opacity = self.cfg.kps_rain_opacity;
@@ -1692,31 +1692,18 @@ impl App {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(s.kps_rain_style).color(HUD_TEXT));
-            let cur = if self.cfg.kps_rain_style == "block" {
-                s.kps_rain_style_block
-            } else {
-                s.kps_rain_style_trail
-            };
-            egui::ComboBox::from_id_salt("kps_rain_style")
-                .selected_text(egui::RichText::new(cur).color(HUD_TEXT))
-                .show_ui(ui, |ui| {
-                    let mut is_block = self.cfg.kps_rain_style == "block";
-                    if ui
-                        .selectable_value(&mut is_block, false, s.kps_rain_style_trail)
-                        .changed()
-                    {
-                        self.cfg.kps_rain_style = "trail".into();
-                        act.dirty = true;
-                    }
-                    if ui
-                        .selectable_value(&mut is_block, true, s.kps_rain_style_block)
-                        .changed()
-                    {
-                        self.cfg.kps_rain_style = "block".into();
-                        act.dirty = true;
-                    }
-                });
+            ui.label(egui::RichText::new(s.kps_rain_width_pct).color(HUD_TEXT));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.cfg.kps_rain_width_pct)
+                        .range(20..=100)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("%").color(HUD_TEXT));
             ui.label(egui::RichText::new(s.kps_rain_speed).color(HUD_TEXT));
             if ui
                 .add(egui::DragValue::new(&mut self.cfg.kps_rain_speed).range(200..=20000).speed(20.0))
@@ -1750,7 +1737,6 @@ impl App {
         });
     }
 
-    /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
     /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
     fn kps_settings_groups(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
         ui.add_space(4.0);
@@ -1915,10 +1901,9 @@ impl App {
 
     #[cfg(feature = "softshot")]
     #[allow(dead_code)]
-    pub(crate) fn debug_set_kps_rain(&mut self, show: bool, style: &str, graph: bool, speed: u16) {
+    pub(crate) fn debug_set_kps_rain(&mut self, show: bool, graph: bool, speed: u16) {
         let mut c = self.cfg_shared.lock();
         c.kps_show_rain = show;
-        c.kps_rain_style = style.to_string();
         c.kps_show_graph = graph;
         c.kps_rain_speed = speed;
     }
@@ -2358,7 +2343,7 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.kps_show_graph = from.kps_show_graph;
     to.kps_graph_secs = from.kps_graph_secs;
     to.kps_show_rain = from.kps_show_rain;
-    to.kps_rain_style = from.kps_rain_style.clone();
+    to.kps_rain_width_pct = from.kps_rain_width_pct;
     to.kps_rain_speed = from.kps_rain_speed;
     to.kps_rain_height = from.kps_rain_height;
     to.kps_rain_opacity = from.kps_rain_opacity;
@@ -2406,6 +2391,15 @@ pub(crate) fn settings_shell(
                 .rounding(8.0),
         )
         .show(cfg_ctx, |ui| {
+            // 这整块是深色面板，但程序全局是浅色主题（主窗口用浅色）。
+            // 不在这里把本 ui 的视觉切成深色的话，DragValue / ComboBox / 按钮会按浅色主题
+            // 画成近乎白的浅灰底，而文字又被统一成白色 —— 白字浅底几乎看不见（用户反馈过两次）。
+            // ui 级的 style 是 Arc 局部覆盖，不会漏到主窗口。
+            {
+                let v = ui.visuals_mut();
+                *v = egui::Visuals::dark();
+                v.override_text_color = Some(HUD_TEXT);
+            }
             // 标题行：左段可拖动（Wayland 下无边框窗口只能靠这招移动），右端是关闭按钮。
             // 两者用互不重叠的矩形交互，避免"点关闭却拖动了窗口"。
             let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());

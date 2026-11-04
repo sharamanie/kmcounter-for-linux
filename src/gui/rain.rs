@@ -1,10 +1,10 @@
-//! 键雨（Key Rain）—— 按压区间驱动的两种样式。
+//! 键雨（Key Rain）—— 按压区间驱动的生长竖条。
 //!
 //! 与 JipperKeyViewer 的差异：那边是 Unity 对象池 + 逐滴 Update；这里是 egui 立即模式，
 //! **不保存任何粒子状态** —— 每帧从 `KpsTracker::rain_spans` 拿「每个键最近的按压区间
 //! （按下距今 / 松开距今）」，按**纯几何**重建整条雨。
 //!
-//! 两种样式都遵守同一个运动学（对齐 JipperKeyViewer 的 RawRain::UpdateLocation）：
+//! 运动学（对齐 JipperKeyViewer 的 RawRain::UpdateLocation）：
 //!
 //! - `front = 按下至今秒数 × speed`：**前沿**（远端）距键格顶边的高度，只要时间在走就一直增大，
 //!   松手也不会停；
@@ -13,12 +13,10 @@
 //! - 可见区间 = `[front - len, front]` 与轨道 `[0, H]` 求交：前沿出顶后，条的**底部开始被裁**，
 //!   越来越短，直到整条出顶才消失（对齐 JipperKeyViewer 的 `sizeY = FinalSize.y - dropY + height`）。
 //!
-//! - **trail 生长竖条**：一条连续竖条（JipperKeyViewer 的 RainLayer 样式）。
-//! - **block 方块串**：按住期间每 `D` 像素发射一个短方块，`D` 固定，块本身也按 `speed` 上飘。
-//!
-//! 两种样式共用同一套坐标约定：
+//! 坐标约定：
 //! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
 //! - 渐隐带固定在**轨道顶部 1/3**：进入 [2H/3, H] 后从满亮线性淡到 0，H 以上完全不可见；
+//! - 条宽 = 键格宽 × 0.72（**略窄于键格**，看起来是键格上长出的一根柱子）；
 //! - 多排布局时第 2 排起逐排**变窄 + 加深一档**，所有排共用同一条轨道（轨道底边 = 第一排键格顶边）。
 //!
 //! 来源（样式参照）：https://github.com/adofaiex/JipperKeyViewer
@@ -27,17 +25,12 @@ use super::*;
 
 /// 最短可见长度（px）：极短按压也画得出来。
 const MIN_BAR_H: f32 = 3.0;
-/// 方块串里条宽相对键格宽的比例（再做绝对上下限），细条才像"雨"而不是"方块"。
-const BAR_W_RATIO: f32 = 0.20;
-/// 条宽绝对上下限（px）：太细看不见，太粗像方块。
-const BAR_W_MIN: f32 = 3.0;
-const BAR_W_MAX: f32 = 10.0;
-/// 方块串：条长 = 条宽 × 这个系数。
-const BAR_H_RATIO: f32 = 1.15;
-/// 方块串里条占间距的比例（剩下是缝）：0.62 → 缝约 38%，块之间连成「串」而不是散点。
-const BLOCK_FILL: f32 = 0.62;
-/// 生长竖条的宽度系数（比方块略宽，看起来是"柱"）。
-const TRAIL_W_RATIO: f32 = 0.16;
+/// 条宽相对键格宽的默认比例：略窄于键格，两侧各留约 14% 的边。
+/// 运行期取 cfg.kps_rain_width_pct（20~100），这里只是缺省值。
+const BAR_W_RATIO: f32 = 0.72;
+/// 条宽绝对上下限（px）：极小缩放下不至于细成线，极大缩放下不至于糊成整块。
+const BAR_W_MIN: f32 = 4.0;
+const BAR_W_MAX: f32 = 64.0;
 /// 每排键格的递进系数：第 2 排起宽度 ×0.85、颜色加深一档。
 const ROW_WIDTH_STEP: f32 = 0.85;
 /// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
@@ -52,6 +45,15 @@ pub(crate) fn rain_area_h(cfg: &Config) -> f32 {
         cfg.kps_rain_height.clamp(16, 400) as f32
     } else {
         96.0
+    }
+}
+
+/// 条宽占键格宽的比例（0.20~1.00）。默认略窄于键格，让条看起来像键格上长出来的柱子。
+fn rain_width_ratio(cfg: &Config) -> f32 {
+    if cfg.kps_rain_width_pct == 0 {
+        BAR_W_RATIO
+    } else {
+        (cfg.kps_rain_width_pct.clamp(20, 100) as f32 / 100.0).max(0.2)
     }
 }
 
@@ -112,7 +114,6 @@ pub(crate) fn paint_kps_rain(
     if !cfg.kps_show_rain || m.rain_h <= 0.0 {
         return;
     }
-    let block_style = cfg.kps_rain_style == "block";
     let h = rain_area.height();
     let speed = rain_px_per_sec(cfg);
     let opacity = cfg.kps_rain_opacity.min(100) as f32 / 100.0;
@@ -147,6 +148,7 @@ pub(crate) fn paint_kps_rain(
             let heat = crate::stats::kps_key_heat(k.kps);
             let step = ROW_WIDTH_STEP.powi(row as i32);
             let dim = row.min(3) as u32;
+            let w = (box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step;
 
             for &(start_age, end_age) in spans {
                 // 前沿：从按下算起按固定速度推进，**松手后继续推进**（这是"飘上去"的动力）。
@@ -155,60 +157,25 @@ pub(crate) fn paint_kps_rain(
                     continue;
                 }
                 // 按住时长（秒）：松手后 `start_age - end_age` 恒定 = 实际按住时长，
-                // 所以下面的 len 与发射长度都不会随时间漂移，雨条自然"定格上飘"。
+                // 所以下面的 len 不会随时间漂移，雨条自然"定格上飘"。
                 let hold_s = if end_age <= 0.0 {
                     start_age as f32
                 } else {
                     (start_age - end_age).max(0.0) as f32
                 };
-                let hold_len = hold_s * speed;
-
-                if block_style {
-                    // —— 方块串：按住期间每 D 像素发射一块；块本身也按 speed 上飘 ——
-                    let w = (box_w * BAR_W_RATIO).clamp(BAR_W_MIN, BAR_W_MAX) * step;
-                    let bar_h = (w * BAR_H_RATIO).max(MIN_BAR_H);
-                    let d = (bar_h / BLOCK_FILL).max(MIN_BAR_H + 2.0);
-                    // 已发射的最大序号（松手后固定）
-                    let k_hi = (hold_len / d).floor() as i64;
-                    if k_hi < 0 {
-                        continue;
-                    }
-                    // 近端已飘出轨道顶的最小序号（随时间右移，块从底部被裁）
-                    let k_lo = (((front - h) / d).ceil() as i64).max(0);
-                    // 近端还在键格顶以上的最大序号
-                    let k_top = (front / d).floor() as i64;
-                    let (lo, hi) = (k_lo.max(0), k_hi.min(k_top));
-                    if hi < lo {
-                        continue;
-                    }
-                    for kk in lo..=hi {
-                        let top_rise = front - kk as f32 * d;
-                        let vis_top = top_rise.max(0.0);
-                        let vis_bottom = (top_rise + bar_h).min(h);
-                        if vis_bottom - vis_top < 0.5 {
-                            continue;
-                        }
-                        emit_bar(
-                            &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, heat, dim,
-                        );
-                    }
-                } else {
-                    // —— 生长竖条：按住时长到前沿，松手后长度定格、整条继续上飘 ——
-                    let w = (box_w * TRAIL_W_RATIO).clamp(BAR_W_MIN, BAR_W_MAX) * step;
-                    let len = hold_len.max(MIN_BAR_H);
-                    let near = (front - len).max(0.0);
-                    if near >= h {
-                        continue; // 整条已飘出轨道
-                    }
-                    let vis_top = near.min(h);
-                    let vis_bottom = front.min(h);
-                    if vis_bottom - vis_top < 0.5 {
-                        continue;
-                    }
-                    emit_bar(
-                        &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, heat, dim,
-                    );
+                let len = (hold_s * speed).max(MIN_BAR_H);
+                let near = (front - len).max(0.0);
+                if near >= h {
+                    continue; // 整条已飘出轨道
                 }
+                let vis_top = near.min(h);
+                let vis_bottom = front.min(h);
+                if vis_bottom - vis_top < 0.5 {
+                    continue;
+                }
+                emit_bar(
+                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, heat, dim,
+                );
             }
         }
     }
