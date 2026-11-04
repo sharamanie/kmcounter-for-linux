@@ -296,14 +296,38 @@ pub(crate) fn paint_kps_rain(
     }
 }
 
-/// 画一根竖条：从 vis_top（距键格的高度）到 vis_bottom，**沿竖直方向做渐隐**。
+/// 一根雨条在竖直方向上的**顶点切分**：返回按 vis 升序排列的高度列表。
 ///
-/// 用 Mesh 而不是 rect_filled：整根是一个矩形，但上下两端颜色不同，顶点色插值后
-/// 条内就是连续渐变。必须在**轨道顶**与**滤镜区下边界**两处切一刀插顶点，否则只有端点两个 alpha，
-/// 长条会被插值成"整条都在缓缓变淡"：
+/// 只取关键位置并集，绝不做等距采样：
+/// - vis_lo / vis_hi：这根条自己的上下端；
+/// - zone_start（滤镜区下边界）与 h（轨道顶）：**只要落在这根条内部就必须切一刀**。
 ///
-/// 切完之后每个子段内部 alpha 线性、相邻子段在接缝处取值相同，
-/// 所以整条雨连续无断层，同时能正确表达"带下方满亮 / 带内向上淡到 0"。
+/// 为什么必须切：Mesh 的顶点色是**线性插值**的。若整根只给两个端点，
+/// 一条从轨道底部贯穿到顶部的长条会在整条长度上做线性渐变 ——
+/// 视觉上就是「每根条的渐变长度都不一样」（长的特别长、短的几乎没有），
+/// 而不是「轨道上半段有一块固定蒙版」。切在区域边界上，才能保证
+/// **滤镜区内**做渐变、**区下方**是纯实心的一段。
+fn bar_cuts(vis_a: f32, vis_b: f32, h: f32, band: f32) -> Vec<f32> {
+    let lo = vis_a.min(vis_b);
+    let hi = vis_a.max(vis_b);
+    let mut cuts = vec![lo, hi];
+    let zone_start = h - band;
+    for c in [zone_start, h] {
+        // 只有严格落在条内部才需要插顶点（端点已经在了）。
+        if c > lo && c < hi {
+            cuts.push(c);
+        }
+    }
+    cuts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|x, y| (*x - *y).abs() < 0.01);
+    cuts
+}
+
+/// 画一根竖条：从 vis_top 到 vis_bottom（两者都是「距键格顶边的高度」）。
+///
+/// 用 Mesh 而不是 rect_filled：整根是一个矩形，但上下两端颜色可能不同，
+/// 顶点色插值后条内就是连续渐变。顶点切分见 bar_cuts ——
+/// **必须把滤镜区边界切出来**，否则那条边界会被插值抹平、渐变铺满整根。
 #[allow(clippy::too_many_arguments)]
 fn emit_bar(
     painter: &egui::Painter,
@@ -324,28 +348,18 @@ fn emit_bar(
         Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
     };
 
-    // 顶点按 vis 升序（= 屏幕上从上往下）排列，相邻两两成段。
-    let band_start = h - band;
-    let mut cuts = vec![vis_bottom, vis_top];
-    for c in [h, band_start] {
-        if c > vis_bottom && c < vis_top {
-            cuts.push(c);
-        }
-    }
-    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.01);
-
+    let cuts = bar_cuts(vis_top, vis_bottom, h, band);
     let any_visible = cuts
         .iter()
-        .any(|&v| (base_alpha * rain_alpha(v, h, band) * 255.0).round() >= 1.0);
+        .any(|v| (base_alpha * rain_alpha(*v, h, band) * 255.0).round() >= 1.0);
     if !any_visible {
         return;
     }
 
     let mut mesh = egui::Mesh::default();
-    for &vis in &cuts {
+    for vis in &cuts {
         let y = cell_top - vis;
-        let c = to_color(vis);
+        let c = to_color(*vis);
         mesh.colored_vertex(Pos2::new(xl, y), c);
         mesh.colored_vertex(Pos2::new(xr, y), c);
     }
@@ -455,6 +469,66 @@ mod tests {
         let at_top = (rain_alpha(h, h, band) - rain_alpha(h - d, h, band)) / d;
         assert!(at_start.abs() < 1e-2, "区下边界斜率应≈0，实际 {at_start}");
         assert!(at_top.abs() < 1e-2, "轨道顶斜率应≈0，实际 {at_top}");
+    }
+
+    /// **这是「按轨道划分」的核心守卫**：切点必须把滤镜区边界插进去。
+    ///
+    /// 曾经的 bug：判断写成 c > vis_bottom && c < vis_top，
+    /// 但 vis_bottom（远端）恒大于 vis_top，条件永不成立 —— 边界从来没被切过，
+    /// 整根只留两个端点，Mesh 于是把渐变线性铺满整条长度。
+    /// 表现就是「每条长条的渐变长度都不一样、长的特别长」。
+    #[test]
+    fn bar_cuts_insert_filter_boundaries() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let band = fade_band_h(h, &cfg);
+        let zone_start = h - band;
+        assert!(zone_start > 0.0 && zone_start < h);
+
+        // 一根从轨道最底贯穿到最顶的长条：必须切出 4 个点，
+        // 其中包含 zone_start 与 h，这样区内 / 区外才是两段独立的插值。
+        let cuts = bar_cuts(0.0, h, h, band);
+        // 条的两端恰好是 0 与 h，所以轨道顶与条端重合、只算一个点：
+        // 期望值 = {0, zone_start, h} 三个位置。
+        assert_eq!(
+            cuts.len(),
+            3,
+            "贯穿全轨的长条应切出 3 个位置，实际 cuts={cuts:?}"
+        );
+        assert!(cuts.iter().any(|c| (*c - zone_start).abs() < 0.01), "必须切出滤镜区下边界");
+        assert!(cuts.iter().any(|c| (*c - h).abs() < 0.01), "必须切出轨道顶");
+
+        // 反过来传参（vis_top/vis_bottom 顺序颠倒）也必须得到同样结果
+        let cuts_rev = bar_cuts(h, 0.0, h, band);
+        assert_eq!(cuts, cuts_rev, "切分结果不应依赖传入顺序");
+
+        // 完全在滤镜区下方的短条：只有端点，不该凭空多出切点
+        let short = bar_cuts(0.0, zone_start - 50.0, h, band);
+        assert_eq!(short.len(), 2, "区下方的短条只需两个端点，实际 {short:?}");
+
+        // 完全在区内的一段：只有端点
+        let inside = bar_cuts(zone_start + 10.0, h, h, band);
+        assert_eq!(inside.len(), 2, "完全在区内的一段只需两个端点");
+    }
+
+    /// 配合上一条：**区下方那一段必须整段是满亮的**，不能有任何渐变。
+    /// （这正是「长条下半区域是原来的颜色」的数学表述。）
+    #[test]
+    fn lower_half_of_long_bar_stays_solid() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let band = fade_band_h(h, &cfg);
+        let zone_start = h - band;
+        // 从条底到滤镜区下边界，逐点采样都必须恰好 1.0
+        let steps = 100;
+        for i in 0..=steps {
+            let from = zone_start * (i as f32) / (steps as f32);
+            assert_eq!(
+                rain_alpha(from, h, band),
+                1.0,
+                "滤镜区下方 {from} 处必须完全实心"
+            );
+        }
     }
 
     /// 轨道高度上限放宽到 1200，且超范围会被夹住。
