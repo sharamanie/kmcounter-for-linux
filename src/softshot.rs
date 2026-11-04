@@ -2517,6 +2517,8 @@ mod tests {
         // 而重复喂击键又会让 KPS 时间轴越叠越高（踩过：KPS 虚高到 112、最新一根柱顶满）。
         // 顺序固定：清空 → 键格基础打点 → 图的历史柱 → 键雨的击键。
         let today_feed = today.clone();
+        // 多个场景闭包各持一份，避免 move 之后互相抢所有权
+        let today_rows = today.clone();
         let feed_scene = move |app: &mut App| {
             app.debug_reset_kps();
             // 键格的冷热（Q 最热 → 青绿边框）
@@ -2665,6 +2667,49 @@ mod tests {
         let p4 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-both", true, &feed_scene, false, &hud_spec);
         assert!(p4.exists());
 
+        // 4) 两排键同时按：验证「第一排宽度/不透明度不变，第二排起逐排变窄变淡」
+        //    —— 这是用户报的 bug：两排同列同时按时，雨的宽度不该互相影响，
+        //    否则第一排会莫名其妙变窄。这里两排每次都按满，第一排 Q/W/E 必须保持原宽。
+        app.debug_set_kps_keys("Q, W, E\nA, S, D");
+        {
+            let feed_rows = move |app: &mut App| {
+                app.debug_reset_kps();
+                for _ in 0..5 {
+                    app.debug_record_kps_key(&today_rows, "Q");
+                    app.debug_record_kps_key(&today_rows, "A");
+                }
+                for _ in 0..3 {
+                    app.debug_record_kps_key(&today_rows, "W");
+                    app.debug_record_kps_key(&today_rows, "S");
+                }
+                app.debug_record_kps_key(&today_rows, "E");
+                app.debug_record_kps_key(&today_rows, "D");
+                // 两排同列（第 1 列 / 第 2 列）同时按住，看宽度是否互相干扰
+                for (key, start, end) in [
+                    ("Q", 3000u64, None),
+                    ("A", 3000, None),
+                    ("W", 2000, Some(600)),
+                    ("S", 2000, Some(600)),
+                    ("E", 900, Some(400)),
+                    ("D", 900, Some(400)),
+                ] {
+                    app.debug_push_hold(key, start, end);
+                }
+            };
+            let p5 = capture(
+                &mut app,
+                &ctx,
+                &mut shot_textures,
+                "kps-rain-rows",
+                true,
+                &feed_rows,
+                false,
+                &hud_spec,
+            );
+            assert!(p5.exists());
+        }
+        app.debug_set_kps_keys("Q, W, E, R");
+
         // —— 再拍一张 APM 胶囊条特写（宽度贴合内容）——
         app.hud_kps_show = false;
         app.hud_apm_show = true;
@@ -2684,7 +2729,11 @@ mod tests {
     fn render_kps_settings_shot() {
         let dir = std::env::var("KMCOUNTER_HUD_SHOT_DIR").unwrap_or_else(|_| "/tmp/kmc-hud-shot".into());
         std::fs::create_dir_all(&dir).unwrap();
-        let (mut app, ctx) = headless_app(store_with_days(5));
+        // 把键雨打开：设置窗里的「键雨宽度 / 速度 / 高度 / 不透明度 / 颜色」整组都出现，
+        // 才算把「下拉框、数值框、颜色按钮的文字看不看得清」一起覆盖到。
+        let mut cfg = Config::default();
+        cfg.kps_show_rain = true;
+        let (mut app, ctx) = headless_app_with_cfg(store_with_days(5), cfg);
         app.hud_kps_show = false;
         app.debug_set_cfg_open(false, true);
         let s: &'static crate::lang::Strings = crate::lang::strings(crate::lang::Lang::En);

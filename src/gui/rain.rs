@@ -16,8 +16,14 @@
 //! 坐标约定：
 //! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
 //! - 渐隐带固定在**轨道顶部 1/3**：进入 [2H/3, H] 后从满亮线性淡到 0，H 以上完全不可见；
-//! - 条宽 = 键格宽 × 0.72（**略窄于键格**，看起来是键格上长出的一根柱子）；
-//! - 多排布局时第 2 排起逐排**变窄 + 加深一档**，所有排共用同一条轨道（轨道底边 = 第一排键格顶边）。
+//! - 条宽 = 键格宽 × `kps_rain_width_pct`（**略窄于键格**，看起来是键格上长出的一根柱子）；
+//! - 颜色固定取 `kps_rain_color`（默认纯白），**不随 KPS 热度变色** —— 雨是"运动轨迹"，
+//!   跟着热度变色会让人误以为自己按多快，而且和键格本身的发光混在一起看不出层次。
+//!
+//! 多层布局（`kps_keys` 里换行 = 分行）：所有排共用同一条轨道（轨道底边 = 第一排键格顶边），
+//! 但**排号越大越窄、越透明**（`ROW_WIDTH_STEP` / `ROW_ALPHA_STEP`）：
+//! 第一排永远是原始宽度与不透明度，第二排起逐排收窄并降低 alpha。这样两排同一竖线上的键
+//! 同时按下时，能看到"前景窄条叠在背景宽条上"，而不是两个同宽条糊成一块。
 //!
 //! 来源（样式参照）：https://github.com/adofaiex/JipperKeyViewer
 
@@ -31,8 +37,11 @@ const BAR_W_RATIO: f32 = 0.72;
 /// 条宽绝对上下限（px）：极小缩放下不至于细成线，极大缩放下不至于糊成整块。
 const BAR_W_MIN: f32 = 4.0;
 const BAR_W_MAX: f32 = 64.0;
-/// 每排键格的递进系数：第 2 排起宽度 ×0.85、颜色加深一档。
+/// 排间宽度递进系数：第 1 排 ×1.00（原始宽度），第 2 排 ×0.85，第 3 排 ×0.72…
 const ROW_WIDTH_STEP: f32 = 0.85;
+/// 排间不透明度递进系数：第 1 排 ×1.00，第 2 排 ×0.72，第 3 排 ×0.52…
+/// **只降 alpha，不改颜色** —— 靠压暗颜色做层次会在深色背景上变成一团脏灰。
+const ROW_ALPHA_STEP: f32 = 0.72;
 /// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
 /// 松手后的雨还要继续上飘、还要能被裁短，若窗口等于走完轨道的时间，
 /// 松手瞬间整条雨就会因为"按下太久"被丢掉 —— 那正是"松手即消失"的根因。
@@ -83,21 +92,13 @@ fn fade_at(d_from_top: f32, h: f32) -> f32 {
     d_from_top.max(0.0).min(band) / band
 }
 
-/// 键雨的基准色：跟随该键热力（与键格边框同源）。
-/// `dim` = 额外压暗档位（多排递进用，0 = 不压）。
-fn rain_color(heat: f32, alpha: u8, dim: u32) -> Color32 {
-    let (_, border, _) = key_heat_style(heat, 0.0);
-    let c = border.color.to_array();
-    if dim == 0 {
-        return Color32::from_rgba_unmultiplied(c[0], c[1], c[2], alpha);
-    }
-    let f = (1.0 - 0.18 * dim as f32).max(0.3);
-    Color32::from_rgba_unmultiplied(
-        (c[0] as f32 * f) as u8,
-        (c[1] as f32 * f) as u8,
-        (c[2] as f32 * f) as u8,
-        alpha,
-    )
+/// 键雨的固定基色（`kps_rain_color`，默认纯白）。
+///
+/// **不跟随 KPS 热度**：雨条是"这次按压的运动轨迹"，与手速无关；跟着热度变色会让同一个键
+/// 在不同时刻呈现不同颜色，和键格自身的发光混在一起反而看不出层次。
+pub(crate) fn rain_base_color(cfg: &Config) -> Color32 {
+    let c = cfg.kps_rain_color;
+    Color32::from_rgb(c[0], c[1], c[2])
 }
 
 /// 画一帧键雨（无状态：整条雨每帧从按压区间纯几何重建）。
@@ -117,14 +118,19 @@ pub(crate) fn paint_kps_rain(
     let h = rain_area.height();
     let speed = rain_px_per_sec(cfg);
     let opacity = cfg.kps_rain_opacity.min(100) as f32 / 100.0;
+    let base = rain_base_color(cfg);
     let painter = ui.painter().with_clip_rect(rain_area);
     let row_pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
 
-    // 轨道底边 = 第一排键格顶边；多排布局下所有排共用同一条轨道。
+    // 轨道底边 = 第一排键格顶边；多层布局下所有排共用同一条轨道。
     let cell_top = rain_area.bottom();
 
     let mut info_idx = 0usize;
     for (row, cells) in layout.rows.iter().enumerate() {
+        // 排间递进：第 1 排（row = 0）恒为 1.00，即**原始宽度与原始不透明度**。
+        // 这一点是硬约束：只要第一排按过键，它的雨就必须和你单独按它时一模一样。
+        let step = ROW_WIDTH_STEP.powi(row as i32);
+        let alpha_scale = ROW_ALPHA_STEP.powi(row as i32);
         for (cell_idx, cell) in cells.iter().enumerate() {
             let Some(&(x_off, box_w)) = row_pos.get(row).and_then(|r| r.get(cell_idx)) else {
                 break;
@@ -133,9 +139,9 @@ pub(crate) fn paint_kps_rain(
                 info_idx += 1; // 空位：占地方，不画不统计
                 continue;
             }
-            let Some(k) = kd.key_infos.get(info_idx) else {
+            if kd.key_infos.get(info_idx).is_none() {
                 break;
-            };
+            }
             let idx = info_idx;
             info_idx += 1;
             let Some(spans) = kd.rain.get(idx) else {
@@ -145,9 +151,6 @@ pub(crate) fn paint_kps_rain(
                 continue;
             }
             let cx = rain_area.left() + x_off + box_w * 0.5;
-            let heat = crate::stats::kps_key_heat(k.kps);
-            let step = ROW_WIDTH_STEP.powi(row as i32);
-            let dim = row.min(3) as u32;
             let w = (box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step;
 
             for &(start_age, end_age) in spans {
@@ -174,7 +177,7 @@ pub(crate) fn paint_kps_rain(
                     continue;
                 }
                 emit_bar(
-                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, heat, dim,
+                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, base, alpha_scale,
                 );
             }
         }
@@ -192,16 +195,17 @@ fn emit_bar(
     vis_bottom: f32,
     h: f32,
     opacity: f32,
-    heat: f32,
-    dim: u32,
+    base: Color32,
+    alpha_scale: f32,
 ) {
     let a_top = fade_at(h - vis_top, h);
     let a_bot = fade_at(h - vis_bottom, h);
-    let alpha_top = (a_top * opacity * 255.0).round() as u8;
-    let alpha_bot = (a_bot * opacity * 255.0).round() as u8;
+    let alpha_top = (a_top * opacity * alpha_scale * 255.0).round() as u8;
+    let alpha_bot = (a_bot * opacity * alpha_scale * 255.0).round() as u8;
     if alpha_top == 0 && alpha_bot == 0 {
         return;
     }
+    let tint = |a: u8| Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a);
     // vis_* 是「距键格顶边的高度」：数值大的一端离**轨道顶**近，在屏幕上更靠上（y 更小）。
     // Rect::from_min_max 要求 min <= max，而这里 vis 越大 y 越小，两者方向相反 ——
     // 必须显式取 min/max，否则画出来是空矩形（rect_filled 直接不可见，
@@ -214,15 +218,15 @@ fn emit_bar(
         painter.rect_filled(
             Rect::from_min_max(Pos2::new(xl, y_hi), Pos2::new(xr, y_lo)),
             1.5,
-            rain_color(heat, alpha_bot, dim),
+            tint(alpha_bot),
         );
     } else {
         // 跨渐隐带：Mesh 顶点色做竖向渐变
         let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(Pos2::new(xl, y_a), rain_color(heat, alpha_top, dim));
-        mesh.colored_vertex(Pos2::new(xr, y_a), rain_color(heat, alpha_top, dim));
-        mesh.colored_vertex(Pos2::new(xl, y_b), rain_color(heat, alpha_bot, dim));
-        mesh.colored_vertex(Pos2::new(xr, y_b), rain_color(heat, alpha_bot, dim));
+        mesh.colored_vertex(Pos2::new(xl, y_a), tint(alpha_top));
+        mesh.colored_vertex(Pos2::new(xr, y_a), tint(alpha_top));
+        mesh.colored_vertex(Pos2::new(xl, y_b), tint(alpha_bot));
+        mesh.colored_vertex(Pos2::new(xr, y_b), tint(alpha_bot));
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(1, 3, 2);
         painter.add(egui::Shape::mesh(mesh));

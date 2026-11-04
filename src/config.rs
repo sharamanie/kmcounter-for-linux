@@ -106,6 +106,9 @@ pub struct Config {
     pub kps_rain_width_pct: u8,
     /// 键雨不透明度（0~100）
     pub kps_rain_opacity: u8,
+    /// 键雨颜色（RGB，默认纯白）。键雨**不跟随 KPS 热度变色** —— 雨条是「这次按压的
+    /// 运动轨迹」，跟着手速变色会和键格自身的发光混在一起，看不出层次。
+    pub kps_rain_color: [u8; 3],
     /// 键格按压弹跳：按下瞬间放大再回弹（对齐 JipperKeyViewer 的 KeyShapeLayer）
     pub kps_key_bounce: bool,
     /// 按组 KPS 分组定义：一行一组，格式 `组名=A,S,D,F`（组名可省略）
@@ -178,6 +181,7 @@ impl Default for Config {
             kps_rain_height: 96,
             kps_rain_width_pct: 72,
             kps_rain_opacity: 85,
+            kps_rain_color: [255, 255, 255],
             kps_key_bounce: true,
             kps_groups: String::new(),
             kps_show_groups: false,

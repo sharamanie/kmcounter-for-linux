@@ -1151,6 +1151,7 @@ impl App {
         cfg.kps_rain_speed = self.cfg.kps_rain_speed;
         cfg.kps_rain_height = self.cfg.kps_rain_height;
         cfg.kps_rain_opacity = self.cfg.kps_rain_opacity;
+        cfg.kps_rain_color = self.cfg.kps_rain_color;
         cfg.kps_key_bounce = self.cfg.kps_key_bounce;
         cfg.kps_groups = self.cfg.kps_groups.clone();
         cfg.kps_show_groups = self.cfg.kps_show_groups;
@@ -1735,6 +1736,23 @@ impl App {
             }
             ui.label(egui::RichText::new("%").color(HUD_TEXT));
         });
+        // 键雨颜色：默认纯白。键雨**不跟随 KPS 热度**，所以颜色必须能在设置里自己调。
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_rain_color).color(HUD_TEXT));
+            if ui.color_edit_button_srgb(&mut self.cfg.kps_rain_color).changed() {
+                act.dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "#{:02X}{:02X}{:02X}",
+                    self.cfg.kps_rain_color[0],
+                    self.cfg.kps_rain_color[1],
+                    self.cfg.kps_rain_color[2]
+                ))
+                .small()
+                .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+            );
+        });
     }
 
     /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
@@ -1906,6 +1924,13 @@ impl App {
         c.kps_show_rain = show;
         c.kps_show_graph = graph;
         c.kps_rain_speed = speed;
+    }
+
+    /// 截图用：直接改共享配置里的监控键（换行 = 分行），用来验证多层排布
+    #[cfg(feature = "softshot")]
+    #[allow(dead_code)]
+    pub(crate) fn debug_set_kps_keys(&mut self, keys: &str) {
+        self.cfg_shared.lock().kps_keys = keys.to_string();
     }
 
     #[cfg(feature = "softshot")]
@@ -2347,6 +2372,7 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.kps_rain_speed = from.kps_rain_speed;
     to.kps_rain_height = from.kps_rain_height;
     to.kps_rain_opacity = from.kps_rain_opacity;
+    to.kps_rain_color = from.kps_rain_color;
     to.kps_key_bounce = from.kps_key_bounce;
     to.kps_groups = from.kps_groups.clone();
     to.kps_show_groups = from.kps_show_groups;
