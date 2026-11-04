@@ -489,6 +489,32 @@ fn hud_check(ui: &mut egui::Ui, value: &mut bool, label: &'static str, act: &mut
     }
 }
 
+/// 设置窗口里的小节标题：左侧小字标题 + 一条淡分隔线向右延伸。
+///
+/// 加它是为了收拾"整面墙都是勾选框和数值框"的观感：把内容切成 基础 / 按键 /
+/// 显示 / 键雨 四组，一眼能看出每一项属于哪一类（用户反馈过窗口太乱）。
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), Sense::hover());
+    let color = Color32::from_rgb(0x8F, 0x9C, 0xB4);
+    let galley = ui.painter().layout_no_wrap(
+        title.to_string(),
+        egui::FontId::proportional(11.0),
+        color,
+    );
+    let w = galley.size().x;
+    ui.painter().galley(
+        Pos2::new(row.left(), row.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    let y = row.center().y;
+    ui.painter().line_segment(
+        [Pos2::new(row.left() + w + 8.0, y), Pos2::new(row.right(), y)],
+        egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(70, 78, 96, 140)),
+    );
+}
+
 /// KPS 算法的显示名。
 fn kps_method_label(m: crate::stats::KpsMethod, s: &'static Strings) -> &'static str {
     match m {
@@ -1227,12 +1253,19 @@ impl App {
     }
 
     /// APM 设置窗口的内容：窗口长度 / 不透明度 / 显示项 / 缩放 / 底部按钮
+    /// APM 设置窗口的内容：与 KPS 设置用同一套小节标题，两个窗口看起来是一个东西。
+    ///
+    /// 「重置峰值」从显示组挪进底栏按钮区 —— 它和「打开主程序 / 显示悬浮窗」
+    /// 同属一次性动作，单独混在勾选框里会让人以为它是个开关。
     fn apm_settings_body(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        settings_section(ui, s.cfg_group_basic);
         self.apm_settings_window_row(ui, s, act);
-        ui.add_space(4.0);
-        self.apm_settings_display_toggles(ui, s, act);
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         self.apm_settings_scale_row(ui, s, act);
+
+        settings_section(ui, s.cfg_group_display);
+        self.apm_settings_display_toggles(ui, s, act);
+
         ui.add_space(6.0);
         self.apm_settings_buttons(ui, s, act);
         ui.add_space(4.0);
@@ -1260,6 +1293,8 @@ impl App {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.cfg.apm_hud_opacity)
+                        // 下限 20：0 会让悬浮窗完全消失（看不见也抓不到，
+                        // 用户想调回来时已经点不到这个设置项了），故保留最小可见度
                         .range(20..=100)
                         .speed(1.0)
                         .suffix("%"),
@@ -1360,8 +1395,10 @@ impl App {
             vp_id,
             egui::ViewportBuilder::default()
                 .with_title(format!("KMC - {}", s.kps_cfg_title))
-                // 高度按内容实测定（标签统一到正文字号 + 显示项分两行后需要 336）
-                .with_inner_size([430.0, 486.0])
+                // 高度按内容实测定。分四组（基础 / 按键 / 显示 / 键雨）后每组多一行小标题，
+                // 同时键表输入框独占整行（原来挤在 label 后面只有 180px 宽）。
+                // 实测值须与 render_kps_settings_shot 的截图画布一致，否则底栏会被截断。
+                .with_inner_size([430.0, 588.0])
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_always_on_top()
@@ -1387,17 +1424,38 @@ impl App {
         self.apply_kps_settings_actions(ctx, &act);
     }
 
-    /// KPS 设置窗口的内容：按行分组，逐行交给下面的小方法
+    /// KPS 设置窗口的内容：四个小节，每组先画标题再逐行交给下面的小方法。
+    ///
+    /// 分组原则（用户反馈"设置界面太乱"后重排）：
+    /// 1. **基础**：决定数字怎么算 —— 统计窗口、计算方式、缩放、自适应键宽、不透明度；
+    /// 2. **按键**：决定把哪些键画出来 —— 键表、键数、设置键位、分组 KPS；
+    /// 3. **显示**：决定画哪些部件 —— 按键格子/统计/图/各项读数/限制在屏幕内；
+    /// 4. **键雨**：纯表现层 —— 开关、宽度、速度、高度、不透明度、颜色。
+    ///
+    /// 三处刻意设计：
+    /// - 「重置」是低频且不可逆的操作，挂在**底栏最右端**，不跟常用控件混；
+    /// - 选择类控件（是否显示、是否限制）集中在显示组，数值类控件紧跟各自的标签，
+    ///   避免一行里塞四五种控件导致眼睛要来回扫；
+    /// - 键表的多行输入独占一行（原来它挤在 label 后面，宽度被压到 180，
+    ///   键一多就要横向滚动）。
     fn kps_settings_body(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        settings_section(ui, s.cfg_group_basic);
         self.kps_settings_window_row(ui, s, act);
+        ui.add_space(2.0);
         self.kps_settings_scale_row(ui, s, act);
+
+        settings_section(ui, s.cfg_group_keys);
         self.kps_settings_key_list(ui, s, act);
         self.kps_settings_key_buttons(ui, s, act);
-        self.kps_settings_reset_menu(ui, s, act);
         self.kps_settings_capture(ui, s, act);
-        self.kps_settings_display_toggles(ui, s, act);
-        self.kps_settings_rain(ui, s, act);
         self.kps_settings_groups(ui, s, act);
+
+        settings_section(ui, s.cfg_group_display);
+        self.kps_settings_display_toggles(ui, s, act);
+
+        settings_section(ui, s.cfg_group_rain);
+        self.kps_settings_rain(ui, s, act);
+
         self.kps_settings_footer(ui, s, act);
     }
 
@@ -1470,11 +1528,12 @@ impl App {
         }
     }
 
-    /// 第二行：缩放、自动宽度与不透明度
+    /// 第二行：缩放、自适应键宽与不透明度 —— 三者都只影响"整块悬浮窗的外观框架"，
+    /// 所以放在同一个视觉组里（数值框之间用小间距，组内各控件紧挨着）。
     fn kps_settings_scale_row(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
         ui.horizontal(|ui| {
             self.kps_settings_scale(ui, s, act);
-            ui.add_space(6.0);
+            ui.add_space(12.0);
             if ui
                 .checkbox(
                     &mut self.cfg.kps_auto_width,
@@ -1485,15 +1544,18 @@ impl App {
             {
                 act.dirty = true;
             }
-            ui.add_space(6.0);
+            ui.add_space(12.0);
             ui.label(egui::RichText::new(s.hud_opacity).color(HUD_TEXT));
             if ui
                 .add(
                     egui::DragValue::new(&mut self.cfg.kps_hud_opacity)
+                        // 下限 20：0 会让悬浮窗彻底看不见（连这个设置项自己都点不到），
+                        // 用户没法再调回来，所以保留最小可见度
                         .range(20..=100)
                         .speed(1.0)
                         .suffix("%"),
                 )
+                .on_hover_text(s.hud_opacity_hint)
                 .changed()
             {
                 act.dirty = true;
@@ -1518,28 +1580,29 @@ impl App {
         }
     }
 
-    /// 键表输入：换行=分行，空项=空位，1.5H/4H=宽度倍数
+    /// 键表输入：换行=分行，空项=空位，1.5H/4H=宽度倍数。
+    ///
+    /// 布局：标签单独一行、输入框占满整行宽度。原来标签和输入框挤在同一行，
+    /// 输入框只剩 180px，多排键表必须横向滚动才看得全（这正是"乱"的来源之一）。
     fn kps_settings_key_list(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(s.settings_kps_keys).color(HUD_TEXT));
-            // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.cfg.kps_keys)
-                        .desired_width(180.0)
-                        .desired_rows(3)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J"),
-                )
-                .on_hover_text(s.settings_kps_keys_hint)
-                .changed()
-            {
-                // 手改键表时把"键数"跟着对一下，避免两处打架
-                self.cfg.kps_key_count =
-                    self.cfg.kps_key_layout().names().len().clamp(1, 26) as u8;
-                act.dirty = true;
-            }
-        });
+        ui.label(egui::RichText::new(s.settings_kps_keys).color(HUD_TEXT));
+        // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut self.cfg.kps_keys)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J"),
+            )
+            .on_hover_text(s.settings_kps_keys_hint)
+            .changed()
+        {
+            // 手改键表时把"键数"跟着对一下，避免两处打架
+            self.cfg.kps_key_count =
+                self.cfg.kps_key_layout().names().len().clamp(1, 26) as u8;
+            act.dirty = true;
+        }
     }
 
     /// 键数调节、设置键位与恢复默认键表
@@ -1576,32 +1639,29 @@ impl App {
         });
     }
 
-    /// 重置菜单：按键总次数 / 最大 KPS / KPS 图 / 以上所有
+    /// 重置菜单（由底栏用 right_to_left 布局贴到行右端）。
     fn kps_settings_reset_menu(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
-        ui.horizontal(|ui| {
-            // 重置菜单（对齐 osu-kps 的重置子菜单：按键总次数 / 最大 KPS / KPS 图 / 以上所有）
-            ui.menu_button(s.kps_reset, |ui| {
-                // 菜单也是浅色弹出层：用主题默认深色字（不要 HUD_TEXT）
-                ui.label(egui::RichText::new(s.kps_reset_hint));
-                ui.separator();
-                if ui.button(s.kps_reset_counts).clicked() {
-                    act.reset_counts = true;
-                    ui.close_menu();
-                }
-                if ui.button(s.kps_reset_peak).clicked() {
-                    act.reset_peak = true;
-                    ui.close_menu();
-                }
-                if ui.button(s.kps_reset_graph).clicked() {
-                    act.reset_graph = true;
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button(s.kps_reset_all).clicked() {
-                    act.reset_all = true;
-                    ui.close_menu();
-                }
-            });
+        ui.menu_button(s.kps_reset, |ui| {
+            // 菜单是浅色弹出层：用主题默认深色字（不要 HUD_TEXT，白字白底看不见）
+            ui.label(egui::RichText::new(s.kps_reset_hint));
+            ui.separator();
+            if ui.button(s.kps_reset_counts).clicked() {
+                act.reset_counts = true;
+                ui.close_menu();
+            }
+            if ui.button(s.kps_reset_peak).clicked() {
+                act.reset_peak = true;
+                ui.close_menu();
+            }
+            if ui.button(s.kps_reset_graph).clicked() {
+                act.reset_graph = true;
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(s.kps_reset_all).clicked() {
+                act.reset_all = true;
+                ui.close_menu();
+            }
         });
     }
 
@@ -1644,22 +1704,36 @@ impl App {
         }
     }
 
+    /// 显示组：第一行是「画哪些部件」（格子 / 统计 / 图 + 图时长），
+    /// 第二行是「统计信息里画哪些读数」（击打次数 / 单键 KPS / Max / 平均），
+    /// 第三行是窗口行为（限制在屏幕内）。
+    ///
+    /// 拆成"部件"和"读数"两行而不是随便切三行：前者决定画不画一整块区域，
+    /// 后者只影响那块区域里的文字，分开放才好找。
     fn kps_settings_display_toggles(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             hud_check(ui, &mut self.cfg.kps_show_buttons, s.kps_show_buttons, act);
             hud_check(ui, &mut self.cfg.kps_show_stats, s.kps_show_stats, act);
             hud_check(ui, &mut self.cfg.kps_show_graph, s.kps_show_graph, act);
             self.kps_settings_graph_secs(ui, s, act);
         });
-        // 分两行：四个复选框挤一行时最后一项（显示平均 KPS）会被窗口右边缘裁掉
+        // 读数项按"四个字以上的长标签"和"短标签"分两行：全挤一行时最右边的「单键 KPS」
+        // 会被窗口右边缘裁掉（430px 宽装不下四个长复选框，实测差约 100px）。
         ui.horizontal(|ui| {
             hud_check(ui, &mut self.cfg.kps_show_hits, s.settings_kps_show_hits, act);
-            hud_check(ui, &mut self.cfg.kps_show_key_kps, s.kps_show_key_kps, act);
-        });
-        ui.horizontal(|ui| {
             hud_check(ui, &mut self.cfg.kps_show_max, s.settings_kps_show_max, act);
             hud_check(ui, &mut self.cfg.kps_show_avg, s.kps_show_avg, act);
+        });
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_key_kps, s.kps_show_key_kps, act);
+            ui.add_space(12.0);
+            if ui
+                .checkbox(&mut self.cfg.kps_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
+                .on_hover_text(s.hud_keep_in_screen_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
         });
     }
 
@@ -1684,9 +1758,10 @@ impl App {
     /// 键雨与 KPS 图是**两个独立开关**：只开图 ≈ osu-kps，只开雨 ≈ JipperKeyViewer，
     /// 都开则上下叠放，一屏看到更多。
     fn kps_settings_rain(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             hud_check(ui, &mut self.cfg.kps_show_rain, s.kps_show_rain, act);
+            ui.add_space(12.0);
+            // 弹跳属于键格的表现，但和键雨同属"按下去有反馈"这一类，放一起更好找
             hud_check(ui, &mut self.cfg.kps_key_bounce, s.kps_key_bounce, act);
         });
         if !self.cfg.kps_show_rain {
@@ -1756,15 +1831,12 @@ impl App {
     }
 
     /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）
+    /// 分组 KPS：勾选 + 多行文本编辑（一行一组，组名=A,S,D,F）。
+    ///
+    /// 复选框用"分组 KPS"，后面那条同文本的小灰字已删（一句话写两遍＝纯噪音）。
     fn kps_settings_groups(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            hud_check(ui, &mut self.cfg.kps_show_groups, s.kps_groups, act);
-            ui.label(
-                egui::RichText::new(s.kps_show_groups)
-                    .small()
-                    .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
-            );
+            hud_check(ui, &mut self.cfg.kps_show_groups, s.kps_show_groups, act);
         });
         if !self.cfg.kps_show_groups {
             return;
@@ -1787,7 +1859,11 @@ impl App {
         );
     }
 
-    /// 底栏：打开主窗口、显示/隐藏悬浮窗、限制在屏幕内与说明文字
+    /// 底栏：左侧是"动作"（打开主窗口 / 显示或关闭悬浮窗），右端是低频且不可逆的「重置」。
+    ///
+    /// 「限制在屏幕内」已挪进显示组（它是窗口行为，不属于底栏的按钮区）。
+    /// 重置从按键行挪到这里：它和那几个按钮同属"一次性动作"，
+    /// 而按键行里夹一个下拉菜单恰恰是让那一行看起来乱的主要原因。
     fn kps_settings_footer(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -1798,15 +1874,9 @@ impl App {
             if ui.button(hud_btn).clicked() {
                 act.toggle_hud = true;
             }
-            ui.add_space(10.0);
-            // 限制在屏幕内（对齐 osu-kps 的同名选项）
-            if ui
-                .checkbox(&mut self.cfg.kps_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
-                .on_hover_text(s.hud_keep_in_screen_hint)
-                .changed()
-            {
-                act.dirty = true;
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.kps_settings_reset_menu(ui, s, act);
+            });
         });
         ui.add_space(4.0);
         ui.label(

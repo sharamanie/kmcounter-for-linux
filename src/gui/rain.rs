@@ -15,7 +15,11 @@
 //!
 //! 坐标约定：
 //! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
-//! - 渐隐带固定在**轨道顶部 1/3**：进入 [2H/3, H] 后从满亮线性淡到 0，H 以上完全不可见；
+//! - 渐隐：**整条雨共用一个 alpha，只由前沿高度决定**。前沿越过轨道一半后开始变淡，
+//!   到轨道顶刚好透明 —— 于是"升到设定高度正好化开"，而不是硬生生被裁掉。
+//!   这里刻意**不按位置**做竖向渐变：位置式渐变会让同一条雨的上半截先淡、下半截仍满亮，
+//!   条的中间出现一条肉眼可见的分界线（主人报过"下方一定区域突然出现渐隐"）。
+//!   整条统一 alpha 时无论条多长都是整体一起消散，条内**任何位置都没有接缝**；
 //! - 条宽 = 键格宽 × `kps_rain_width_pct`（**略窄于键格**，看起来是键格上长出的一根柱子）；
 //! - 颜色固定取 `kps_rain_color`（默认纯白），**不随 KPS 热度变色** —— 雨是"运动轨迹"，
 //!   跟着热度变色会让人误以为自己按多快，而且和键格本身的发光混在一起看不出层次。
@@ -97,19 +101,37 @@ pub(crate) fn rain_lifespan_secs(_cfg: &Config) -> f32 {
     RAIN_SAMPLE_SECS
 }
 
-/// 渐隐带高度：轨道顶部 1/3。
+/// 渐隐带占轨道高度的比例：轨道**上半段**（前沿越过 50% 才开始变淡）。
+///
+/// 给到一半是因为：消散过程足够长，就不会被察觉成"到某个高度突然变淡"；
+/// 下半段完全满亮，短按的雨看起来仍是实心的一根。
+/// 这个比例只影响"什么时候开始淡"，不影响条内部 —— 条内永远是单一 alpha。
+const FADE_BAND_FRAC: f32 = 0.5;
+
+/// 渐隐带高度：轨道高度的 FADE_BAND_FRAC。
 fn fade_band_h(h: f32) -> f32 {
-    h / 3.0
+    h * FADE_BAND_FRAC
 }
 
-/// 条上某一点的透明度系数：`d_from_top` = 该点到轨道顶的距离（0=最顶）。
-/// 顶部 1/3 内从 0 线性升到 1，其余满亮。
-fn fade_at(d_from_top: f32, h: f32) -> f32 {
+/// 整条雨的不透明度系数：只由**前沿**（front，距键格的高度）决定，条内处处相同。
+///
+/// 这是"衔接自然"的关键：若按位置给条上的点分别算 alpha，一条比渐隐带还长的雨
+/// 就会上半截淡、下半截亮，中间出现肉眼可见的断层 —— 那正是"下方突然出现渐隐"。
+/// 改成整条统一之后，雨是"整体一边上升一边变淡"，无论多长都没有内部接缝。
+///
+/// 曲线用 smoothstep（t*t*(3-2t)）而不是线性：线性在起淡点与终点各有一次**斜率突变**，
+/// 出现在运动的物体上就是两次"咯噔"；smoothstep 两端导数都为 0，进出渐隐带都连续。
+fn fade_by_front(front: f32, h: f32) -> f32 {
     let band = fade_band_h(h);
     if band <= 0.5 {
         return 1.0;
     }
-    d_from_top.max(0.0).min(band) / band
+    let start = h - band;
+    if front <= start {
+        return 1.0;
+    }
+    let t = ((front - start) / band).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
 }
 
 /// 某个排的不透明度系数（见 `ROW_ALPHA_TABLE`）。表外的排返回 0 = 完全不画。
@@ -226,16 +248,20 @@ pub(crate) fn paint_kps_rain(
                 if vis_bottom - vis_top < 0.5 {
                     continue;
                 }
-                emit_bar(
-                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, row_base,
-                    alpha_scale,
-                );
+                // 整条雨共用一个 alpha：跟随前沿的淡出 x 排间系数 x 用户设定的总不透明度。
+                // 用**前沿**而不是可见顶端：前沿越过轨道顶后继续增大，此时 alpha 已归零，
+                // 条在"被裁短"之前就先化干净，不会出现硬切。
+                let alpha = opacity * alpha_scale * fade_by_front(front, h);
+                if alpha <= 0.004 {
+                    continue;
+                }
+                emit_bar(&painter, cx, w, cell_top, vis_top, vis_bottom, alpha, row_base);
             }
         }
     }
 }
 
-/// 画一根竖条：从 `vis_top`（距轨道顶的距离）到 `vis_bottom`，顶端进渐隐带就做竖向渐变。
+/// 画一根竖条：从 vis_top（距键格的高度）到 vis_bottom，整条同一 alpha。
 #[allow(clippy::too_many_arguments)]
 fn emit_bar(
     painter: &egui::Painter,
@@ -244,42 +270,82 @@ fn emit_bar(
     cell_top: f32,
     vis_top: f32,
     vis_bottom: f32,
-    h: f32,
-    opacity: f32,
+    alpha: f32,
     base: Color32,
-    alpha_scale: f32,
 ) {
-    let a_top = fade_at(h - vis_top, h);
-    let a_bot = fade_at(h - vis_bottom, h);
-    let alpha_top = (a_top * opacity * alpha_scale * 255.0).round() as u8;
-    let alpha_bot = (a_bot * opacity * alpha_scale * 255.0).round() as u8;
-    if alpha_top == 0 && alpha_bot == 0 {
+    let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+    if a == 0 {
         return;
     }
-    let tint = |a: u8| Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a);
-    // vis_* 是「距键格顶边的高度」：数值大的一端离**轨道顶**近，在屏幕上更靠上（y 更小）。
-    // Rect::from_min_max 要求 min <= max，而这里 vis 越大 y 越小，两者方向相反 ——
-    // 必须显式取 min/max，否则画出来是空矩形（rect_filled 直接不可见，
-    // 而 Mesh 分支因不剔除背面仍能看见，表现为「只有跨渐隐带的条才显示一半」）。
+    // vis_* 是「距键格顶边的高度」：数值大的一端在屏幕上更靠上（y 更小）。
+    // Rect::from_min_max 要求 min <= max，两者方向相反 —— 必须显式取 min/max，
+    // 否则是空矩形（rect_filled 直接不可见，正是"下半段没雨"那次的根因）。
     let y_a = cell_top - vis_top;
     let y_b = cell_top - vis_bottom;
     let (y_hi, y_lo) = (y_a.min(y_b), y_a.max(y_b));
     let (xl, xr) = (cx - w * 0.5, cx + w * 0.5);
-    if alpha_top == alpha_bot {
-        painter.rect_filled(
-            Rect::from_min_max(Pos2::new(xl, y_hi), Pos2::new(xr, y_lo)),
-            1.5,
-            tint(alpha_bot),
-        );
-    } else {
-        // 跨渐隐带：Mesh 顶点色做竖向渐变
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(Pos2::new(xl, y_a), tint(alpha_top));
-        mesh.colored_vertex(Pos2::new(xr, y_a), tint(alpha_top));
-        mesh.colored_vertex(Pos2::new(xl, y_b), tint(alpha_bot));
-        mesh.colored_vertex(Pos2::new(xr, y_b), tint(alpha_bot));
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(1, 3, 2);
-        painter.add(egui::Shape::mesh(mesh));
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(xl, y_hi), Pos2::new(xr, y_lo)),
+        1.5,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 渐隐曲线必须**单调不增**且**连续**：这正是「下方突然出现一条渐隐」的回归守卫。
+    ///
+    /// 曾经的做法是按位置给条上的点分别算 alpha（上淡下亮），条一长就出现肉眼可见的分界线；
+    /// 现在整条共用一个由前沿决定的 alpha，所以只要保证曲线本身连续单调，
+    /// 条内就不可能出现接缝。
+    #[test]
+    fn fade_by_front_is_continuous_and_monotonic() {
+        let h = 96.0f32;
+        let mut prev = fade_by_front(0.0, h);
+        assert_eq!(prev, 1.0, "起淡点之前必须满亮");
+        let mut x = 0.0f32;
+        while x <= h * 1.2 {
+            let v = fade_by_front(x, h);
+            assert!(
+                v <= prev + 1e-4,
+                "渐隐系数必须随高度单调不增：front={x} 时 {v} > {prev}"
+            );
+            // 相邻取样（0.5px）之间的跳变不得超过 1/20，
+            // 否则以 60fps 推进时就等于「一跳变淡一大截」。
+            assert!(
+                (prev - v).abs() < 0.05,
+                "渐隐必须连续：front={x} 处一次跳变 {}",
+                (prev - v).abs()
+            );
+            prev = v;
+            x += h / 192.0;
+        }
+        assert_eq!(fade_by_front(h, h), 0.0, "到轨道顶必须刚好透明");
+        assert_eq!(fade_by_front(h * 1.2, h), 0.0, "越过轨道顶后保持透明");
+    }
+
+    /// 起淡点必须在轨道上半段：下半段满亮，短按的雨才是实心的一根。
+    #[test]
+    fn fade_starts_in_upper_half() {
+        let h = 100.0f32;
+        assert_eq!(fade_by_front(h * 0.5, h), 1.0, "轨道中段仍应满亮");
+        assert!(fade_by_front(h * 0.75, h) < 1.0, "越过一半后开始变淡");
+        assert!(fade_by_front(h * 0.75, h) > 0.0, "四分之三处还没淡光");
+    }
+
+    /// smoothstep 两端导数为 0：进入与离开渐隐带时都不能有折角。
+    #[test]
+    fn fade_has_no_kink_at_band_edges() {
+        let h = 96.0f32;
+        let band = fade_band_h(h);
+        let start = h - band;
+        let d = 0.01f32;
+        let at_start = (fade_by_front(start, h) - fade_by_front(start - d, h)) / d;
+        let at_end = (fade_by_front(h, h) - fade_by_front(h - d, h)) / d;
+        assert!(at_start.abs() < 1e-2, "起淡点斜率应≈0，实际 {at_start}");
+        assert!(at_end.abs() < 1e-2, "终点斜率应≈0，实际 {at_end}");
     }
 }
+

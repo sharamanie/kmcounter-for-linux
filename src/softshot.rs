@@ -2741,7 +2741,9 @@ mod tests {
         let s: &'static crate::lang::Strings = crate::lang::strings(crate::lang::Lang::En);
         let ppp = 2.0;
         ctx.set_pixels_per_point(ppp);
-        let (w, h) = (430.0_f32, 486.0_f32);
+        // 画布必须等于设置窗的真实内高（430x588）：分四组后内容变高，
+        // 仍按旧的 486 渲染会把底栏（打开主程序 / 显示悬浮窗 / 重置）整条截掉。
+        let (w, h) = (430.0_f32, 588.0_f32);
         let mut textures: HashMap<TextureId, Tex> = HashMap::new();
         let mut last = Vec::new();
         for _ in 0..4 {
