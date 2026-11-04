@@ -9,6 +9,50 @@ use super::*;
 /// 悬浮窗 / 其设置窗口（深色底）上的文字色：白色保证可读性（主面板浅色底仍用 `TEXT`）
 pub(crate) const HUD_TEXT: Color32 = Color32::WHITE;
 
+/// HUD 独立视口 → 主窗口的事件（视口回调里推入，主窗口恢复后 drain 处理）
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HudEvent {
+    /// 视口请求关闭（Alt+F4 / 合成器 close_requested）
+    Close,
+    /// 右键：打开本 HUD 自己的设置窗口（设置窗口挂在主视口下，需要叫回主窗口）
+    OpenSettings,
+}
+
+/// HUD 视口本帧看到的位置 / 显示器尺寸（位置记忆用；回调回写，主窗口读取）
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HudSeen {
+    pub pos: Option<(f32, f32)>,
+    pub monitor: Option<(f32, f32)>,
+}
+
+/// HUD 独立视口的共享数据。
+///
+/// 为什么需要它：HUD 用的是 **deferred 视口**（回调持久存储、视口自己渲染）。
+/// 主窗口最小化后 Wayland 不再给它发帧回调、主 update() 停摆，但 HUD 要照常渲染 ——
+/// 渲染所需的一切都得走这条共享通道：主窗口每帧刷新快照（cfg / 语言 / 日期），
+/// 实时统计本来就是 Arc；回调把事件与看到的位置回写，主窗口恢复后 drain。
+/// （旧实现用 immediate 视口：UI 闭包必须由父视口 update() 每次提供，
+/// 主窗口一最小化 HUD 就断粮冻结 —— 这就是「最小化后两个 HUD 都冻结」的根因。）
+#[derive(Clone)]
+pub(crate) struct HudShared {
+    /// 实时统计（按键 / 点击 / 距离 / KPS 跟踪器）
+    pub shared: Arc<Shared>,
+    /// 配置快照（只读；改动总在主窗口侧发生，恢复后自然同步回来）
+    pub cfg: Config,
+    /// 今天的日期键（统计查询用）
+    pub today: String,
+    /// 界面语言（HUD 上的文字）
+    pub lang: Lang,
+    /// HUD → 主窗口事件
+    pub events: Arc<parking_lot::Mutex<Vec<HudEvent>>>,
+    /// 本帧看到的位置 / 显示器尺寸（位置记忆用）
+    pub seen: Arc<parking_lot::Mutex<HudSeen>>,
+    /// 最近一次下发的窗口尺寸（避免每帧重复发 InnerSize）
+    pub last_size: Arc<parking_lot::Mutex<(f32, f32)>>,
+    /// 主窗口置顶标记（双击 / 右键叫回主窗口时沿用）
+    pub keep_on_top: bool,
+}
+
 impl App {
     #[allow(dead_code)]
     pub fn toggle_hud(&mut self, _ctx: &egui::Context) {
@@ -22,6 +66,7 @@ impl App {
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_apm_show = true;
         let _ = cfg.save(&self.cfg_path);
+        self.push_hud_state();
     }
 
     #[allow(dead_code)]
@@ -31,491 +76,717 @@ impl App {
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_apm_show = false;
         let _ = cfg.save(&self.cfg_path);
+        self.push_hud_state();
     }
 
     pub fn toggle_apm_hud(&mut self) {
         self.hud_apm_show = !self.hud_apm_show;
+        // 留痕：悬浮窗开关有 3 个入口（托盘 / 主面板按钮 / HUD 设置窗），出问题时能查是谁关的
+        log::info!("APM 悬浮窗 → {}", if self.hud_apm_show { "开" } else { "关" });
         self.cfg.hud_apm_show = self.hud_apm_show;
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_apm_show = self.hud_apm_show;
         let _ = cfg.save(&self.cfg_path);
         // 窗口关了：下次打开要重新恢复一次位置
         self.apm_pos = HudPosState::default();
+        // 托盘菜单的 ✔ 跟着走（托盘点击 / 主面板按钮 / 设置保存三个入口都在这里汇合）
+        self.push_hud_state();
     }
 
     pub fn toggle_kps_hud(&mut self) {
         self.hud_kps_show = !self.hud_kps_show;
+        log::info!("KPS 悬浮窗 → {}", if self.hud_kps_show { "开" } else { "关" });
         self.cfg.hud_kps_show = self.hud_kps_show;
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_kps_show = self.hud_kps_show;
         let _ = cfg.save(&self.cfg_path);
         // 窗口关了：下次打开要重新恢复一次位置
         self.kps_pos = HudPosState::default();
+        // 托盘菜单的 ✔ 跟着走
+        self.push_hud_state();
     }
 
-    pub(crate) fn show_apm_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
-        let (today_keys, today_clicks, today_dist_m) = {
-            let store = self.shared.store.lock();
-            if let Some(entry) = store.days.get(&self.snap_today) {
-                (entry.keystrokes, entry.mouse_clicks(), self.shared.px_to_meters(entry.mouse.move_px))
-            } else {
-                (0, 0, 0.0)
-            }
-        };
-        let apm_w = self.shared.apm_window_secs.load(Ordering::Relaxed);
-        let (cur_apm, peak_apm) = self.shared.apm.lock().get(&self.snap_today, apm_w);
+    /// 把 HUD 开关状态回推给托盘菜单（APM / KPS 两项的 ✔ 勾选）
+    pub(crate) fn push_hud_state(&self) {
+        if let Some(tx) = &self.tray_tx {
+            let _ = tx.send(crate::tray::TrayCmd::HudState {
+                apm: self.hud_apm_show,
+                kps: self.hud_kps_show,
+            });
+        }
+    }
 
-        let apm_color = if cur_apm >= 200 {
-            Color32::from_rgb(0xFF, 0x55, 0x55)
-        } else if cur_apm >= 100 {
-            Color32::from_rgb(0xF5, 0xA6, 0x23)
-        } else {
-            Color32::from_rgb(0x4E, 0xC9, 0xB0)
-        };
-
-        // 显示项与顺序都固定；「设置 → 显示」里可以关掉其中任意几项
-        let val = HUD_TEXT;
-        let mut items: Vec<(String, String, Color32)> = Vec::new();
-        if self.cfg.apm_show_keys {
-            items.push((
-                format!("⌨ {}", fmt_thousands(today_keys as f64)),
-                format!("{}: {}", s.keystrokes, today_keys),
-                val,
-            ));
+    pub(crate) fn show_apm_hud(&mut self, ctx: &egui::Context, _s: &'static Strings) {
+        // 先 drain 视口回传的事件（最小化期间堆积的也一并处理），可能把 hud_apm_show 关掉
+        self.drain_hud_events(ctx, true);
+        if !self.hud_apm_show {
+            return;
         }
-        if self.cfg.apm_show_clicks {
-            items.push((
-                format!("🖱 {}", fmt_thousands(today_clicks as f64)),
-                format!("{}: {}", s.mouse_clicks, today_clicks),
-                val,
-            ));
-        }
-        if self.cfg.apm_show_dist {
-            items.push((
-                format!("📏 {}", format_dist_m(today_dist_m)),
-                format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m),
-                val,
-            ));
-        }
-        items.push((
-            format!("⚡ {} APM", cur_apm),
-            format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm),
-            apm_color,
-        ));
 
         let vp_id = egui::ViewportId::from_hash_of("kmc_apm_hud");
-        // 宽度贴合内容：实测各项文字 + 分隔符 + 内边距，右侧不再空一大块；缩放作用在所有尺寸上。
-        // 尺寸变化时连 min/max 一起下发 —— 与 KPS 悬浮窗同一个坑：
-        // `with_resizable(false)` 会把 min==max 锁成初始尺寸，只发 InnerSize 会被挡住。
-        let sc = apm_hud_scale(&self.cfg);
-        let texts: Vec<String> = items.iter().map(|(t, _, _)| t.clone()).collect();
-        let want_size = (apm_hud_measure(ctx, &texts, sc), 32.0 * sc);
-        if self.apm_hud_size != want_size {
-            self.apm_hud_size = want_size;
-            let size = egui::vec2(want_size.0, want_size.1);
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::MinInnerSize(size));
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::MaxInnerSize(size));
-        }
-
-        // 本帧读到的窗口位置与显示器尺寸（位置记忆 / 限制在屏幕内用）。
-        // Wayland 下 winit 拿不到位置（None），KDE 由 KWin 监听脚本上报。
-        let mut seen_pos: Option<(f32, f32)> = None;
-        let mut monitor_size: Option<(f32, f32)> = None;
-
-        let mut close_requested = false;
-        let mut open_main_requested = false;
-        let mut open_settings_requested = false;
-
-        ctx.show_viewport_immediate(
+        let hs = HudShared {
+            shared: self.shared.clone(),
+            cfg: self.cfg.clone(),
+            today: self.snap_today.clone(),
+            lang: self.lang,
+            events: self.hud_apm_events.clone(),
+            seen: self.hud_apm_seen.clone(),
+            last_size: self.apm_hud_size.clone(),
+            keep_on_top: self.cfg.keep_on_top,
+        };
+        let size = self.apm_hud_initial_size();
+        // **deferred 视口**：回调持久存储、视口自己渲染 —— 主窗口最小化（update 停摆）后
+        // HUD 照常更新。immediate 视口只能由父视口驱动渲染，父窗口一最小化 HUD 就冻结（踩过）。
+        ctx.show_viewport_deferred(
             vp_id,
-            egui::ViewportBuilder::default()
-                .with_title("KMC - APM")
-                .with_inner_size([want_size.0, want_size.1])
-                .with_min_inner_size([want_size.0, want_size.1])
-                .with_max_inner_size([want_size.0, want_size.1])
-                .with_resizable(false)
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_transparent(true),
-            |hud_ctx, _class| {
-                if hud_ctx.input(|i| i.viewport().close_requested()) {
-                    close_requested = true;
-                    return;
-                }
-                hud_ctx.request_repaint_after(Duration::from_millis(200));
-                let vp = hud_ctx.input(|i| i.viewport().clone());
-                if let Some(r) = vp.outer_rect {
-                    seen_pos = Some((r.min.x, r.min.y));
-                }
-                if let Some(m) = vp.monitor_size {
-                    monitor_size = Some((m.x, m.y));
-                }
-
-                let bg_fill = hud_bg_color((24, 26, 34), self.cfg.apm_hud_opacity);
-                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(59, 66, 82, 220));
-
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(bg_fill)
-                            .inner_margin(egui::Margin::symmetric(8.0 * sc, 4.0 * sc))
-                            .stroke(border_stroke)
-                            .rounding(6.0),
-                    )
-                    .show(hud_ctx, |ui| {
-                        let full_rect = ui.max_rect();
-                        let bg_resp = ui.interact(full_rect, ui.id().with("apm_hud_drag"), Sense::click_and_drag());
-                        if bg_resp.drag_started() {
-                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if bg_resp.double_clicked() {
-                            open_main_requested = true;
-                        }
-                        // 右键 → 打开本悬浮窗自己的设置窗口（独立视口）。
-                        // 不要在 HUD 里弹右键菜单：菜单画在本窗口内，340×32 会把第二行起全裁掉（踩过）。
-                        if bg_resp.clicked_by(egui::PointerButton::Secondary) {
-                            open_settings_requested = true;
-                        }
-                        bg_resp.on_hover_text(s.hud_drag_hint);
-
-                        ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(6.0 * sc, 0.0);
-                            let dim = Color32::from_rgb(0x60, 0x68, 0x78);
-
-                            // 各项已在外层按当前显示开关备好（窗口宽度也是按它实测的）
-                            for (i, (text, tip, color)) in items.iter().enumerate() {
-                                if i > 0 {
-                                    ui.label(egui::RichText::new("·").size(12.0 * sc).color(dim));
-                                }
-                                ui.label(egui::RichText::new(text.clone()).strong().size(12.0 * sc).color(*color))
-                                    .on_hover_text(tip.clone());
-                            }
-                        });
-                    });
-            },
+            hud_viewport_builder("KMC - APM", size),
+            move |hud_ctx, _class| render_apm_hud(hud_ctx, &hs),
         );
 
-        // 位置三件事：恢复一次 → 限制在屏幕内 → 稳定后落盘（记忆）
-        self.tick_hud_pos(
-            ctx,
-            vp_id,
-            true,
-            seen_pos,
-            monitor_size,
-            want_size,
-            self.cfg.apm_keep_in_screen,
-        );
+        // 位置三件事：seen 由回调回写（KDE/Wayland 下 winit 拿不到位置，tick 内部会回退 KWin 上报）
+        let seen = *self.hud_apm_seen.lock();
+        let size = *self.apm_hud_size.lock();
+        let keep_in_screen = self.cfg.apm_keep_in_screen;
+        self.tick_hud_pos(ctx, vp_id, true, seen.pos, seen.monitor, size, keep_in_screen);
+    }
 
-        if close_requested {
-            self.toggle_apm_hud();
-        }
-        if open_main_requested {
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
-        }
-        if open_settings_requested {
-            self.apm_cfg_open = true; // 自己的设置窗口（见 show_apm_settings）
+    /// APM 悬浮窗的初始尺寸：上次实测的优先，没有就按缩放推一个。
+    fn apm_hud_initial_size(&self) -> (f32, f32) {
+        let init = *self.apm_hud_size.lock();
+        let sc0 = apm_hud_scale(&self.cfg);
+        if init.0 > 1.0 {
+            init
+        } else {
+            (360.0 * sc0, 32.0 * sc0)
         }
     }
 
-    /// KPS 悬浮窗：键格（每格显示**该键自己的 KPS**）+ 统计块 + KPS 图，三块可单独开关。
-    /// 缩放（`kps_scale`）作用在所有尺寸上；键格分行由键表里的换行决定（默认每行最多 12 个）。
-    /// KPS 悬浮窗：**上半区**键格（每格显示该键自己的 KPS）+ 右侧统计块，**下半区**整宽的 KPS 图。
-    /// 三块可单独开关；缩放作用在所有长度上；键格分行/空位/宽度倍数都写在键表里。
-    pub(crate) fn show_kps_hud(&mut self, ctx: &egui::Context, s: &'static Strings) {
-        let layout = self.cfg.kps_key_layout();
-        let keys_list = layout.names(); // 键名走布局解析：去掉宽度前缀 / 空位 / 换行
-        let kps_w = self.shared.kps_window_ms.load(Ordering::Relaxed);
-        let (cur_kps, peak_kps, avg_kps, method, key_infos, hist) = {
-            let mut kps = self.shared.kps.lock();
-            let (cur, peak) = kps.get(&self.snap_today, kps_w);
-            let infos = kps.query_keys(&keys_list, kps_w);
-            let method = kps.method();
-            let avg = if self.cfg.kps_show_avg { kps.avg() } else { 0.0 };
-            let now = Instant::now();
-            let hist: Vec<(f32, f32)> = kps
-                .history()
-                .iter()
-                .map(|(t, v)| (now.saturating_duration_since(*t).as_secs_f32(), *v as f32))
-                .collect();
-            (cur, peak, avg, method, infos, hist)
-        };
-        let m = kps_hud_metrics(&self.cfg, &layout);
-        let show_hits = self.cfg.kps_show_hits;
-        let show_key_kps = self.cfg.kps_show_key_kps;
-        let show_max = self.cfg.kps_show_max;
-        let show_avg = self.cfg.kps_show_avg;
-        let span_secs = self.cfg.kps_graph_secs.clamp(10, 300);
-        let graph_max = hist
-            .iter()
-            .filter(|(age, _)| *age <= span_secs as f32)
-            .map(|(_, v)| *v)
-            .fold(0.0f32, f32::max);
-
-        let kps_color = if cur_kps >= 15.0 {
-            Color32::from_rgb(0xFF, 0x47, 0x57)
-        } else if cur_kps >= 8.0 {
-            Color32::from_rgb(0xFF, 0xA5, 0x02)
+    /// 处理 HUD 独立视口回传的事件（主窗口最小化期间也可能堆积，恢复后第一帧处理）。
+    fn drain_hud_events(&mut self, ctx: &egui::Context, is_apm: bool) {
+        let queue = if is_apm {
+            self.hud_apm_events.clone()
         } else {
-            Color32::from_rgb(0x2E, 0xD5, 0x73)
+            self.hud_kps_events.clone()
         };
-        let vp_id = egui::ViewportId::from_hash_of("kmc_kps_hud");
-        // 尺寸变化时下发命令。**必须连 min/max 一起改**：`with_resizable(false)` 在 winit 里会把
-        // min==max 锁成初始尺寸，只发 InnerSize 会被这个约束挡住（"每行键数"改了窗口不长、第二行看不见）。
-        let want_size = (m.w, m.h);
-        if self.kps_hud_size != want_size {
-            self.kps_hud_size = want_size;
-            let size = egui::vec2(m.w, m.h);
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::MinInnerSize(size));
-            ctx.send_viewport_cmd_to(vp_id, egui::ViewportCommand::MaxInnerSize(size));
+        let events: Vec<HudEvent> = std::mem::take(&mut *queue.lock());
+        for ev in events {
+            match ev {
+                HudEvent::Close => self.on_hud_closed(is_apm),
+                HudEvent::OpenSettings => self.on_hud_open_settings(ctx, is_apm),
+            }
         }
+    }
 
-        // 本帧读到的窗口位置与显示器尺寸（位置记忆 / 限制在屏幕内用）
-        let mut seen_pos: Option<(f32, f32)> = None;
-        let mut monitor_size: Option<(f32, f32)> = None;
-
-        let mut close_requested = false;
-        let mut open_main_requested = false;
-        let mut open_settings_requested = false;
-
-        ctx.show_viewport_immediate(
-            vp_id,
-            egui::ViewportBuilder::default()
-                .with_title("KMC - KPS")
-                .with_inner_size([m.w, m.h])
-                // min/max 也显式给出（与 inner_size 相同 = 尺寸固定）：
-                // winit 在 Wayland 下非 resizable 的窗口会把 min==max 锁死，改尺寸必须连它俩一起动
-                .with_min_inner_size([m.w, m.h])
-                .with_max_inner_size([m.w, m.h])
-                .with_resizable(false)
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_transparent(true),
-            |hud_ctx, _class| {
-                if hud_ctx.input(|i| i.viewport().close_requested()) {
-                    close_requested = true;
-                    return;
-                }
-                hud_ctx.request_repaint_after(Duration::from_millis(40));
-                let vp = hud_ctx.input(|i| i.viewport().clone());
-                if let Some(r) = vp.outer_rect {
-                    seen_pos = Some((r.min.x, r.min.y));
-                }
-                if let Some(m) = vp.monitor_size {
-                    monitor_size = Some((m.x, m.y));
-                }
-
-                let bg_fill = hud_bg_color((16, 18, 24), self.cfg.kps_hud_opacity);
-                let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(60, 68, 86, 220));
-
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(bg_fill)
-                            .inner_margin(egui::Margin::symmetric(m.pad, m.pad))
-                            .stroke(border_stroke)
-                            .rounding(6.0),
-                    )
-                    .show(hud_ctx, |ui| {
-                        let content = ui.max_rect();
-                        let bg_resp = ui.interact(content, ui.id().with("kps_hud_drag"), Sense::click_and_drag());
-                        if bg_resp.drag_started() {
-                            hud_ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if bg_resp.double_clicked() {
-                            open_main_requested = true;
-                        }
-                        // 右键 → 打开本悬浮窗自己的设置窗口（独立视口，不会被窗口裁掉）
-                        if bg_resp.clicked_by(egui::PointerButton::Secondary) {
-                            open_settings_requested = true;
-                        }
-                        bg_resp.on_hover_text(s.hud_drag_hint);
-
-                        // ---- 上半区：键格（按布局分行 / 空位 / 宽度倍数；**每行缝隙等宽、左右对称**）----
-                        if self.cfg.kps_show_buttons {
-                            let row_pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
-                            let mut info_idx = 0usize;
-                            for (row, cells) in layout.rows.iter().enumerate() {
-                                for (cell_idx, cell) in cells.iter().enumerate() {
-                                    let Some(&(x_off, box_w)) = row_pos
-                                        .get(row)
-                                        .and_then(|r| r.get(cell_idx))
-                                    else {
-                                        break;
-                                    };
-                                    let rect = Rect::from_min_size(
-                                        Pos2::new(
-                                            content.left() + x_off,
-                                            content.top() + row as f32 * (m.box_h + m.gap),
-                                        ),
-                                        Vec2::new(box_w, m.box_h),
-                                    );
-                                    if cell.name.is_empty() {
-                                        continue; // 空位：占地方，不画不统计
-                                    }
-                                    let Some(k) = key_infos.get(info_idx) else { break };
-                                    info_idx += 1;
-                                    // 颜色对齐 osu-kps：heat（该键 KPS 的 2→4 插值）管边框色相，
-                                    // 降速时沿原路缓慢退回；**按住期间底板保持满亮**（长按点亮），
-                                    // 松开后由 glow 沿 50→250ms 曲线淡出
-                                    let press = if k.held { 1.0_f32 } else { k.glow };
-                                    let (box_bg, box_border, overlay) =
-                                        key_heat_style(crate::stats::kps_key_heat(k.kps), press);
-                                    ui.painter().rect(rect, 4.0, box_bg, box_border);
-                                    if let Some(ovl) = overlay {
-                                        ui.painter().rect_filled(rect, 4.0, ovl);
-                                    }
-                                    ui.painter().text(
-                                        Pos2::new(rect.center().x, rect.min.y + m.box_h * 0.28),
-                                        egui::Align2::CENTER_CENTER,
-                                        &k.name,
-                                        egui::FontId::proportional(m.font_key),
-                                        HUD_TEXT,
-                                    );
-                                    let sub = match (show_hits, show_key_kps) {
-                                        (true, true) => format!(
-                                            "{} · {}",
-                                            format_compact_num(k.hits),
-                                            fmt_kps(k.kps, method)
-                                        ),
-                                        (true, false) => format_compact_num(k.hits),
-                                        (false, true) => fmt_kps(k.kps, method),
-                                        (false, false) => String::new(),
-                                    };
-                                    if !sub.is_empty() {
-                                        ui.painter().text(
-                                            Pos2::new(rect.center().x, rect.max.y - m.box_h * 0.28),
-                                            egui::Align2::CENTER_CENTER,
-                                            sub,
-                                            egui::FontId::proportional(m.font_sub),
-                                            HUD_TEXT,
-                                        );
-                                    }
-                                    let resp =
-                                        ui.interact(rect, ui.id().with(("kps_key", info_idx - 1)), Sense::hover());
-                                    resp.on_hover_text(format!(
-                                        "{}: {} · {} {}",
-                                        k.name,
-                                        k.hits,
-                                        fmt_kps(k.kps, method),
-                                        s.kps_label
-                                    ));
-                                }
-                            }
-                        }
-
-                        // 缩放系数（度量里所有长度都按它算，这里用来算小间隙）
-                        let sc = m.pad / 6.0;
-                        let keys_h = if self.cfg.kps_show_buttons {
-                            m.rows as f32 * m.box_h + (m.rows as f32 - 1.0) * m.gap
-                        } else {
-                            0.0
-                        };
-
-                        // ---- 第二栏：数据行（当前 KPS · Max · 平均），画在图的**上方** ----
-                        if m.meter_w > 0.0 {
-                            let stats_cy = content.top()
-                                + keys_h
-                                + if keys_h > 0.0 { m.pad } else { 0.0 }
-                                + m.top_h * 0.5;
-                            // 文字按**实测宽度**依次排下去：KPS 到两位数、三位数都不会和标签挤在一起
-                            let mut x = content.left();
-                            x = text_advance(
-                                ui,
-                                x,
-                                stats_cy,
-                                fmt_kps(cur_kps, method),
-                                egui::FontId::proportional(m.font_cur),
-                                kps_color,
-                            );
-                            x += 4.0 * sc;
-                            x = text_advance(
-                                ui,
-                                x,
-                                stats_cy + m.font_cur * 0.14,
-                                s.kps_label.to_string(),
-                                egui::FontId::proportional(m.font_sub),
-                                HUD_TEXT,
-                            );
-                            if show_max {
-                                x += 16.0 * sc;
-                                x = text_advance(
-                                    ui,
-                                    x,
-                                    stats_cy + m.font_cur * 0.14,
-                                    format!("{}: {}", s.kps_max_label, fmt_kps(peak_kps, method)),
-                                    egui::FontId::proportional(m.font_sub),
-                                    HUD_TEXT,
-                                );
-                            }
-                            if show_avg {
-                                x += 16.0 * sc;
-                                let _ = text_advance(
-                                    ui,
-                                    x,
-                                    stats_cy + m.font_cur * 0.14,
-                                    format!("{}: {}", s.avg_label, fmt_kps(avg_kps, method)),
-                                    egui::FontId::proportional(m.font_sub),
-                                    HUD_TEXT,
-                                );
-                            }
-                        }
-
-                        // ---- 第三栏：整宽的 KPS 图 ----
-                        if m.graph_h > 0.0 {
-                            let graph_top = content.top()
-                                + keys_h
-                                + if keys_h > 0.0 { m.pad } else { 0.0 }
-                                + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 };
-                            let rect = Rect::from_min_max(
-                                Pos2::new(content.left(), graph_top),
-                                Pos2::new(content.right(), content.bottom()),
-                            );
-                            paint_kps_graph(
-                                ui,
-                                rect,
-                                &hist,
-                                cur_kps as f32,
-                                span_secs,
-                                avg_kps as f32,
-                                kps_color,
-                            );
-                            let resp = ui.interact(rect, ui.id().with("kps_graph"), Sense::hover());
-                            resp.on_hover_text(format!(
-                                "{}: {} {} / {} s",
-                                s.kps_max_label,
-                                fmt_kps(graph_max as f64, method),
-                                s.kps_label,
-                                span_secs
-                            ));
-                        }
-                    });
-            },
-        );
-
-        // 位置三件事：恢复一次 → 限制在屏幕内 → 稳定后落盘（记忆）
-        self.tick_hud_pos(
-            ctx,
-            vp_id,
-            false,
-            seen_pos,
-            monitor_size,
-            (m.w, m.h),
-            self.cfg.kps_keep_in_screen,
-        );
-
-        if close_requested {
+    /// 用户点了悬浮窗的关闭：退出流程里子视口也会收到关闭请求 —— 那不是"用户关了悬浮窗"，
+    /// 照着关会把开关写进配置，下次启动两个 HUD 就"自己消失"了。
+    fn on_hud_closed(&mut self, is_apm: bool) {
+        if self.exiting {
+            return;
+        }
+        if is_apm {
+            self.toggle_apm_hud();
+        } else {
             self.toggle_kps_hud();
         }
-        if open_main_requested {
-            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
+    }
+
+    /// 悬浮窗右键 → 打开对应的设置窗。
+    /// 设置窗口是主视口的子视口：主窗口的画循环在跑它才画得出来。
+    /// - Wayland：主窗口「收起」= 停放（仍 mapped，循环照跑）→ **不叫回主窗口**，
+    ///   右键只开设置窗（主人明确要求）；
+    /// - X11 / Windows：窗口是真隐藏，渲染循环停摆，设置窗压根画不出来 ——
+    ///   只能先把主窗口显示出来（这两个平台保持原行为）。
+    fn on_hud_open_settings(&mut self, ctx: &egui::Context, is_apm: bool) {
+        if is_apm {
+            self.apm_cfg_open = true;
+        } else {
+            self.kps_cfg_open = true;
         }
-        if open_settings_requested {
-            self.kps_cfg_open = true; // 自己的设置窗口（见 show_kps_settings）
+        if !is_wayland() {
+            show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
         }
     }
 
+    pub(crate) fn show_kps_hud(&mut self, ctx: &egui::Context, _s: &'static Strings) {
+        // 先 drain 视口回传的事件（最小化期间堆积的也一并处理），可能把 hud_kps_show 关掉
+        self.drain_hud_events(ctx, false);
+        if !self.hud_kps_show {
+            return;
+        }
+
+        let vp_id = egui::ViewportId::from_hash_of("kmc_kps_hud");
+        let layout = self.cfg.kps_key_layout();
+        let m = kps_hud_metrics(&self.cfg, &layout);
+        let hs = HudShared {
+            shared: self.shared.clone(),
+            cfg: self.cfg.clone(),
+            today: self.snap_today.clone(),
+            lang: self.lang,
+            events: self.hud_kps_events.clone(),
+            seen: self.hud_kps_seen.clone(),
+            last_size: self.kps_hud_size.clone(),
+            keep_on_top: self.cfg.keep_on_top,
+        };
+        // **deferred 视口**（原因见 APM：immediate 视口在主窗口最小化后断粮冻结）
+        ctx.show_viewport_deferred(
+            vp_id,
+            hud_viewport_builder("KMC - KPS", (m.w, m.h)),
+            move |hud_ctx, _class| render_kps_hud(hud_ctx, &hs),
+        );
+
+        // 位置三件事：seen 由回调回写
+        let seen = *self.hud_kps_seen.lock();
+        let size = *self.kps_hud_size.lock();
+        let keep_in_screen = self.cfg.kps_keep_in_screen;
+        self.tick_hud_pos(ctx, vp_id, false, seen.pos, seen.monitor, size, keep_in_screen);
+    }
+}
+
+/// KPS 悬浮窗的实际渲染（deferred 视口回调；主窗口最小化时也照常被调用）。
+fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
+    log_hud_alive("KPS");
+    let s = strings(hs.lang);
+    let cfg = &hs.cfg;
+    let layout = cfg.kps_key_layout();
+    let keys_list = layout.names(); // 键名走布局解析：去掉宽度前缀 / 空位 / 换行
+    let kps_w = hs.shared.kps_window_ms.load(Ordering::Relaxed);
+    let m = kps_hud_metrics(cfg, &layout);
+    let kd = kps_hud_data(hs, cfg, &keys_list, kps_w);
+
+    // 尺寸变化时下发命令。**必须连 min/max 一起改**：with_resizable(false) 在 winit 里会把
+    // min==max 锁成初始尺寸，只发 InnerSize 会被这个约束挡住（"每行键数"改了窗口不长、第二行看不见）。
+    hud_apply_size(ctx, &hs.last_size, (m.w, m.h));
+
+    // 本帧看到的位置 / 显示器尺寸（回写给主窗口：位置记忆 / 限制在屏幕内用）
+    hud_report_seen(ctx, &hs.seen);
+
+    if hud_close_requested(ctx, &hs.events) {
+        return;
+    }
+    ctx.request_repaint_after(Duration::from_millis(40));
+
+    let bg_fill = hud_bg_color((16, 18, 24), cfg.kps_hud_opacity);
+    let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(60, 68, 86, 220));
+
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(bg_fill)
+                .inner_margin(egui::Margin::symmetric(m.pad, m.pad))
+                .stroke(border_stroke)
+                .rounding(6.0),
+        )
+        .show(ctx, |ui| {
+            let content = ui.max_rect();
+            hud_background_gestures(ui, ctx, content, hs, "kps_hud_drag", s.hud_drag_hint);
+
+            // ---- 上半区：键格（按布局分行 / 空位 / 宽度倍数；**每行缝隙等宽、左右对称**）----
+            if cfg.kps_show_buttons {
+                paint_kps_key_cells(ui, content, &layout, &m, &kd, cfg, s);
+            }
+
+            // 缩放系数（度量里所有长度都按它算，这里用来算小间隙）
+            let sc = m.pad / 6.0;
+            let keys_h = if cfg.kps_show_buttons {
+                m.rows as f32 * m.box_h + (m.rows as f32 - 1.0) * m.gap
+            } else {
+                0.0
+            };
+
+            // ---- 第二栏：数据行（当前 KPS · Max · 平均），画在图的**上方** ----
+            if m.meter_w > 0.0 {
+                paint_kps_meter(ui, content, &m, &kd, cfg, s, sc, keys_h);
+            }
+
+            // ---- 第三栏：整宽的 KPS 图 ----
+            if m.graph_h > 0.0 {
+                paint_kps_graph_area(ui, content, &m, &kd, hs, s, keys_h, cfg.kps_graph_secs);
+            }
+        });
+}
+
+/// KPS 悬浮窗每帧要读的一次性数据（当前 / 峰值 / 平均 / 算法 + 每个键格的实时信息）。
+struct KpsHudData {
+    cur_kps: f64,
+    peak_kps: f64,
+    avg_kps: f64,
+    method: crate::stats::KpsMethod,
+    key_infos: Vec<crate::stats::KpsKeyInfo>,
+    color: Color32,
+}
+
+/// 取当前 KPS 数据并算好强调色（≥15 红 / ≥8 橙 / 其余绿）。
+fn kps_hud_data(hs: &HudShared, cfg: &Config, keys_list: &[String], kps_w: u32) -> KpsHudData {
+    let (cur_kps, peak_kps, avg_kps, method, key_infos) = {
+        let mut kps = hs.shared.kps.lock();
+        let (cur, peak) = kps.get(&hs.today, kps_w);
+        let infos = kps.query_keys(keys_list, kps_w);
+        let method = kps.method();
+        let avg = if cfg.kps_show_avg { kps.avg() } else { 0.0 };
+        // KPS 图：过去 300 秒、每秒一格（网格对齐整秒，值从按键记录反推 —— 见 stats::history_series）。
+        // 数据每整秒才变一次，所以柱子是"一格一格往左跳"，同一节奏下高度稳定。
+        (cur, peak, avg, method, infos)
+    };
+    let color = if cur_kps >= 15.0 {
+        Color32::from_rgb(0xFF, 0x47, 0x57)
+    } else if cur_kps >= 8.0 {
+        Color32::from_rgb(0xFF, 0xA5, 0x02)
+    } else {
+        Color32::from_rgb(0x2E, 0xD5, 0x73)
+    };
+    KpsHudData {
+        cur_kps,
+        peak_kps,
+        avg_kps,
+        method,
+        key_infos,
+        color,
+    }
+}
+
+fn paint_kps_key_cells(
+    ui: &mut egui::Ui,
+    content: Rect,
+    layout: &crate::config::KpsKeyLayout,
+    m: &KpsHudMetrics,
+    kd: &KpsHudData,
+    cfg: &Config,
+    s: &'static Strings,
+) {
+    let row_pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
+    let mut info_idx = 0usize;
+    for (row, cells) in layout.rows.iter().enumerate() {
+        for (cell_idx, cell) in cells.iter().enumerate() {
+            let Some(&(x_off, box_w)) = row_pos.get(row).and_then(|r| r.get(cell_idx)) else {
+                break;
+            };
+            let rect = Rect::from_min_size(
+                Pos2::new(
+                    content.left() + x_off,
+                    content.top() + row as f32 * (m.box_h + m.gap),
+                ),
+                Vec2::new(box_w, m.box_h),
+            );
+            if cell.name.is_empty() {
+                continue; // 空位：占地方，不画不统计
+            }
+            let Some(k) = kd.key_infos.get(info_idx) else {
+                break;
+            };
+            info_idx += 1;
+            paint_kps_key_cell(ui, rect, m, kd, k, cfg, s, info_idx - 1);
+        }
+    }
+}
+
+/// 单个键格：热力底色 + 键名 + 副标题（次数 / 该键 KPS）+ 悬停提示。
+#[allow(clippy::too_many_arguments)]
+fn paint_kps_key_cell(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    m: &KpsHudMetrics,
+    kd: &KpsHudData,
+    k: &crate::stats::KpsKeyInfo,
+    cfg: &Config,
+    s: &'static Strings,
+    idx: usize,
+) {
+    // 颜色对齐 osu-kps：heat（该键 KPS 的 2→4 插值）管边框色相，
+    // 降速时沿原路缓慢退回；按住期间底板保持满亮（长按点亮），
+    // 松开后由 glow 沿 50→250ms 曲线淡出
+    let press = if k.held { 1.0_f32 } else { k.glow };
+    let (box_bg, box_border, overlay) = key_heat_style(crate::stats::kps_key_heat(k.kps), press);
+    ui.painter().rect(rect, 4.0, box_bg, box_border);
+    if let Some(ovl) = overlay {
+        ui.painter().rect_filled(rect, 4.0, ovl);
+    }
+    ui.painter().text(
+        Pos2::new(rect.center().x, rect.min.y + m.box_h * 0.28),
+        egui::Align2::CENTER_CENTER,
+        &k.name,
+        egui::FontId::proportional(m.font_key),
+        HUD_TEXT,
+    );
+    let sub = kps_key_sub_text(k, cfg, kd.method);
+    if !sub.is_empty() {
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.max.y - m.box_h * 0.28),
+            egui::Align2::CENTER_CENTER,
+            sub,
+            egui::FontId::proportional(m.font_sub),
+            HUD_TEXT,
+        );
+    }
+    let resp = ui.interact(rect, ui.id().with(("kps_key", idx)), Sense::hover());
+    resp.on_hover_text(format!(
+        "{}: {} · {} {}",
+        k.name,
+        k.hits,
+        fmt_kps(k.kps, kd.method),
+        s.kps_label
+    ));
+}
+
+/// HUD 设置窗里的一个深底白字复选框：改了就把动作位标脏。
+fn hud_check(ui: &mut egui::Ui, value: &mut bool, label: &'static str, act: &mut HudCfgActions) {
+    if ui
+        .checkbox(value, egui::RichText::new(label).color(HUD_TEXT))
+        .changed()
+    {
+        act.dirty = true;
+    }
+}
+
+/// KPS 算法的显示名。
+fn kps_method_label(m: crate::stats::KpsMethod, s: &'static Strings) -> &'static str {
+    match m {
+        crate::stats::KpsMethod::Hard => s.kps_method_hard,
+        crate::stats::KpsMethod::Sensitive => s.kps_method_sensitive,
+    }
+}
+
+/// KPS 算法的说明文字（悬停提示）。
+fn kps_method_hint(m: crate::stats::KpsMethod, s: &'static Strings) -> &'static str {
+    match m {
+        crate::stats::KpsMethod::Hard => s.kps_method_hard_hint,
+        crate::stats::KpsMethod::Sensitive => s.kps_method_sensitive_hint,
+    }
+}
+
+/// 键格下方的小字：次数与当前 KPS，按设置里的两个开关组合。
+fn kps_key_sub_text(k: &crate::stats::KpsKeyInfo, cfg: &Config, method: crate::stats::KpsMethod) -> String {
+    match (cfg.kps_show_hits, cfg.kps_show_key_kps) {
+        (true, true) => format!("{} · {}", format_compact_num(k.hits), fmt_kps(k.kps, method)),
+        (true, false) => format_compact_num(k.hits),
+        (false, true) => fmt_kps(k.kps, method),
+        (false, false) => String::new(),
+    }
+}
+
+/// 数据行：当前 KPS · Max · 平均，按实测宽度依次排下去。
+#[allow(clippy::too_many_arguments)]
+fn paint_kps_meter(
+    ui: &mut egui::Ui,
+    content: Rect,
+    m: &KpsHudMetrics,
+    kd: &KpsHudData,
+    cfg: &Config,
+    s: &'static Strings,
+    sc: f32,
+    keys_h: f32,
+) {
+    let stats_cy = content.top()
+        + keys_h
+        + if keys_h > 0.0 { m.pad } else { 0.0 }
+        + m.top_h * 0.5;
+    // 文字按**实测宽度**依次排下去：KPS 到两位数、三位数都不会和标签挤在一起
+    let mut x = content.left();
+    x = text_advance(
+        ui,
+        x,
+        stats_cy,
+        fmt_kps(kd.cur_kps, kd.method),
+        egui::FontId::proportional(m.font_cur),
+        kd.color,
+    );
+    x += 4.0 * sc;
+    x = text_advance(
+        ui,
+        x,
+        stats_cy + m.font_cur * 0.14,
+        s.kps_label.to_string(),
+        egui::FontId::proportional(m.font_sub),
+        HUD_TEXT,
+    );
+    if cfg.kps_show_max {
+        x += 16.0 * sc;
+        x = text_advance(
+            ui,
+            x,
+            stats_cy + m.font_cur * 0.14,
+            format!("{}: {}", s.kps_max_label, fmt_kps(kd.peak_kps, kd.method)),
+            egui::FontId::proportional(m.font_sub),
+            HUD_TEXT,
+        );
+    }
+    if cfg.kps_show_avg {
+        x += 16.0 * sc;
+        let _ = text_advance(
+            ui,
+            x,
+            stats_cy + m.font_cur * 0.14,
+            format!("{}: {}", s.avg_label, fmt_kps(kd.avg_kps, kd.method)),
+            egui::FontId::proportional(m.font_sub),
+            HUD_TEXT,
+        );
+    }
+}
+
+/// 下半区：整宽 KPS 图（柱数按实际像素宽推，每根柱 = 一个时间片的平均 KPS）。
+fn paint_kps_graph_area(
+    ui: &mut egui::Ui,
+    content: Rect,
+    m: &KpsHudMetrics,
+    kd: &KpsHudData,
+    hs: &HudShared,
+    s: &'static Strings,
+    keys_h: f32,
+    graph_secs: u32,
+) {
+    let span_secs = graph_secs.clamp(10, 300);
+    let graph_top = content.top()
+        + keys_h
+        + if keys_h > 0.0 { m.pad } else { 0.0 }
+        + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 };
+    let rect = Rect::from_min_max(
+        Pos2::new(content.left(), graph_top),
+        Pos2::new(content.right(), content.bottom()),
+    );
+    // 柱数由图的实际像素宽决定（柱宽固定 GRAPH_BAR_W 像素），
+    // 每根柱 = 时间片（时长/柱数 秒）内的平均 KPS —— 片内图形完全静止
+    let mut kps_g = hs.shared.kps.lock();
+    let bars = ((rect.width() / GRAPH_BAR_W).floor() as usize).max(1);
+    let hist: Vec<f32> = kps_g
+        .history_bars(Instant::now(), span_secs, bars)
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
+    let graph_max = hist.iter().copied().fold(0.0f32, f32::max);
+    paint_kps_graph(ui, rect, &hist, kd.avg_kps as f32, kd.color);
+    let resp = ui.interact(rect, ui.id().with("kps_graph"), Sense::hover());
+    resp.on_hover_text(format!(
+        "{}: {} {} / {} s",
+        s.kps_max_label,
+        fmt_kps(graph_max as f64, kd.method),
+        s.kps_label,
+        span_secs
+    ));
+}
+/// 尺寸变化时连 min/max 一起下发（with_resizable(false) 会把 min==max 锁成初始尺寸，
+/// 只发 InnerSize 会被这个约束挡住 —— 改「每行键数」后窗口不长、第二行看不见，踩过两次）。
+fn hud_apply_size(
+    ctx: &egui::Context,
+    last: &Arc<parking_lot::Mutex<(f32, f32)>>,
+    want: (f32, f32),
+) {
+    let mut last = last.lock();
+    if *last != want {
+        *last = want;
+        let size = egui::vec2(want.0, want.1);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+    }
+}
+
+/// 把本帧看到的位置 / 显示器尺寸回写给主窗口（位置记忆 / 限制在屏幕内用）。
+fn hud_report_seen(ctx: &egui::Context, slot: &Arc<parking_lot::Mutex<HudSeen>>) {
+    let vp = ctx.input(|i| i.viewport().clone());
+    let mut seen = slot.lock();
+    seen.pos = vp.outer_rect.map(|r| (r.min.x, r.min.y));
+    seen.monitor = vp.monitor_size.map(|mm| (mm.x, mm.y));
+}
+
+/// 用户关掉了悬浮窗：推事件给主窗口去改开关（这里自己不退出）。
+fn hud_close_requested(
+    ctx: &egui::Context,
+    events: &Arc<parking_lot::Mutex<Vec<HudEvent>>>,
+) -> bool {
+    if ctx.input(|i| i.viewport().close_requested()) {
+        events.lock().push(HudEvent::Close);
+        return true;
+    }
+    false
+}
+
+/// 悬浮窗底板的三个手势：拖动 → 移动窗口；双击 → 叫回主窗口；右键 → 打开本窗的设置。
+/// 走 window 模块的 HUD 专用路径：egui 命令显式发给 ROOT 视口，并且**解除停放**
+/// （只「取消最小化」的话窗口还是全透明 32px，看着像没反应）。
+/// 右键只推事件：要不要顺带叫回主窗口由 drain_hud_events 按平台决定
+/// （Wayland 下不叫 —— 主人要求右键只开设置窗）。
+/// 不要在 HUD 里弹右键菜单：菜单画在本窗口内，340×32 会把第二行起全裁掉（踩过）。
+fn hud_background_gestures(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    rect: Rect,
+    hs: &HudShared,
+    drag_id: &'static str,
+    hint: &'static str,
+) {
+    let resp = ui.interact(rect, ui.id().with(drag_id), Sense::click_and_drag());
+    if resp.drag_started() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if resp.double_clicked() {
+        show_window_from_hud(&hs.shared, ctx, hs.keep_on_top);
+    }
+    if resp.clicked_by(egui::PointerButton::Secondary) {
+        hs.events.lock().push(HudEvent::OpenSettings);
+    }
+    resp.on_hover_text(hint);
+}
+
+/// 悬浮窗视口：无边框、透明、置顶、尺寸锁死。
+/// min/max 也显式给出（与 inner_size 相同 = 尺寸固定）：
+/// winit 在 Wayland 下非 resizable 的窗口会把 min==max 锁死，改尺寸必须连它俩一起动。
+fn hud_viewport_builder(title: &str, size: (f32, f32)) -> egui::ViewportBuilder {
+    let (w, h) = size;
+    egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size([w, h])
+        .with_min_inner_size([w, h])
+        .with_max_inner_size([w, h])
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_transparent(true)
+}
+
+/// 诊断心跳：每 5 秒一条，证明 HUD 视口在**自己**渲染（主窗口收起后是否还在更新，
+/// 看日志里这两行是否继续增长即可）。
+///
+/// 默认 debug 级（否则一个后台工具每 5 秒刷两行日志，一天几万行）；
+/// 排查时用 `RUST_LOG=kmcounter=debug` 打开：
+/// `RUST_LOG=kmcounter=debug ./kmcounter 2>&1 | grep 'HUD 心跳'`
+fn log_hud_alive(which: &'static str) {
+    static AT_APM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static AT_KPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let slot = if which == "APM" { &AT_APM } else { &AT_KPS };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // 注意：只有真的打印了才更新时间戳 —— 每帧都刷新的话差值永远是一帧的间隔
+    let prev = slot.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) >= 5000 {
+        slot.store(now_ms, Ordering::Relaxed);
+        log::debug!("HUD 心跳（{which}）：视口仍在自行渲染");
+    }
+}
+
+/// APM 悬浮窗的实际渲染（deferred 视口回调；主窗口最小化时也照常被调用）。
+fn render_apm_hud(ctx: &egui::Context, hs: &HudShared) {
+    log_hud_alive("APM");
+    let s = strings(hs.lang);
+    let cfg = &hs.cfg;
+    let ad = apm_hud_data(ctx, hs, cfg, s);
+
+    // 宽度贴合内容：实测各项文字 + 分隔符 + 内边距，右侧不再空一大块；缩放作用在所有尺寸上。
+    hud_apply_size(ctx, &hs.last_size, ad.want_size);
+
+    // 本帧看到的位置 / 显示器尺寸（回写给主窗口：位置记忆 / 限制在屏幕内用）
+    hud_report_seen(ctx, &hs.seen);
+
+    if hud_close_requested(ctx, &hs.events) {
+        return;
+    }
+    ctx.request_repaint_after(Duration::from_millis(200));
+
+    let sc = ad.scale;
+    let bg_fill = hud_bg_color((24, 26, 34), cfg.apm_hud_opacity);
+    let border_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(59, 66, 82, 220));
+
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(bg_fill)
+                .inner_margin(egui::Margin::symmetric(8.0 * sc, 4.0 * sc))
+                .stroke(border_stroke)
+                .rounding(6.0),
+        )
+        .show(ctx, |ui| {
+            let full_rect = ui.max_rect();
+            hud_background_gestures(ui, ctx, full_rect, hs, "apm_hud_drag", s.hud_drag_hint);
+
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0 * sc, 0.0);
+                let dim = Color32::from_rgb(0x60, 0x68, 0x78);
+
+                // 各项已在外层按当前显示开关备好（窗口宽度也是按它实测的）
+                for (i, (text, tip, color)) in ad.items.iter().enumerate() {
+                    if i > 0 {
+                        ui.label(egui::RichText::new("·").size(12.0 * sc).color(dim));
+                    }
+                    ui.label(egui::RichText::new(text.clone()).strong().size(12.0 * sc).color(*color))
+                        .on_hover_text(tip.clone());
+                }
+            });
+        });
+}
+
+/// APM 悬浮窗每帧要算好的一组数据：显示项、强调色、缩放与贴合内容的目标尺寸。
+struct ApmHudData {
+    items: Vec<(String, String, Color32)>,
+    scale: f32,
+    want_size: (f32, f32),
+}
+
+/// 采集今日按键 / 点击 / 距离 + 当前与峰值 APM，拼出要显示的项并实测窗口宽度。
+fn apm_hud_data(
+    ctx: &egui::Context,
+    hs: &HudShared,
+    cfg: &Config,
+    s: &'static Strings,
+) -> ApmHudData {
+    let (today_keys, today_clicks, today_dist_m) = {
+        let store = hs.shared.store.lock();
+        if let Some(entry) = store.days.get(&hs.today) {
+            (entry.keystrokes, entry.mouse_clicks(), hs.shared.px_to_meters(entry.mouse.move_px))
+        } else {
+            (0, 0, 0.0)
+        }
+    };
+    let apm_w = hs.shared.apm_window_secs.load(Ordering::Relaxed);
+    let (cur_apm, peak_apm) = hs.shared.apm.lock().get(&hs.today, apm_w);
+
+    let apm_color = if cur_apm >= 200 {
+        Color32::from_rgb(0xFF, 0x55, 0x55)
+    } else if cur_apm >= 100 {
+        Color32::from_rgb(0xF5, 0xA6, 0x23)
+    } else {
+        Color32::from_rgb(0x4E, 0xC9, 0xB0)
+    };
+
+    // 显示项与顺序都固定；「设置 → 显示」里可以关掉其中任意几项
+    let val = HUD_TEXT;
+    let mut items: Vec<(String, String, Color32)> = Vec::new();
+    if cfg.apm_show_keys {
+        items.push((
+            format!("⌨ {}", fmt_thousands(today_keys as f64)),
+            format!("{}: {}", s.keystrokes, today_keys),
+            val,
+        ));
+    }
+    if cfg.apm_show_clicks {
+        items.push((
+            format!("🖱 {}", fmt_thousands(today_clicks as f64)),
+            format!("{}: {}", s.mouse_clicks, today_clicks),
+            val,
+        ));
+    }
+    if cfg.apm_show_dist {
+        items.push((
+            format!("📏 {}", format_dist_m(today_dist_m)),
+            format!("{}: {:.2} {}", s.mouse_move, today_dist_m, s.unit_m),
+            val,
+        ));
+    }
+    items.push((
+        format!("⚡ {} APM", cur_apm),
+        format!("{}: {} | {}: {}", s.apm_label, cur_apm, s.apm_peak_label, peak_apm),
+        apm_color,
+    ));
+
+    let sc = apm_hud_scale(cfg);
+    let texts: Vec<String> = items.iter().map(|(t, _, _)| t.clone()).collect();
+    ApmHudData {
+        items,
+        scale: sc,
+        want_size: (apm_hud_measure(ctx, &texts, sc), 32.0 * sc),
+    }
+}
+
+impl App {
     /// 进入「设置键位」捕获：清空缓冲、打开开关（输入线程会把按下的键按顺序记进来）
     fn start_kps_capture(&mut self) {
         self.shared.kps_capture_buf.lock().clear();
@@ -550,67 +821,127 @@ impl App {
     ) {
         let idx = if is_apm { 0 } else { 1 };
         let saved = if is_apm { self.cfg.apm_hud_pos } else { self.cfg.kps_hud_pos };
+        // KDE/Wayland：KWin 脚本上报的位置（带"是不是用户拖的"标记）；其他平台 None
+        let report = kde_hud_pos(idx);
 
-        let mut save_now: Option<(f32, f32)> = None;
+        // ① 恢复：头三帧都发，刚建好的窗口可能吞掉第一份命令
+        self.restore_hud_pos(ctx, vp_id, is_apm, saved, seen);
+
+        // 平台拿不到位置时，看 KWin 脚本有没有上报（KDE / Wayland）
+        let cur = match (seen, report) {
+            (Some(p), _) => p,
+            (None, Some((x, y, _))) => (x, y),
+            (None, None) => return,
+        };
+        // 当前位置能不能当成「用户的选择」：
+        // - winit 能读位置的平台（X11 / Windows）：能 —— 后面靠「稳定 1.2s」判定；
+        // - KDE / Wayland：只有用户真的拖动过才算。合成器在窗口刚出现时的自动
+        //   摆放也会被脚本上报，照单全收的话，哪次没恢复上就把错位沉淀成新记忆
+        //   （实测：反复重启会让 HUD 位置越走越远，主人的 KPS 就这么被推走了好几次）。
+        let user_position = seen.is_some() || report.map_or(false, |(_, _, moved)| moved);
+
+        // ② 限制在屏幕内（只管 winit 能设位置的平台；KDE 的夹取在 KWin 脚本里做）
+        if seen.is_some()
+            && self.clamp_hud_to_monitor(ctx, vp_id, is_apm, cur, monitor, size, keep_in_screen)
         {
-            let st = if is_apm { &mut self.apm_pos } else { &mut self.kps_pos };
-
-            // ① 恢复（头三帧都发：刚建好的窗口可能吞掉第一份命令）
-            if st.restored < 3 {
-                if let Some(p) = saved {
-                    if seen.map_or(true, |cur| pos_dist(cur, p) > 1.0) {
-                        ctx.send_viewport_cmd_to(
-                            vp_id,
-                            egui::ViewportCommand::OuterPosition(egui::pos2(p.0, p.1)),
-                        );
-                    }
-                }
-                st.restored += 1;
-            }
-
-            // 平台拿不到位置时，看 KWin 脚本有没有上报（KDE / Wayland）
-            let cur = seen.or_else(|| kde_hud_pos(idx));
-            let Some(cur) = cur else { return };
-
-            // ② 限制在屏幕内（只管 winit 能设位置的平台；KDE 的夹取在 KWin 脚本里做）
-            if keep_in_screen && seen.is_some() {
-                if let Some(mon) = monitor {
-                    let clamped = clamp_hud_pos(cur, size, mon);
-                    if pos_dist(clamped, cur) > 0.5 {
-                        ctx.send_viewport_cmd_to(
-                            vp_id,
-                            egui::ViewportCommand::OuterPosition(egui::pos2(clamped.0, clamped.1)),
-                        );
-                        st.pending = None; // 正在被我们修正，中间态不落盘
-                        return;
-                    }
-                }
-            }
-
-            // ③ 记忆：与记忆不同 → 等它安静约 1.2s → 过了启动安静期 → 落盘
-            if saved.map_or(true, |p| pos_dist(p, cur) > 0.5) {
-                let first_seen = match st.pending {
-                    Some((p, t)) if pos_dist(p, cur) <= 0.5 => t,
-                    _ => {
-                        let now = Instant::now();
-                        st.pending = Some((cur, now));
-                        now
-                    }
-                };
-                let now = Instant::now();
-                if now.duration_since(first_seen).as_secs_f32() > 1.2
-                    && now >= self.hud_pos_grace_until
-                {
-                    st.pending = None;
-                    save_now = Some(cur);
-                }
-            } else {
-                st.pending = None;
-            }
+            return;
         }
-        if let Some(p) = save_now {
+
+        // ③ 记忆：与记忆不同 → 等它安静约 1.2s → 过了启动安静期 → 落盘
+        if let Some(p) = self.settle_hud_pos(is_apm, cur, saved, user_position) {
+            // 落盘时把来源一并写进日志：位置记忆一旦被「非用户选择」污染就会越走越歪，
+            // 出问题时这行日志能直接指出是 winit 读到的位置还是 KWin 脚本上报的
+            log::info!(
+                "HUD 位置落盘：{} = {p:?}（winit 位置={seen:?} / KWin 上报={report:?}）",
+                if is_apm { "APM" } else { "KPS" }
+            );
             self.save_hud_pos(is_apm, p);
         }
+    }
+
+    /// ① 恢复上次的位置。头三帧都发：刚建好的窗口可能吞掉第一份命令。
+    fn restore_hud_pos(
+        &mut self,
+        ctx: &egui::Context,
+        vp_id: egui::ViewportId,
+        is_apm: bool,
+        saved: Option<(f32, f32)>,
+        seen: Option<(f32, f32)>,
+    ) {
+        let st = if is_apm { &mut self.apm_pos } else { &mut self.kps_pos };
+        if st.restored >= 3 {
+            return;
+        }
+        if let Some(p) = saved {
+            if seen.map_or(true, |cur| pos_dist(cur, p) > 1.0) {
+                ctx.send_viewport_cmd_to(
+                    vp_id,
+                    egui::ViewportCommand::OuterPosition(egui::pos2(p.0, p.1)),
+                );
+            }
+        }
+        st.restored += 1;
+    }
+
+    /// ② 限制在屏幕内。返回 true 表示这帧已经下发了修正命令，调用方应直接返回
+    ///（中间态不落盘）。只在 winit 能设位置的平台走这里，KDE 的夹取在 KWin 脚本里做。
+    #[allow(clippy::too_many_arguments)]
+    fn clamp_hud_to_monitor(
+        &mut self,
+        ctx: &egui::Context,
+        vp_id: egui::ViewportId,
+        is_apm: bool,
+        cur: (f32, f32),
+        monitor: Option<(f32, f32)>,
+        size: (f32, f32),
+        keep_in_screen: bool,
+    ) -> bool {
+        if !keep_in_screen {
+            return false;
+        }
+        let Some(mon) = monitor else { return false };
+        let clamped = clamp_hud_pos(cur, size, mon);
+        if pos_dist(clamped, cur) <= 0.5 {
+            return false;
+        }
+        ctx.send_viewport_cmd_to(
+            vp_id,
+            egui::ViewportCommand::OuterPosition(egui::pos2(clamped.0, clamped.1)),
+        );
+        let st = if is_apm { &mut self.apm_pos } else { &mut self.kps_pos };
+        st.pending = None; // 正在被我们修正，中间态不落盘
+        true
+    }
+
+    /// ③ 记忆：与记忆不同 → 等它安静约 1.2s → 过了启动安静期 → 返回要落盘的位置。
+    /// user_position 为假 = 这个位置是合成器摆的，绝不动记忆。
+    fn settle_hud_pos(
+        &mut self,
+        is_apm: bool,
+        cur: (f32, f32),
+        saved: Option<(f32, f32)>,
+        user_position: bool,
+    ) -> Option<(f32, f32)> {
+        let grace_until = self.hud_pos_grace_until;
+        let st = if is_apm { &mut self.apm_pos } else { &mut self.kps_pos };
+        if !(user_position && saved.map_or(true, |p| pos_dist(p, cur) > 0.5)) {
+            st.pending = None;
+            return None;
+        }
+        let first_seen = match st.pending {
+            Some((p, t)) if pos_dist(p, cur) <= 0.5 => t,
+            _ => {
+                let now = Instant::now();
+                st.pending = Some((cur, now));
+                now
+            }
+        };
+        let now = Instant::now();
+        if now.duration_since(first_seen).as_secs_f32() > 1.2 && now >= grace_until {
+            st.pending = None;
+            return Some(cur);
+        }
+        None
     }
 
     /// 记忆位置落盘（防抖后调用）：写自己的配置与共享配置；
@@ -629,49 +960,8 @@ impl App {
             cfg.kps_hud_pos = Some(pos);
         }
         let _ = cfg.save(&self.cfg_path);
-    }
-
-    /// 悬浮窗设置改动后：同步到共享状态（原子量 / KPS 跟踪器）并落盘。
-    /// 只改自己关心的字段、不整份覆盖 —— 托盘可能刚改过别的设置（例如开机启动）。
-    fn apply_hud_cfg(&mut self) {
-        self.shared.apm_window_secs.store(self.cfg.apm_window_secs, Ordering::Relaxed);
-        self.shared.kps_window_ms.store(self.cfg.kps_window_ms, Ordering::Relaxed);
-        {
-            let mut kps = self.shared.kps.lock();
-            kps.set_monitored(&self.cfg.kps_key_layout().names());
-            kps.set_method(crate::stats::KpsMethod::from_config(&self.cfg.kps_method));
-        }
-        copy_hud_fields(&self.cfg, &mut self.edit); // 面板里的副本也跟着更新，别把新设置覆盖回去
-        {
-            let mut cfg = self.cfg_shared.lock();
-            cfg.hud_apm_show = self.cfg.hud_apm_show;
-            cfg.hud_kps_show = self.cfg.hud_kps_show;
-            cfg.apm_window_secs = self.cfg.apm_window_secs;
-            cfg.kps_window_ms = self.cfg.kps_window_ms;
-            cfg.kps_keys = self.cfg.kps_keys.clone();
-            cfg.kps_show_hits = self.cfg.kps_show_hits;
-            cfg.kps_show_max = self.cfg.kps_show_max;
-            cfg.kps_show_avg = self.cfg.kps_show_avg;
-            cfg.apm_show_keys = self.cfg.apm_show_keys;
-            cfg.apm_show_clicks = self.cfg.apm_show_clicks;
-            cfg.apm_show_dist = self.cfg.apm_show_dist;
-            cfg.apm_hud_opacity = self.cfg.apm_hud_opacity;
-            cfg.kps_hud_opacity = self.cfg.kps_hud_opacity;
-            cfg.kps_show_key_kps = self.cfg.kps_show_key_kps;
-            cfg.kps_scale = self.cfg.kps_scale;
-            cfg.kps_auto_width = self.cfg.kps_auto_width;
-            cfg.kps_method = self.cfg.kps_method.clone();
-            cfg.kps_key_count = self.cfg.kps_key_count;
-            cfg.kps_show_buttons = self.cfg.kps_show_buttons;
-            cfg.kps_show_stats = self.cfg.kps_show_stats;
-            cfg.kps_show_graph = self.cfg.kps_show_graph;
-            cfg.kps_graph_secs = self.cfg.kps_graph_secs;
-            cfg.apm_scale = self.cfg.apm_scale;
-            cfg.apm_keep_in_screen = self.cfg.apm_keep_in_screen;
-            cfg.kps_keep_in_screen = self.cfg.kps_keep_in_screen;
-            let _ = cfg.save(&self.cfg_path);
-        }
-        // KDE/Wayland：屏幕内限制的开关或记忆位置变了，要重载 HUD 监听脚本（幂等，没变就跳过）
+        // KDE/Wayland：恢复目标（KMC_TARGET）是编在 KWin 监听脚本里的，记忆变了要重载
+        //（幂等：签名没变会跳过），否则「关闭 HUD 再打开」会回到旧位置
         #[cfg(target_os = "linux")]
         crate::kwin::sync_hud_listener(
             self.cfg.apm_keep_in_screen,
@@ -679,18 +969,101 @@ impl App {
             self.cfg.apm_hud_pos,
             self.cfg.kps_hud_pos,
         );
+        // KWin 窗口规则同步：规则在窗口 map 时由 KWin 核心应用位置（恢复的正道），
+        // 记忆变了要更新，下次启动 / 重新打开就回到新位置
+        #[cfg(target_os = "linux")]
+        crate::kwin::sync_hud_rules(self.cfg.apm_hud_pos, self.cfg.kps_hud_pos);
     }
 
+    /// 悬浮窗设置改动后：同步到共享状态（原子量 / KPS 跟踪器）并落盘。
+    /// 只改自己关心的字段、不整份覆盖 —— 托盘可能刚改过别的设置（例如开机启动）。
+    fn apply_hud_cfg(&mut self) {
+        self.sync_hud_runtime();
+        self.persist_hud_cfg();
+        self.sync_hud_kwin_scripts();
+    }
+
+    /// 把窗口时长 / KPS 方法推到运行中的共享状态（下一帧 HUD 立刻按新值算）。
+    fn sync_hud_runtime(&mut self) {
+        self.shared
+            .apm_window_secs
+            .store(self.cfg.apm_window_secs, Ordering::Relaxed);
+        self.shared
+            .kps_window_ms
+            .store(self.cfg.kps_window_ms, Ordering::Relaxed);
+        let mut kps = self.shared.kps.lock();
+        kps.set_monitored(&self.cfg.kps_key_layout().names());
+        kps.set_method(crate::stats::KpsMethod::from_config(&self.cfg.kps_method));
+    }
+
+    /// 落盘：面板里的副本一起更新（别把新设置覆盖回去），再写回配置文件。
+    fn persist_hud_cfg(&mut self) {
+        copy_hud_fields(&self.cfg, &mut self.edit);
+        let mut cfg = self.cfg_shared.lock();
+        cfg.hud_apm_show = self.cfg.hud_apm_show;
+        cfg.hud_kps_show = self.cfg.hud_kps_show;
+        cfg.apm_window_secs = self.cfg.apm_window_secs;
+        cfg.kps_window_ms = self.cfg.kps_window_ms;
+        cfg.kps_keys = self.cfg.kps_keys.clone();
+        cfg.kps_show_hits = self.cfg.kps_show_hits;
+        cfg.kps_show_max = self.cfg.kps_show_max;
+        cfg.kps_show_avg = self.cfg.kps_show_avg;
+        cfg.apm_show_keys = self.cfg.apm_show_keys;
+        cfg.apm_show_clicks = self.cfg.apm_show_clicks;
+        cfg.apm_show_dist = self.cfg.apm_show_dist;
+        cfg.apm_hud_opacity = self.cfg.apm_hud_opacity;
+        cfg.kps_hud_opacity = self.cfg.kps_hud_opacity;
+        cfg.kps_show_key_kps = self.cfg.kps_show_key_kps;
+        cfg.kps_scale = self.cfg.kps_scale;
+        cfg.kps_auto_width = self.cfg.kps_auto_width;
+        cfg.kps_method = self.cfg.kps_method.clone();
+        cfg.kps_key_count = self.cfg.kps_key_count;
+        cfg.kps_show_buttons = self.cfg.kps_show_buttons;
+        cfg.kps_show_stats = self.cfg.kps_show_stats;
+        cfg.kps_show_graph = self.cfg.kps_show_graph;
+        cfg.kps_graph_secs = self.cfg.kps_graph_secs;
+        cfg.apm_scale = self.cfg.apm_scale;
+        cfg.apm_keep_in_screen = self.cfg.apm_keep_in_screen;
+        cfg.kps_keep_in_screen = self.cfg.kps_keep_in_screen;
+        let _ = cfg.save(&self.cfg_path);
+    }
+
+    /// KDE/Wayland：屏幕内限制的开关或记忆位置变了，要重载 HUD 监听脚本（幂等，没变就跳过）。
+    fn sync_hud_kwin_scripts(&mut self) {
+        #[cfg(target_os = "linux")]
+        crate::kwin::sync_hud_listener(
+            self.cfg.apm_keep_in_screen,
+            self.cfg.kps_keep_in_screen,
+            self.cfg.apm_hud_pos,
+            self.cfg.kps_hud_pos,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = &self.cfg;
+    }
+}
+
+/// HUD 设置窗口里由界面交互置起的动作位：视口闭包里只置位，关闭后统一落地
+#[derive(Default)]
+struct HudCfgActions {
+    close_settings: bool,
+    open_main: bool,
+    reset_peak: bool,
+    reset_counts: bool,
+    reset_graph: bool,
+    reset_all: bool,
+    toggle_hud: bool,
+    dirty: bool,
+    start_capture: bool,
+    cancel_capture: bool,
+}
+
+impl App {
     /// APM 悬浮窗自己的设置窗口（右键悬浮窗打开）。
     ///
     /// 用**独立视口**而不是右键菜单：菜单画在悬浮窗内部，340×32 的胶囊条会把第二行起全裁掉（踩过）。
     pub(crate) fn show_apm_settings(&mut self, ctx: &egui::Context, s: &'static Strings) {
         let vp_id = egui::ViewportId::from_hash_of("kmc_apm_cfg");
-        let mut close_settings = false;
-        let mut open_main = false;
-        let mut reset_peak = false;
-        let mut toggle_hud = false;
-        let mut dirty = false;
+        let mut act = HudCfgActions::default();
 
         ctx.show_viewport_immediate(
             vp_id,
@@ -703,114 +1076,143 @@ impl App {
                 .with_transparent(true),
             |cfg_ctx, _class| {
                 if cfg_ctx.input(|i| i.viewport().close_requested()) {
-                    close_settings = true;
+                    act.close_settings = true;
                     return;
                 }
                 cfg_ctx.request_repaint_after(Duration::from_millis(400));
-                let bg = hud_bg_color((24, 26, 34), self.cfg.apm_hud_opacity);
+                let bg = hud_bg_color((24, 26, 34), SETTINGS_BG_OPACITY);
                 let closed = settings_shell(cfg_ctx, "⚡", s.apm_cfg_title, s.cfg_close, bg, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(s.settings_apm_window).small().color(HUD_TEXT));
-                        if ui
-                            .add(egui::DragValue::new(&mut self.cfg.apm_window_secs).range(5..=300).speed(1.0))
-                            .on_hover_text(s.settings_apm_window_sub)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.label(egui::RichText::new("s").small().color(HUD_TEXT));
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new(s.hud_opacity).small().color(HUD_TEXT));
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.cfg.apm_hud_opacity)
-                                    .range(20..=100)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut self.cfg.apm_show_keys, s.apm_show_keys).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.apm_show_clicks, s.apm_show_clicks).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.apm_show_dist, s.apm_show_dist).changed() {
-                            dirty = true;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    // 缩放 + 限制在屏幕内（对齐 osu-kps 的同名选项）
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(s.kps_cfg_scale).small().color(HUD_TEXT));
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.cfg.apm_scale)
-                                    .range(60..=400)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .on_hover_text(s.apm_cfg_scale_hint)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.add_space(10.0);
-                        if ui
-                            .checkbox(&mut self.cfg.apm_keep_in_screen, s.hud_keep_in_screen)
-                            .on_hover_text(s.hud_keep_in_screen_hint)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(s.hud_open_main).clicked() {
-                            open_main = true;
-                        }
-                        if ui.button(s.hud_reset_peak).clicked() {
-                            reset_peak = true;
-                        }
-                        let hud_btn = if self.cfg.hud_apm_show { s.hud_close } else { s.hud_show };
-                        if ui.button(hud_btn).clicked() {
-                            toggle_hud = true;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(s.hud_cfg_hint)
-                            .small()
-                            .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
-                    );
+                    self.apm_settings_body(ui, s, &mut act);
                 });
                 if closed {
-                    close_settings = true;
+                    act.close_settings = true;
                 }
             },
         );
 
+        self.apply_apm_settings_actions(ctx, &act);
+    }
+
+    /// APM 设置窗口的内容：窗口长度 / 不透明度 / 显示项 / 缩放 / 底部按钮
+    fn apm_settings_body(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        self.apm_settings_window_row(ui, s, act);
+        ui.add_space(4.0);
+        self.apm_settings_display_toggles(ui, s, act);
+        ui.add_space(4.0);
+        self.apm_settings_scale_row(ui, s, act);
+        ui.add_space(6.0);
+        self.apm_settings_buttons(ui, s, act);
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(s.hud_cfg_hint)
+                .small()
+                .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+        );
+    }
+
+    /// 窗口长度（秒）+ 不透明度（%）
+    fn apm_settings_window_row(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.settings_apm_window).color(HUD_TEXT));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.apm_window_secs).range(5..=300).speed(1.0))
+                .on_hover_text(s.settings_apm_window_sub)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("s").color(HUD_TEXT));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new(s.hud_opacity).color(HUD_TEXT));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.cfg.apm_hud_opacity)
+                        .range(20..=100)
+                        .speed(1.0)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 显示项：按键 / 点击 / 移动距离
+    fn apm_settings_display_toggles(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.cfg.apm_show_keys, egui::RichText::new(s.apm_show_keys).color(HUD_TEXT)).changed() {
+                act.dirty = true;
+            }
+            if ui.checkbox(&mut self.cfg.apm_show_clicks, egui::RichText::new(s.apm_show_clicks).color(HUD_TEXT)).changed() {
+                act.dirty = true;
+            }
+            if ui.checkbox(&mut self.cfg.apm_show_dist, egui::RichText::new(s.apm_show_dist).color(HUD_TEXT)).changed() {
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 缩放 + 限制在屏幕内（对齐 osu-kps 的同名选项）
+    fn apm_settings_scale_row(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_cfg_scale).color(HUD_TEXT));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.cfg.apm_scale)
+                        .range(60..=400)
+                        .speed(1.0)
+                        .suffix("%"),
+                )
+                .on_hover_text(s.apm_cfg_scale_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.add_space(10.0);
+            if ui
+                .checkbox(&mut self.cfg.apm_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
+                .on_hover_text(s.hud_keep_in_screen_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 底部按钮：打开主窗口 / 重置峰值 / 显示或关闭 HUD
+    fn apm_settings_buttons(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            if ui.button(s.hud_open_main).clicked() {
+                act.open_main = true;
+            }
+            if ui.button(s.hud_reset_peak).clicked() {
+                act.reset_peak = true;
+            }
+            let hud_btn = if self.cfg.hud_apm_show { s.hud_close } else { s.hud_show };
+            if ui.button(hud_btn).clicked() {
+                act.toggle_hud = true;
+            }
+        });
+    }
+
+    /// APM 设置窗口的动作落地：改动即时生效（写盘集中在改动与关闭两个时机）
+    fn apply_apm_settings_actions(&mut self, ctx: &egui::Context, act: &HudCfgActions) {
         // 窗口内的改动即时生效（写盘集中在改动/关闭两个时机，拖动滑杆不会每帧写文件）
-        if dirty {
+        if act.dirty {
             self.apply_hud_cfg();
         }
-        if toggle_hud {
+        if act.toggle_hud {
             self.toggle_apm_hud();
             self.apply_hud_cfg();
         }
-        if reset_peak {
+        if act.reset_peak {
             self.shared.apm.lock().reset_peak();
         }
-        if open_main {
+        if act.open_main {
             show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
         }
-        if close_settings {
+        if act.close_settings {
             self.apm_cfg_open = false;
             self.apply_hud_cfg(); // 关闭时兜底落盘
         }
@@ -819,342 +1221,397 @@ impl App {
     /// KPS 悬浮窗自己的设置窗口（右键悬浮窗打开）：窗口长度、监控键、显示项、不透明度、重置与关闭。
     pub(crate) fn show_kps_settings(&mut self, ctx: &egui::Context, s: &'static Strings) {
         let vp_id = egui::ViewportId::from_hash_of("kmc_kps_cfg");
-        let mut close_settings = false;
-        let mut open_main = false;
-        let mut reset_counts = false;
-        let mut reset_peak = false;
-        let mut reset_graph = false;
-        let mut reset_all = false;
-        let mut toggle_hud = false;
-        let mut dirty = false;
-        let mut start_capture = false;
-        let mut cancel_capture = false;
+        let mut act = HudCfgActions::default();
 
         ctx.show_viewport_immediate(
             vp_id,
             egui::ViewportBuilder::default()
                 .with_title(format!("KMC - {}", s.kps_cfg_title))
-                .with_inner_size([400.0, 312.0])
+                // 高度按内容实测定（标签统一到正文字号 + 显示项分两行后需要 336）
+                .with_inner_size([400.0, 336.0])
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_transparent(true),
             |cfg_ctx, _class| {
                 if cfg_ctx.input(|i| i.viewport().close_requested()) {
-                    close_settings = true;
+                    act.close_settings = true;
                     return;
                 }
                 // 捕获键位时要及时反馈，其它时候没必要刷那么勤
                 let interval = if self.kps_capturing { 80 } else { 400 };
                 cfg_ctx.request_repaint_after(Duration::from_millis(interval));
-                let bg = hud_bg_color((16, 18, 24), self.cfg.kps_hud_opacity);
+                let bg = hud_bg_color((16, 18, 24), SETTINGS_BG_OPACITY);
                 let closed = settings_shell(cfg_ctx, "🎯", s.kps_cfg_title, s.cfg_close, bg, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(s.settings_kps_window).small().color(HUD_TEXT));
-                        if ui
-                            .add(egui::DragValue::new(&mut self.cfg.kps_window_ms).range(200..=5000).speed(50.0))
-                            .on_hover_text(s.settings_kps_window_sub)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.label(egui::RichText::new("ms").small().color(HUD_TEXT));
-                        ui.add_space(8.0);
-                        // 计算方式（对齐 osu-kps 的「硬算 / 灵敏」）
-                        ui.label(egui::RichText::new(s.kps_cfg_method).small().color(HUD_TEXT));
-                        let cur = crate::stats::KpsMethod::from_config(&self.cfg.kps_method);
-                        egui::ComboBox::from_id_salt("kps_method")
-                            .selected_text(match cur {
-                                crate::stats::KpsMethod::Hard => s.kps_method_hard,
-                                crate::stats::KpsMethod::Sensitive => s.kps_method_sensitive,
-                            })
-                            .width(66.0)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        cur == crate::stats::KpsMethod::Hard,
-                                        egui::RichText::new(s.kps_method_hard).color(HUD_TEXT),
-                                    )
-                                    .on_hover_text(s.kps_method_hard_hint)
-                                    .clicked()
-                                {
-                                    self.cfg.kps_method =
-                                        crate::stats::KpsMethod::Hard.as_config().to_string();
-                                    dirty = true;
-                                }
-                                if ui
-                                    .selectable_label(
-                                        cur == crate::stats::KpsMethod::Sensitive,
-                                        egui::RichText::new(s.kps_method_sensitive).color(HUD_TEXT),
-                                    )
-                                    .on_hover_text(s.kps_method_sensitive_hint)
-                                    .clicked()
-                                {
-                                    self.cfg.kps_method =
-                                        crate::stats::KpsMethod::Sensitive.as_config().to_string();
-                                    dirty = true;
-                                }
-                            })
-                            .response
-                            .on_hover_text(match cur {
-                                crate::stats::KpsMethod::Hard => s.kps_method_hard_hint,
-                                crate::stats::KpsMethod::Sensitive => s.kps_method_sensitive_hint,
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        // 缩放 + 每行键数 + 不透明度
-                        ui.label(egui::RichText::new(s.kps_cfg_scale).small().color(HUD_TEXT));
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.cfg.kps_scale)
-                                    .range(60..=400)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .on_hover_text(s.kps_cfg_scale_hint)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.add_space(6.0);
-                        if ui
-                            .checkbox(&mut self.cfg.kps_auto_width, s.kps_auto_width)
-                            .on_hover_text(s.kps_auto_width_hint)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new(s.hud_opacity).small().color(HUD_TEXT));
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.cfg.kps_hud_opacity)
-                                    .range(20..=100)
-                                    .speed(1.0)
-                                    .suffix("%"),
-                            )
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(s.settings_kps_keys).small().color(HUD_TEXT));
-                        // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
-                        if ui
-                            .add(
-                                egui::TextEdit::multiline(&mut self.cfg.kps_keys)
-                                    .desired_width(180.0)
-                                    .desired_rows(3)
-                                    .font(egui::TextStyle::Monospace)
-                                    .hint_text("E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J"),
-                            )
-                            .on_hover_text(s.settings_kps_keys_hint)
-                            .changed()
-                        {
-                            // 手改键表时把"键数"跟着对一下，避免两处打架
-                            self.cfg.kps_key_count =
-                                self.cfg.kps_key_layout().names().len().clamp(1, 26) as u8;
-                            dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(s.kps_key_count).small().color(HUD_TEXT));
-                        let mut count = self.cfg.kps_key_count as i32;
-                        if ui
-                            .add(egui::DragValue::new(&mut count).range(1..=26).speed(1.0))
-                            .changed()
-                        {
-                            self.cfg.kps_key_count = count.clamp(1, 26) as u8;
-                            self.cfg.resize_kps_keys();
-                            dirty = true;
-                        }
-                        if ui
-                            .button(s.kps_set_keys)
-                            .on_hover_text(s.kps_set_keys_hint)
-                            .clicked()
-                        {
-                            start_capture = true;
-                        }
-                        if ui
-                            .button(s.kps_default_keys)
-                            .on_hover_text(s.kps_default_keys_hint)
-                            .clicked()
-                        {
-                            self.cfg.kps_keys = crate::config::Config::default_kps_keys_for(
-                                self.cfg.kps_key_count as usize,
-                            )
-                            .join(", ");
-                            dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        // 重置菜单（对齐 osu-kps 的重置子菜单：按键总次数 / 最大 KPS / KPS 图 / 以上所有）
-                        ui.menu_button(s.kps_reset, |ui| {
-                            ui.label(egui::RichText::new(s.kps_reset_hint).small().color(HUD_TEXT));
-                            ui.separator();
-                            if ui.button(s.kps_reset_counts).clicked() {
-                                reset_counts = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(s.kps_reset_peak).clicked() {
-                                reset_peak = true;
-                                ui.close_menu();
-                            }
-                            if ui.button(s.kps_reset_graph).clicked() {
-                                reset_graph = true;
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(s.kps_reset_all).clicked() {
-                                reset_all = true;
-                                ui.close_menu();
-                            }
-                        });
-                    });
-                    // 「设置键位」捕获中：显示进度 + 已捕获的键 + 取消（凑满 N 个就自动写入）
-                    if self.kps_capturing {
-                        let need = self.cfg.kps_key_count.max(1) as usize;
-                        let captured = self.shared.kps_capture_buf.lock().clone();
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(s.kps_capture_prompt)
-                                    .small()
-                                    .color(Color32::from_rgb(0xFF, 0xD0, 0x60)),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{}/{}",
-                                    captured.len().min(need),
-                                    need
-                                ))
-                                .small()
-                                .strong()
-                                .color(Color32::from_rgb(0xFF, 0xD0, 0x60)),
-                            );
-                            let names = if captured.is_empty() {
-                                s.kps_capture_none.to_string()
-                            } else {
-                                captured.join(", ")
-                            };
-                            ui.label(egui::RichText::new(names).small().color(HUD_TEXT));
-                            if ui.small_button(s.kps_capture_cancel).clicked() {
-                                cancel_capture = true;
-                            }
-                        });
-                        if captured.len() >= need {
-                            self.cfg.kps_keys = captured.into_iter().take(need).collect::<Vec<_>>().join(", ");
-                            self.cfg.kps_key_count = need as u8;
-                            dirty = true;
-                            cancel_capture = true;
-                        }
-                    }
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut self.cfg.kps_show_buttons, s.kps_show_buttons).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.kps_show_stats, s.kps_show_stats).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.kps_show_graph, s.kps_show_graph).changed() {
-                            dirty = true;
-                        }
-                        if self.cfg.kps_show_graph {
-                            ui.label(egui::RichText::new(s.kps_cfg_graph_secs).small().color(HUD_TEXT));
-                            if ui
-                                .add(egui::DragValue::new(&mut self.cfg.kps_graph_secs).range(10..=300).speed(5.0))
-                                .changed()
-                            {
-                                dirty = true;
-                            }
-                            ui.label(egui::RichText::new("s").small().color(HUD_TEXT));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut self.cfg.kps_show_hits, s.settings_kps_show_hits).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.kps_show_key_kps, s.kps_show_key_kps).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.kps_show_max, s.settings_kps_show_max).changed() {
-                            dirty = true;
-                        }
-                        if ui.checkbox(&mut self.cfg.kps_show_avg, s.kps_show_avg).changed() {
-                            dirty = true;
-                        }
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(s.hud_open_main).clicked() {
-                            open_main = true;
-                        }
-                        let hud_btn = if self.cfg.hud_kps_show { s.hud_close } else { s.hud_show };
-                        if ui.button(hud_btn).clicked() {
-                            toggle_hud = true;
-                        }
-                        ui.add_space(10.0);
-                        // 限制在屏幕内（对齐 osu-kps 的同名选项）
-                        if ui
-                            .checkbox(&mut self.cfg.kps_keep_in_screen, s.hud_keep_in_screen)
-                            .on_hover_text(s.hud_keep_in_screen_hint)
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(s.hud_cfg_hint)
-                            .small()
-                            .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
-                    );
+                    self.kps_settings_body(ui, s, &mut act);
                 });
                 if closed {
-                    close_settings = true;
+                    act.close_settings = true;
                 }
             },
         );
 
-        if start_capture {
+        self.apply_kps_settings_actions(ctx, &act);
+    }
+
+    /// KPS 设置窗口的内容：按行分组，逐行交给下面的小方法
+    fn kps_settings_body(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        self.kps_settings_window_row(ui, s, act);
+        self.kps_settings_scale_row(ui, s, act);
+        self.kps_settings_key_list(ui, s, act);
+        self.kps_settings_key_buttons(ui, s, act);
+        self.kps_settings_reset_menu(ui, s, act);
+        self.kps_settings_capture(ui, s, act);
+        self.kps_settings_display_toggles(ui, s, act);
+        self.kps_settings_footer(ui, s, act);
+    }
+
+    /// 第一行：统计窗口长度（ms）与计算方式（硬算 / 灵敏）
+    fn kps_settings_window_row(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.settings_kps_window).color(HUD_TEXT));
+            if ui
+                .add(egui::DragValue::new(&mut self.cfg.kps_window_ms).range(200..=5000).speed(50.0))
+                .on_hover_text(s.settings_kps_window_sub)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("ms").color(HUD_TEXT));
+            ui.add_space(8.0);
+            self.kps_settings_method_combo(ui, s, act);
+        });
+    }
+
+    fn kps_settings_method_combo(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &'static Strings,
+        act: &mut HudCfgActions,
+    ) {
+        ui.label(egui::RichText::new(s.kps_cfg_method).color(HUD_TEXT));
+        let cur = crate::stats::KpsMethod::from_config(&self.cfg.kps_method);
+        egui::ComboBox::from_id_salt("kps_method")
+            .selected_text(kps_method_label(cur, s))
+            .width(66.0)
+            .show_ui(ui, |ui| {
+                self.kps_method_options(ui, s, cur, act);
+            })
+            .response
+            .on_hover_text(kps_method_hint(cur, s));
+    }
+
+    /// 下拉里的两个选项：命中后写回 cfg 并标脏。
+    fn kps_method_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &'static Strings,
+        cur: crate::stats::KpsMethod,
+        act: &mut HudCfgActions,
+    ) {
+        // 注意：ComboBox 的弹出层是 egui 浅色主题的白底，
+        // 这里千万别套 HUD_TEXT（白字白底＝看不见，踩过）
+        if ui
+            .selectable_label(
+                cur == crate::stats::KpsMethod::Hard,
+                egui::RichText::new(s.kps_method_hard),
+            )
+            .on_hover_text(s.kps_method_hard_hint)
+            .clicked()
+        {
+            self.cfg.kps_method = crate::stats::KpsMethod::Hard.as_config().to_string();
+            act.dirty = true;
+        }
+        if ui
+            .selectable_label(
+                cur == crate::stats::KpsMethod::Sensitive,
+                egui::RichText::new(s.kps_method_sensitive),
+            )
+            .on_hover_text(s.kps_method_sensitive_hint)
+            .clicked()
+        {
+            self.cfg.kps_method = crate::stats::KpsMethod::Sensitive.as_config().to_string();
+            act.dirty = true;
+        }
+    }
+
+    /// 第二行：缩放、自动宽度与不透明度
+    fn kps_settings_scale_row(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            self.kps_settings_scale(ui, s, act);
+            ui.add_space(6.0);
+            if ui
+                .checkbox(
+                    &mut self.cfg.kps_auto_width,
+                    egui::RichText::new(s.kps_auto_width).color(HUD_TEXT),
+                )
+                .on_hover_text(s.kps_auto_width_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(s.hud_opacity).color(HUD_TEXT));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.cfg.kps_hud_opacity)
+                        .range(20..=100)
+                        .speed(1.0)
+                        .suffix("%"),
+                )
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 缩放百分比（60~400%）。
+    fn kps_settings_scale(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.label(egui::RichText::new(s.kps_cfg_scale).color(HUD_TEXT));
+        if ui
+            .add(
+                egui::DragValue::new(&mut self.cfg.kps_scale)
+                    .range(60..=400)
+                    .speed(1.0)
+                    .suffix("%"),
+            )
+            .on_hover_text(s.kps_cfg_scale_hint)
+            .changed()
+        {
+            act.dirty = true;
+        }
+    }
+
+    /// 键表输入：换行=分行，空项=空位，1.5H/4H=宽度倍数
+    fn kps_settings_key_list(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.settings_kps_keys).color(HUD_TEXT));
+            // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.cfg.kps_keys)
+                        .desired_width(180.0)
+                        .desired_rows(3)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J"),
+                )
+                .on_hover_text(s.settings_kps_keys_hint)
+                .changed()
+            {
+                // 手改键表时把"键数"跟着对一下，避免两处打架
+                self.cfg.kps_key_count =
+                    self.cfg.kps_key_layout().names().len().clamp(1, 26) as u8;
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 键数调节、设置键位与恢复默认键表
+    fn kps_settings_key_buttons(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_key_count).color(HUD_TEXT));
+            let mut count = self.cfg.kps_key_count as i32;
+            if ui
+                .add(egui::DragValue::new(&mut count).range(1..=26).speed(1.0))
+                .changed()
+            {
+                self.cfg.kps_key_count = count.clamp(1, 26) as u8;
+                self.cfg.resize_kps_keys();
+                act.dirty = true;
+            }
+            if ui
+                .button(s.kps_set_keys)
+                .on_hover_text(s.kps_set_keys_hint)
+                .clicked()
+            {
+                act.start_capture = true;
+            }
+            if ui
+                .button(s.kps_default_keys)
+                .on_hover_text(s.kps_default_keys_hint)
+                .clicked()
+            {
+                self.cfg.kps_keys = crate::config::Config::default_kps_keys_for(
+                    self.cfg.kps_key_count as usize,
+                )
+                .join(", ");
+                act.dirty = true;
+            }
+        });
+    }
+
+    /// 重置菜单：按键总次数 / 最大 KPS / KPS 图 / 以上所有
+    fn kps_settings_reset_menu(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.horizontal(|ui| {
+            // 重置菜单（对齐 osu-kps 的重置子菜单：按键总次数 / 最大 KPS / KPS 图 / 以上所有）
+            ui.menu_button(s.kps_reset, |ui| {
+                // 菜单也是浅色弹出层：用主题默认深色字（不要 HUD_TEXT）
+                ui.label(egui::RichText::new(s.kps_reset_hint));
+                ui.separator();
+                if ui.button(s.kps_reset_counts).clicked() {
+                    act.reset_counts = true;
+                    ui.close_menu();
+                }
+                if ui.button(s.kps_reset_peak).clicked() {
+                    act.reset_peak = true;
+                    ui.close_menu();
+                }
+                if ui.button(s.kps_reset_graph).clicked() {
+                    act.reset_graph = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button(s.kps_reset_all).clicked() {
+                    act.reset_all = true;
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    /// 键位捕获进度：已捕获的键、进度计数与取消（凑满 N 个自动写入）
+    fn kps_settings_capture(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        // 「设置键位」捕获中：显示进度 + 已捕获的键 + 取消（凑满 N 个就自动写入）
+        if self.kps_capturing {
+            let need = self.cfg.kps_key_count.max(1) as usize;
+            let captured = self.shared.kps_capture_buf.lock().clone();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(s.kps_capture_prompt)
+                        .color(Color32::from_rgb(0xFF, 0xD0, 0x60)),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}/{}",
+                        captured.len().min(need),
+                        need
+                    ))
+                    .strong()
+                    .color(Color32::from_rgb(0xFF, 0xD0, 0x60)),
+                );
+                let names = if captured.is_empty() {
+                    s.kps_capture_none.to_string()
+                } else {
+                    captured.join(", ")
+                };
+                ui.label(egui::RichText::new(names).color(HUD_TEXT));
+                if ui.small_button(s.kps_capture_cancel).clicked() {
+                    act.cancel_capture = true;
+                }
+            });
+            if captured.len() >= need {
+                self.cfg.kps_keys = captured.into_iter().take(need).collect::<Vec<_>>().join(", ");
+                self.cfg.kps_key_count = need as u8;
+                act.dirty = true;
+                act.cancel_capture = true;
+            }
+        }
+    }
+
+    fn kps_settings_display_toggles(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_buttons, s.kps_show_buttons, act);
+            hud_check(ui, &mut self.cfg.kps_show_stats, s.kps_show_stats, act);
+            hud_check(ui, &mut self.cfg.kps_show_graph, s.kps_show_graph, act);
+            self.kps_settings_graph_secs(ui, s, act);
+        });
+        // 分两行：四个复选框挤一行时最后一项（显示平均 KPS）会被窗口右边缘裁掉
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_hits, s.settings_kps_show_hits, act);
+            hud_check(ui, &mut self.cfg.kps_show_key_kps, s.kps_show_key_kps, act);
+        });
+        ui.horizontal(|ui| {
+            hud_check(ui, &mut self.cfg.kps_show_max, s.settings_kps_show_max, act);
+            hud_check(ui, &mut self.cfg.kps_show_avg, s.kps_show_avg, act);
+        });
+    }
+
+
+    /// 「显示 KPS 曲线」后面跟着的时长输入（仅在勾选时才出现）。
+    fn kps_settings_graph_secs(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        if !self.cfg.kps_show_graph {
+            return;
+        }
+        ui.label(egui::RichText::new(s.kps_cfg_graph_secs).color(HUD_TEXT));
+        if ui
+            .add(egui::DragValue::new(&mut self.cfg.kps_graph_secs).range(10..=300).speed(5.0))
+            .changed()
+        {
+            act.dirty = true;
+        }
+        ui.label(egui::RichText::new("s").color(HUD_TEXT));
+    }
+
+    /// 底栏：打开主窗口、显示/隐藏悬浮窗、限制在屏幕内与说明文字
+    fn kps_settings_footer(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button(s.hud_open_main).clicked() {
+                act.open_main = true;
+            }
+            let hud_btn = if self.cfg.hud_kps_show { s.hud_close } else { s.hud_show };
+            if ui.button(hud_btn).clicked() {
+                act.toggle_hud = true;
+            }
+            ui.add_space(10.0);
+            // 限制在屏幕内（对齐 osu-kps 的同名选项）
+            if ui
+                .checkbox(&mut self.cfg.kps_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
+                .on_hover_text(s.hud_keep_in_screen_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(s.hud_cfg_hint)
+                .small()
+                .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+        );
+    }
+
+    /// KPS 设置窗口的动作落地：捕获启动/取消、写盘、重置统计与开关悬浮窗
+    fn apply_kps_settings_actions(&mut self, ctx: &egui::Context, act: &HudCfgActions) {
+        if act.start_capture {
             self.start_kps_capture();
         }
-        if cancel_capture {
+        if act.cancel_capture {
             self.stop_kps_capture();
         }
-        if dirty {
+        if act.dirty {
             self.apply_hud_cfg();
         }
-        if toggle_hud {
+        if act.toggle_hud {
             self.toggle_kps_hud();
             self.apply_hud_cfg();
         }
-        if reset_counts || reset_peak || reset_graph || reset_all {
+        if act.reset_counts || act.reset_peak || act.reset_graph || act.reset_all {
             let mut kps = self.shared.kps.lock();
-            if reset_all {
+            if act.reset_all {
                 kps.reset_all();
             } else {
-                if reset_counts {
+                if act.reset_counts {
                     kps.reset_counts();
                 }
-                if reset_peak {
+                if act.reset_peak {
                     kps.reset_peak();
                 }
-                if reset_graph {
+                if act.reset_graph {
                     kps.reset_graph();
                 }
             }
         }
-        if open_main {
+        if act.open_main {
             show_window_now(&self.shared, ctx, self.cfg.keep_on_top);
         }
-        if close_settings {
+        if act.close_settings {
             self.kps_cfg_open = false;
             self.apply_hud_cfg();
         }
     }
-
     #[cfg(any(test, feature = "softshot"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn debug_toggle_hud(&mut self) {
@@ -1210,7 +1667,7 @@ impl App {
     #[cfg(feature = "softshot")]
     #[allow(dead_code)]
     pub(crate) fn debug_apm_hud_size(&self) -> (f32, f32) {
-        self.apm_hud_size
+        *self.apm_hud_size.lock()
     }
 }
 
@@ -1422,13 +1879,14 @@ pub(crate) fn clamp_hud_pos(pos: (f32, f32), size: (f32, f32), monitor: (f32, f3
     (pos.0.clamp(0.0, max_x), pos.1.clamp(0.0, max_y))
 }
 
-/// KDE/Wayland 下 KWin 监听脚本上报的最新 HUD 位置（[APM, KPS]；其他平台恒为 None）
+/// KDE/Wayland 下 KWin 监听脚本上报的最新 HUD 位置：`(x, y, 是否用户拖动过)`。
+/// 其他平台恒为 None（winit 自己就能读位置）。
 #[cfg(target_os = "linux")]
-fn kde_hud_pos(idx: usize) -> Option<(f32, f32)> {
-    crate::kwin::hud_pos_reports()[idx]
+fn kde_hud_pos(idx: usize) -> Option<(f32, f32, bool)> {
+    crate::kwin::hud_pos_reports()[idx].map(|r| (r.pos.0, r.pos.1, r.user_moved))
 }
 #[cfg(not(target_os = "linux"))]
-fn kde_hud_pos(_idx: usize) -> Option<(f32, f32)> {
+fn kde_hud_pos(_idx: usize) -> Option<(f32, f32, bool)> {
     None
 }
 
@@ -1504,67 +1962,46 @@ pub(crate) fn nice_kps_max(v: f32) -> f32 {
 }
 
 /// KPS 图（参照 osu-kps：每秒一条的历史柱状图；再叠一条 KeysPerSecond 那样的平均线）。
-///
-/// **按整秒分桶**画：`hist` 里每条样本按"年龄向下取整"落到对应那一秒的柱子上，当前这一秒另外补上
-/// `current`。这样数值每秒只向左移一格 —— 不会像按小数年龄连续映射那样每帧抖动，也不会把旧峰值
-/// 涂抹到后面的时间里（之前"高峰迟迟不消失 + 一直闪 + 一次填掉 1/3 界面"就是这么来的）。
+/// KPS 图每根柱子的像素宽（**含 1px 间隔**）。柱数 = 图宽 / 柱宽，
+/// 时间片 = 图时长 / 柱数（如 300 秒 / 84 根 ≈ 3.6 秒一根）。片内图形完全静止。
+const GRAPH_BAR_W: f32 = 5.0;
+
+/// 画 KPS 图：**固定像素宽的柱子**，柱数由图宽决定（渲染契约见
+/// [`crate::stats::KpsTracker::history_bars`]）。
 pub(crate) fn paint_kps_graph(
     ui: &mut egui::Ui,
     rect: Rect,
-    hist: &[(f32, f32)],
-    current: f32,
-    span_secs: u32,
+    hist: &[f32],
     avg: f32,
     accent: Color32,
 ) {
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(10, 12, 18, 190));
 
-    let span = span_secs.clamp(10, 300) as usize;
-    let mut buckets = vec![0.0f32; span];
-    for (age, v) in hist {
-        let idx = if *age < 0.0 { 0 } else { *age as usize };
-        if idx < span {
-            let pos = span - 1 - idx;
-            buckets[pos] = buckets[pos].max(*v);
-        }
-    }
-    buckets[span - 1] = buckets[span - 1].max(current.max(0.0));
-
-    let maxv = nice_kps_max(buckets.iter().copied().fold(0.0f32, f32::max));
+    let maxv = nice_kps_max(hist.iter().copied().fold(0.0f32, f32::max)).max(1.0);
     let usable_h = (rect.height() - 2.0).max(1.0);
-    // 按**整数像素列**画、每列只画一次、颜色不透明：
-    // 半透明柱在 0.75px 步进下会互相叠加（窗口一动颜色就变 → 闪），这里彻底避开。
-    let cols = rect.width().max(1.0).floor() as usize;
+    // 柱子用暗色调、顶部 1.5px 用亮色勾"帽"；颜色不透明 —— 半透明柱会互相叠加（窗口一动就闪）
     let dim_accent = {
         let c = accent.to_array();
         Color32::from_rgb((c[0] as u32 * 3 / 5) as u8, (c[1] as u32 * 3 / 5) as u8, (c[2] as u32 * 3 / 5) as u8)
     };
-    let px_per_bucket = cols as f32 / span as f32;
-    for col in 0..cols {
-        // 这一列覆盖的桶（可能跨多个桶，取其中最大值）
-        let b0 = (col as f32 / px_per_bucket).floor() as usize;
-        let b1 = (((col + 1) as f32 / px_per_bucket).ceil() as usize).min(span);
-        let v = buckets[b0.min(span.saturating_sub(1))..b1.max(b0 + 1).min(span)]
-            .iter()
-            .copied()
-            .fold(0.0f32, f32::max);
-        let h = (v / maxv) * usable_h;
+    let body_w = (GRAPH_BAR_W - 1.0).max(1.0); // 柱体留 1px 当间隔，柱与柱界限分明
+    for (i, v) in hist.iter().enumerate() {
+        let h = (*v / maxv) * usable_h;
         if h <= 0.4 {
             continue;
         }
-        let x = rect.left() + col as f32;
+        let x = rect.left() + i as f32 * GRAPH_BAR_W;
         painter.rect_filled(
-            Rect::from_min_max(Pos2::new(x, rect.bottom() - h), Pos2::new(x + 1.0, rect.bottom())),
+            Rect::from_min_max(Pos2::new(x, rect.bottom() - h), Pos2::new(x + body_w, rect.bottom())),
             0.0,
             dim_accent,
         );
-        // 顶部亮一截
         painter.rect_filled(
             Rect::from_min_max(
                 Pos2::new(x, rect.bottom() - h),
                 Pos2::new(
-                    x + 1.0,
+                    x + body_w,
                     (rect.bottom() - h + 1.5 * ui.ctx().pixels_per_point()).min(rect.bottom()),
                 ),
             ),
@@ -1622,6 +2059,14 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
 }
 
 /// 悬浮窗背景色：深色底 + 可调不透明度（0~100；`rgb` 是底色 RGB）
+/// 悬浮窗**设置窗自己**的背景不透明度：固定 100%。
+///
+/// 不要跟着 `cfg.*_hud_opacity` 走 —— 那个设置项管的是**悬浮窗本体**的透明度；
+/// 设置窗跟着一起变透明，用户拖动"不透明度"时只会看到设置窗自己在变淡，
+/// 既看不清也以为改错了对象（主人报过）。
+/// 悬浮窗本体的透明度由 `render_*_hud` 里的 `hud_bg_color(..., cfg.*_hud_opacity)` 应用。
+pub(crate) const SETTINGS_BG_OPACITY: u8 = 100;
+
 pub(crate) fn hud_bg_color(rgb: (u8, u8, u8), opacity: u8) -> Color32 {
     let a = ((opacity.min(100) as u32 * 255) / 100) as u8;
     Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, a)
@@ -1811,3 +2256,4 @@ mod tests {
         assert_eq!(clamp_hud_pos((10.0, 10.0), (2200.0, 40.0), mon), (0.0, 10.0), "只比屏宽时 Y 不用动");
     }
 }
+

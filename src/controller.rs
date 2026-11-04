@@ -80,7 +80,15 @@ pub fn spawn(ctl: Controller, rx: Receiver<TrayCmd>, ctx: egui::Context, show_re
     std::thread::Builder::new()
         .name("kmcounter-ctl".into())
         .spawn(move || {
-            while let Ok(cmd) = rx.recv() {
+            // 注意：这里**不要**给 HUD 视口加定时心跳（踩过）。最小化主窗口后 HUD 冻结的
+            // 根因不是"没人请求重绘"，而是主窗口一 unmap，winit(Wayland) 就不再唤醒
+            // 事件循环 —— 请求照样发不出去。修法在 `gui::hide_window`：主窗口改成
+            // 「停放」（缩到 32px + 全透明，保持 mapped），而不是最小化/隐藏。
+            'ctl: loop {
+                let cmd = match rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break 'ctl,
+                };
                 match cmd {
                     TrayCmd::Show | TrayCmd::Settings => {
                         let settings = matches!(cmd, TrayCmd::Settings);
@@ -122,7 +130,7 @@ pub fn spawn(ctl: Controller, rx: Receiver<TrayCmd>, ctx: egui::Context, show_re
                         }
                     }
                     // GUI → 托盘方向的命令（回执/语言同步），控制线程无需处理
-                    TrayCmd::AutostartState(_) | TrayCmd::Language(_) => {}
+                    TrayCmd::AutostartState(_) | TrayCmd::HudState { .. } | TrayCmd::Language(_) => {}
                     TrayCmd::Exit => {
                         // 立即保存并终止（不经过渲染循环，最小化/隐藏时同样有效）
                         log::info!("托盘退出：保存数据并退出");

@@ -4,6 +4,7 @@
 mod autostart;
 mod chart;
 mod config;
+mod export;
 mod controller;
 mod fonts;
 mod fsutil;
@@ -31,6 +32,7 @@ const APP: &str = "KMCounter-rs";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,kmcounter=info")).init();
+    shorten_proc_title_to_ascii();
 
     let mut config_path: Option<PathBuf> = None;
     let mut export_path: Option<Option<PathBuf>> = None;
@@ -118,6 +120,47 @@ fn take_value(args: &mut std::iter::Peekable<impl Iterator<Item = String>>, opt:
     }
 }
 
+/// Linux：程序所在路径含非 ASCII（比如 `/home/inui/项目/…`）时，把 `/proc/self/cmdline`
+/// 里的 argv[0] 原地改写成纯 ASCII 的 `kmcounter`。
+///
+/// 为什么：`/proc` 里的字节本身是合法 UTF-8（`ps` 显示正常），但 KDE 系统监视器渲染
+/// 命令行列时会把非 ASCII 解码成乱码。数据侧没问题、监视器侧我们改不了，唯一的程序侧
+/// 办法就是别让路径进 cmdline —— 显示成 `kmcounter` 后任何监视器都不可能乱码。
+/// 目录不用改名：`/proc/self/exe`、`current_exe()`、datadir.txt 解析都不受影响
+/// （它们走另一条路，不读 argv）；autostart 的 .desktop 里仍是完整真实路径。
+#[cfg(target_os = "linux")]
+fn shorten_proc_title_to_ascii() {
+    // glibc 把 argv[0] 的指针暴露在 program_invocation_name（指向栈上 argv 区同一块内存）；
+    // 新标题更短时“原地覆盖 + NUL 填充”是经典 setproctitle 做法，安全
+    extern "C" {
+        static mut program_invocation_name: *mut libc::c_char;
+    }
+    unsafe {
+        let p = program_invocation_name;
+        if p.is_null() {
+            return;
+        }
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        // 只有路径里确实有非 ASCII 字节才改写；纯英文路径保持原样（ps 里还能看到完整路径）
+        let orig = std::slice::from_raw_parts(p as *const u8, len);
+        if orig.is_ascii() {
+            return;
+        }
+        let title = b"kmcounter\0";
+        debug_assert!(title.len() <= len, "argv[0] 比 kmcounter 还短，理论上不可能");
+        for i in 0..len {
+            *p.add(i) = if i < title.len() { title[i] as libc::c_char } else { 0 };
+        }
+        log::debug!("进程命令行已改写为 kmcounter（原路径含非 ASCII，避免系统监视器乱码）");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shorten_proc_title_to_ascii() {}
+
 fn print_help() {
     println!(
         "{APP} v{} — 键鼠使用统计 + 键盘热力图（Rust 重建版 KMCounter）
@@ -153,69 +196,18 @@ fn cmd_export(stats_path: &Path, cfg_path: &Path, out: Option<PathBuf>) {
     let px_w = resolve_screen_px_w(&cfg) as f64;
     let px_to_m = |px: f64| px * mm_w / px_w / 1000.0;
 
-    let out = out.unwrap_or_else(|| {
-        PathBuf::from(format!("kmcounter_export_{}.csv", stats::today_string()))
-    });
-
-    let header = "date,keystrokes,mouse_move_px,mouse_move_meters,mouse_lb,mouse_rb,mouse_mb,mouse_xb,mouse_wheel,mouse_hwheel";
-    let mut lines: Vec<String> = vec![header.to_string()];
-    for (date, d) in &store.days {
-        lines.push(format!(
-            "{},{},{},{:.4},{},{},{},{},{},{}",
-            date,
-            d.keystrokes,
-            d.mouse.move_px,
-            px_to_m(d.mouse.move_px),
-            d.mouse.lb,
-            d.mouse.rb,
-            d.mouse.mb,
-            d.mouse.xb,
-            d.mouse.wheel,
-            d.mouse.hwheel
-        ));
-    }
-    match std::fs::write(&out, lines.join("\n") + "\n") {
-        Ok(_) => println!("已导出 {} 天的数据 → {}", lines.len() - 1, out.display()),
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("kmcounter_export_{}.csv", stats::today_string())));
+    // 实际导出统一走 export 模块（与设置面板的「导出数据…」按钮同一份实现）
+    match export::export_to(&store, &cfg, &out, px_to_m) {
+        Ok(e) => {
+            println!("已导出 {} 天的数据（{} 个小时明细）", e.days, e.hours);
+            for f in &e.files {
+                println!("  → {}", f.display());
+            }
+        }
         Err(e) => {
             eprintln!("导出失败: {e}");
             std::process::exit(1);
-        }
-    }
-
-    // 分时明细：另存一份 xxx_hourly.csv（有分时数据时才写）
-    let stem = out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "kmcounter_export".into());
-    let ext = out.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "csv".into());
-    let hourly_out = out.with_file_name(format!("{stem}_hourly.{ext}"));
-    let mut hlines: Vec<String> = vec![
-        "date,hour,keystrokes,mouse_move_px,mouse_move_meters,mouse_lb,mouse_rb,mouse_mb,mouse_xb,mouse_wheel,mouse_hwheel"
-            .to_string(),
-    ];
-    for (date, d) in &store.days {
-        let mut hrs: Vec<(&u8, &stats::BucketStats)> = d.hours.iter().collect();
-        hrs.sort_by_key(|(h, _)| **h);
-        for (h, u) in hrs {
-            // 作废的小时按 0 导出（与界面一致；原始值仍保留在 stats.json 里）
-            let (ks, px) = if u.invalid { (0, 0.0) } else { (u.keystrokes, u.mouse.move_px) };
-            hlines.push(format!(
-                "{},{},{},{},{:.4},{},{},{},{},{},{}",
-                date,
-                h,
-                ks,
-                px,
-                px_to_m(px),
-                u.mouse.lb,
-                u.mouse.rb,
-                u.mouse.mb,
-                u.mouse.xb,
-                u.mouse.wheel,
-                u.mouse.hwheel
-            ));
-        }
-    }
-    if hlines.len() > 1 {
-        match std::fs::write(&hourly_out, hlines.join("\n") + "\n") {
-            Ok(_) => println!("已导出 {} 个小时的明细 → {}", hlines.len() - 1, hourly_out.display()),
-            Err(e) => eprintln!("分时明细导出失败: {e}"),
         }
     }
 }
@@ -469,7 +461,8 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
 
     // 托盘（失败则窗口关闭即退出）
     let tray_lang = Lang::resolve(&cfg.language);
-    let tray = tray::start(tray_lang);
+    // 初始 HUD 状态：托盘菜单的 ✔ 从一开始就与配置一致（之后由 GUI 在切换时回推）
+    let tray = tray::start(tray_lang, cfg.hud_apm_show, cfg.hud_kps_show);
     let autostart_state = Arc::new(std::sync::atomic::AtomicBool::new(autostart::is_enabled()));
 
     // KDE：按配置维护“跳过任务栏/Alt-Tab”的 KWin 窗口规则（后台执行，避免阻塞启动；仅 Linux）
@@ -489,6 +482,15 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
                 kwin::set_skip_taskbar(skip);
                 kwin::start_hud_pos_service();
                 kwin::sync_hud_listener(ac, kc, ap, kp);
+                // 位置恢复的正道：KWin 窗口规则（窗口 map 时由 KWin 核心应用位置）
+                kwin::sync_hud_rules(ap, kp);
+                // 规则与窗口 map 的竞态补刀：窗口若赶在 KWin 重载规则前 map，规则会漏套
+                //（任务栏从此常驻条目）。窗口起来后把「跳过任务栏」直接钉上去，
+                // 幂等多试几次以覆盖 EGL 初始化耗时不同的启动。
+                for _ in 0..3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    kwin::enforce_skip_taskbar(skip);
+                }
             })
             .ok();
     }
@@ -557,7 +559,7 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     };
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([initial_w, initial_h])
-        .with_min_inner_size([460.0, 360.0]);
+        .with_min_inner_size([crate::gui::MAIN_MIN_W, crate::gui::MAIN_MIN_H]);
     if keep_on_top || debug_panels {
         viewport = viewport.with_always_on_top();
     }
@@ -784,5 +786,26 @@ fn acquire_single_instance() -> Result<(), String> {
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod proc_title_tests {
+    use super::*;
+
+    /// 改写后 /proc/self/cmdline 必须是纯 ASCII（系统监视器不再有乱码的机会）。
+    /// cargo 测试进程的 argv[0] 通常也含中文路径（“项目”），正好走改写分支；
+    /// 若在纯英文路径下跑则函数是 no-op，断言“全 ASCII”同样成立。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_cmdline_is_ascii_after_shorten() {
+        shorten_proc_title_to_ascii();
+        let after = std::fs::read("/proc/self/cmdline").unwrap();
+        assert!(
+            after.iter().all(|b| b.is_ascii()),
+            "改写后 cmdline 仍含非 ASCII：{after:?}"
+        );
+        let first: Vec<u8> = after.iter().take_while(|&&b| b != 0).copied().collect();
+        assert!(!first.is_empty(), "cmdline 第一条参数不应为空：{after:?}");
     }
 }

@@ -7,3 +7,7 @@ KMCounter.ini
 # 软渲染调试输出
 *.ppm
 .workbuddy/
+# 本地备份（改文件前的时间戳快照）
+.dsh-backup/
+# 本地项目记忆
+.dsh-memory/

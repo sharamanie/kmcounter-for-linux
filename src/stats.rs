@@ -340,6 +340,21 @@ fn canonical_kps_key(norm: &str) -> String {
 }
 
 /// KPS (Keys Per Second / 按键每秒) 跟踪器（参照 osu-kps 与 KeysPerSecond）
+/// 把时刻**向下取整到 `period` 的网格**（相位取自挂钟；`Instant` 没有纪元）。
+///
+/// KPS 图的渲染契约是"一个时间片内图形完全静止"，所以网格必须锚在挂钟上：
+/// 同一个片内两次调用得到同一个 `end` → 命中缓存；跨片则整体左移一根柱。
+fn grid_floor(now: Instant, period: std::time::Duration) -> Instant {
+    let pn = period.as_nanos().max(1);
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let rem = (unix % pn) as u64;
+    now.checked_sub(std::time::Duration::from_nanos(rem))
+        .unwrap_or(now)
+}
+
 pub struct KpsTracker {
     actions: VecDeque<Instant>,
     today_peak: f64,
@@ -364,12 +379,11 @@ pub struct KpsTracker {
     session_start: Instant,
     /// 计算方式（硬算 / 灵敏）
     method: KpsMethod,
-    /// KPS 图：每秒一条「该秒内的最大值」（对齐 osu-kps 的 calc_kps_recent）
-    history: VecDeque<(Instant, f64)>,
-    /// 当前这一秒里见过的最大值
-    bucket_max: f64,
-    /// 上一次采样时刻
-    last_sample: Option<Instant>,
+    /// KPS 图：**不攒采样**，按"固定像素宽的时间片"从按键记录现算（见 `history_bars`）。
+    /// 只缓存"当前片"的结果，片内重复取用不重算。
+    graph_cache: Option<(Instant, Vec<f64>)>,
+    /// 「重置 → KPS 图」的清零点：早于它的柱子一律画 0
+    graph_reset_at: Option<Instant>,
 }
 
 impl KpsTracker {
@@ -387,9 +401,8 @@ impl KpsTracker {
             session_actions: 0,
             session_start: Instant::now(),
             method: KpsMethod::Hard,
-            history: VecDeque::new(),
-            bucket_max: 0.0,
-            last_sample: None,
+            graph_cache: None,
+            graph_reset_at: None,
         }
     }
 
@@ -542,8 +555,43 @@ impl KpsTracker {
     }
 
     /// KPS 图的历史（每秒一条，最新在末尾）
-    pub fn history(&self) -> &VecDeque<(Instant, f64)> {
-        &self.history
+    /// KPS 图数据：把 `span_secs` 均分成 `bars` 根柱子，每根 = 该时间片内的**平均 KPS**，
+    /// 从旧到新（最后一个是最新片）。
+    ///
+    /// 渲染契约（主人定的）：
+    /// - **柱宽固定像素**，柱数由图的实际像素宽决定（`bars = 宽 / 柱宽`）；
+    /// - 每根柱子分到 `span_secs / bars` 秒，值 = 这段时间里的平均每秒按键数；
+    /// - 图形**每片才更新一次**：网格锚在挂钟上，同一个片内重复调用返回完全相同的缓存 ——
+    ///   整幅图在一个片内完全静止，片结束整体左移一根柱。视觉上就是干净的平移，
+    ///   不再出现"间距忽有忽无 / 图在变形"。
+    ///
+    /// 尝试过的两种语义都不理想：日历秒计数会把跨秒的爆发切成两根 ✗；
+    /// 每秒滑动窗口在爆发密集时依然逐秒跳变 ✗。固定时间片 + 片内取平均是稳的。
+    pub fn history_bars(&mut self, now: Instant, span_secs: u32, bars: usize) -> Vec<f64> {
+        let bars = bars.max(1).min(span_secs.max(1) as usize); // 每根柱子至少 1 秒
+        let period_s = span_secs as f64 / bars as f64;
+        let period = std::time::Duration::from_secs_f64(period_s);
+        let end = grid_floor(now, period); // 当前片的对齐右边界（挂钟相位）
+        if let Some((cached_end, series)) = &self.graph_cache {
+            if *cached_end == end {
+                return series.clone();
+            }
+        }
+        let window_ms = (period_s * 1000.0).round() as u32;
+        let floor = self.graph_reset_at;
+        let mut out: Vec<f64> = Vec::with_capacity(bars);
+        for i in 0..bars {
+            let at = end.checked_sub(period * (bars - 1 - i) as u32);
+            let v = match at {
+                Some(at) if floor.map_or(true, |f| at >= f) => {
+                    self.calc_kps(&self.actions, at, window_ms)
+                }
+                _ => 0.0,
+            };
+            out.push(v);
+        }
+        self.graph_cache = Some((end, out.clone()));
+        out
     }
 
     fn cleanup(&mut self, now: Instant, date: &str, window_ms: u32) {
@@ -555,15 +603,17 @@ impl KpsTracker {
             self.recent_presses.clear();
             self.recent_releases.clear();
             self.key_times.clear();
-            self.history.clear();
-            self.bucket_max = 0.0;
-            self.last_sample = None;
+            self.graph_cache = None;
+            self.graph_reset_at = None;
             self.session_actions = 0;
             self.session_start = now;
             return;
         }
         // 保留长度：至少覆盖统计窗口；灵敏方式还要 2.5 秒
-        let keep = std::time::Duration::from_millis(window_ms.max(100) as u64).max(SENSITIVE_CONSIDERED);
+        // 保留长度：至少覆盖统计窗口；灵敏方式要 2.5 秒；KPS 图要整整 300 秒
+        let keep = std::time::Duration::from_millis(window_ms.max(100) as u64)
+            .max(SENSITIVE_CONSIDERED)
+            .max(std::time::Duration::from_secs(KPS_HISTORY_MAX as u64));
         while let Some(&front) = self.actions.front() {
             if now.saturating_duration_since(front) > keep {
                 self.actions.pop_front();
@@ -585,22 +635,8 @@ impl KpsTracker {
             self.today_peak = current;
         }
         // KPS 图：每秒采一条「该秒内的最大值」（对齐 osu-kps 一秒一条的历史）
-        match self.last_sample {
-            Some(t) if now.saturating_duration_since(t) < std::time::Duration::from_millis(1000) => {
-                if current > self.bucket_max {
-                    self.bucket_max = current;
-                }
-            }
-            _ => {
-                let sample = self.bucket_max.max(current);
-                self.history.push_back((now, sample));
-                self.bucket_max = current;
-                self.last_sample = Some(now);
-                while self.history.len() > KPS_HISTORY_MAX {
-                    self.history.pop_front();
-                }
-            }
-        }
+        // KPS 图不在这里攒采样 —— 见 `history_bars`：固定像素宽的时间片、片内取平均，
+        // 图形一个片才更新一次（网格锚在挂钟上，片内完全静止、跨片整体左移一根柱）。
     }
 
     /// 按当前计算方式算 KPS（`times` 是该口径下的击键时刻表）
@@ -608,11 +644,19 @@ impl KpsTracker {
         match self.method {
             KpsMethod::Hard => {
                 let window = std::time::Duration::from_millis(window_ms.max(100) as u64);
-                let n = times
-                    .iter()
-                    .rev()
-                    .take_while(|t| now.saturating_duration_since(**t) <= window)
-                    .count();
+                // 从最新往回扫。**不能用 take_while 挡"未来的击键"**：它一遇到 false 就整体
+                // 停止，而回放历史时刻时最前面几条恰恰都是"未来"的 —— 会直接把整格算成 0。
+                // 必须逐条跳过。
+                let mut n = 0usize;
+                for t in times.iter().rev() {
+                    if *t > now {
+                        continue; // 比现在这一刻还新的击键：不算
+                    }
+                    if now.saturating_duration_since(*t) > window {
+                        break; // 队列按时间升序，更旧的都在窗口外
+                    }
+                    n += 1;
+                }
                 let sec = (window_ms.max(100) as f64 / 1000.0).max(1.0);
                 n as f64 / sec
             }
@@ -620,6 +664,9 @@ impl KpsTracker {
                 let mut best = 0.0f64;
                 let mut count = 0u32;
                 for t in times.iter().rev() {
+                    if *t > now {
+                        continue; // 未来的击键不算（KPS 图会回放历史时刻）
+                    }
                     let dt = now.saturating_duration_since(*t);
                     if dt > SENSITIVE_CONSIDERED {
                         break;
@@ -650,9 +697,9 @@ impl KpsTracker {
 
     /// 只清 KPS 图的历史（「重置 → KPS 图」）
     pub fn reset_graph(&mut self) {
-        self.history.clear();
-        self.bucket_max = 0.0;
-        self.last_sample = None;
+        // 图是现算的，"清空图"就是记一个清零点：早于它的柱子画 0
+        self.graph_reset_at = Some(Instant::now());
+        self.graph_cache = None;
     }
 
     /// 全部清零（「重置 → 以上所有」）：峰值 + 按键总次数 + KPS 图 + 平均 KPS 的起算点
@@ -886,10 +933,14 @@ impl Store {
                     s
                 }
                 Err(e) => {
-                    // 尝试备份损坏文件
-                    let bak = path.with_extension("json.bak");
-                    let _ = std::fs::rename(path, &bak);
-                    log::warn!("统计数据解析失败({e})，原文件已备份为 {}，从头开始统计", bak.display());
+                    // 损坏留档（带时间戳，不覆盖以前的留档）后重新开始统计
+                    match crate::fsutil::quarantine_corrupt(path) {
+                        Some(bak) => log::warn!(
+                            "统计数据解析失败({e})，原文件已留档为 {}，从头开始统计",
+                            bak.display()
+                        ),
+                        None => log::warn!("统计数据解析失败({e})，且留档失败，从头开始统计"),
+                    }
                     Store::default()
                 }
             },
@@ -1489,9 +1540,30 @@ mod tests {
         assert_eq!(query[4].glow, 0.0);
 
         // KPS 历史：第一次取值就落一条采样（之后每秒一条），重置时清空
-        assert_eq!(tracker.history().len(), 1);
+        // KPS 图：柱数/片宽由渲染端决定；这里用 30 秒 / 10 根 → 每片 3 秒
+        let series = tracker.history_bars(Instant::now(), 30, 10);
+        assert_eq!(series.len(), 10);
+        // 给 KPS 图补一次击键。注入点必须同时满足两个条件，且与跑到的时刻无关：
+        // ① 落在图的最新柱内：柱的统计窗口是 (片起点-3s, 片起点]，动作晚于片起点就哪根柱都进不了
+        //    （之前取「now-2s」，跑到片内第 2 秒之后注入点就晚于片起点，柱子全空——偶发失败）；
+        // ② 落在 1 秒 KPS 窗口外：否则「当前 KPS」的断言会把这次注入也算进去。
+        // 「片起点往前 1.5 秒」两者兼得：∈ (片起点-3s, 片起点]，且距 now 至少 1.5 秒。
+        let at = grid_floor(Instant::now(), std::time::Duration::from_secs(3))
+            .checked_sub(std::time::Duration::from_millis(1500))
+            .unwrap();
+        // 注入后要失效图的缓存：片内缓存是设计如此（同一片内重复取返回同一份），
+        // 不失效的话"先取图、再补击键"在同一片内永远看不到新柱子（这条断言以前就是这么挂的）
+        tracker.actions.push_front(at);
+        tracker.graph_cache = None;
+        assert!(
+            tracker.history_bars(Instant::now(), 30, 10).iter().any(|v| *v > 0.0),
+            "有击键，图上应该有柱子"
+        );
         tracker.reset_all();
-        assert_eq!(tracker.history().len(), 0, "重置要把 KPS 图一起清掉");
+        assert!(
+            tracker.history_bars(Instant::now(), 30, 10).iter().all(|v| *v == 0.0),
+            "重置要把 KPS 图一起清掉"
+        );
     }
 
     /// 重置菜单的四个选项各管各的（对齐 osu-kps：按键总次数 / 最大 KPS / KPS 图 / 以上所有）
@@ -1504,13 +1576,41 @@ mod tests {
         }
         assert_eq!(t.peak(), 3.0);
         assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 3);
-        assert!(!t.history().is_empty(), "取值后应有历史采样");
+        // 给 KPS 图补一次击键。注入点必须同时满足两个条件，且与跑到的时刻无关：
+        // ① 落在图的最新柱内：柱的统计窗口是 (片起点-3s, 片起点]，动作晚于片起点就哪根柱都进不了
+        //    （之前取「now-2s」，跑到片内第 2 秒之后注入点就晚于片起点，柱子全空——偶发失败）；
+        // ② 落在 1 秒 KPS 窗口外：否则「当前 KPS」的断言会把这次注入也算进去。
+        // 「片起点往前 1.5 秒」两者兼得：∈ (片起点-3s, 片起点]，且距 now 至少 1.5 秒。
+        let at = grid_floor(Instant::now(), std::time::Duration::from_secs(3))
+            .checked_sub(std::time::Duration::from_millis(1500))
+            .unwrap();
+        // 注入的时间戳比已有的更早 → 必须放队首：`actions` 的约定是「队尾最新」，
+        // 从队尾往回扫到第一条超窗的就停；放在队尾会让扫描立刻 break，KPS 恒为 0
+        t.actions.push_front(at);
+        t.graph_cache = None; // 同上：注入后必须失效片内缓存
+        assert!(
+            t.history_bars(Instant::now(), 30, 10).iter().any(|v| *v > 0.0),
+            "有击键，图上应该有柱子"
+        );
 
         // 只清最大 KPS
         t.reset_peak();
         assert_eq!(t.peak(), 0.0, "峰值被清零");
         assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 3, "计数不受影响");
-        assert!(!t.history().is_empty(), "图不受影响");
+        // 给 KPS 图补一次击键。注入点必须同时满足两个条件，且与跑到的时刻无关：
+        // ① 落在图的最新柱内：柱的统计窗口是 (片起点-3s, 片起点]，动作晚于片起点就哪根柱都进不了
+        //    （之前取「now-2s」，跑到片内第 2 秒之后注入点就晚于片起点，柱子全空——偶发失败）；
+        // ② 落在 1 秒 KPS 窗口外：否则「当前 KPS」的断言会把这次注入也算进去。
+        // 「片起点往前 1.5 秒」两者兼得：∈ (片起点-3s, 片起点]，且距 now 至少 1.5 秒。
+        let at = grid_floor(Instant::now(), std::time::Duration::from_secs(3))
+            .checked_sub(std::time::Duration::from_millis(1500))
+            .unwrap();
+        t.actions.push_front(at);
+        t.graph_cache = None;
+        assert!(
+            t.history_bars(Instant::now(), 30, 10).iter().any(|v| *v > 0.0),
+            "图不受影响（图是现算的）"
+        );
 
         // 只清按键总次数
         t.reset_counts();
@@ -1519,15 +1619,42 @@ mod tests {
 
         // 只清 KPS 图
         t.reset_graph();
-        assert!(t.history().is_empty(), "历史被清掉");
+        assert!(
+        t.history_bars(Instant::now(), 30, 10).iter().all(|v| *v == 0.0),
+        "历史被清掉（清零点之后的柱子才有数据）"
+        );
 
         // 以上所有：连平均的起算点一起归零
         t.record("20261013", "Z", 1000);
         t.reset_all();
         assert_eq!(t.peak(), 0.0);
         assert_eq!(t.query_keys(&["Z".into()], 1000)[0].hits, 0);
-        assert!(t.history().is_empty());
+        assert!(t.history_bars(Instant::now(), 30, 10).iter().all(|v| *v == 0.0));
     }
+
+    /// KPS 图的**一致性**：稳定 2 次/秒的节奏下，每根柱子（3 秒/根）都该是 2 —— 不能忽高忽低。
+    #[test]
+    fn kps_graph_is_flat_for_steady_rhythm() {
+        let mut t = KpsTracker::new("20261013");
+        t.set_monitored(&["Z".into()]);
+        let now = Instant::now();
+        // 过去 30 秒、每 500ms 一次 = 稳定 2 KPS（直接塞时间戳，模拟真实节奏）
+        for i in 0..60u64 {
+            let dt = std::time::Duration::from_millis(30_000 - i * 500);
+            t.actions.push_back(now.checked_sub(dt).expect("测试时间戳不该越过进程启动"));
+        }
+        let series = t.history_bars(now, 30, 10);
+        assert_eq!(series.len(), 10);
+        // 跳过最旧/最新各 1 根（相位/边界），中间的柱子高度必须完全一致
+        let mid = &series[1..9];
+        let first = mid[0];
+        assert!(
+            mid.iter().all(|v| (*v - first).abs() < 1e-9),
+            "稳定节奏应该画成平的一条：{series:?}"
+        );
+        assert!((2.0..=2.5).contains(&first), "数值该在 2 上下：{first}");
+    }
+
 
     /// 计算方式的配置映射可来回转换（from_config / as_config）
     #[test]

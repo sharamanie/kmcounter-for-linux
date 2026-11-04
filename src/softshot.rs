@@ -735,6 +735,102 @@ mod tests {
     }
 
     /// 调试用：按 y 顺序打印一帧里的所有文案（排查设置面板排版）
+    /// 设置窗**自己**的背景不透明度不能跟着 HUD 的不透明度走 —— 主人报过：
+    /// 拖"不透明度"时设置窗自己变透明了，既看不清也以为改错了对象。
+    #[test]
+    fn settings_window_stays_opaque_when_hud_opacity_is_low() {
+        let mut cfg = Config::default();
+        cfg.kps_hud_opacity = 20; // 悬浮窗本体很透明
+        cfg.hud_kps_show = false; // 关掉悬浮窗本体，画面里只剩设置窗
+        cfg.hud_apm_show = false;
+        let (mut app, ctx) = headless_app_with_cfg(Store::default(), cfg);
+        app.debug_open_hud_settings("kps");
+
+        let frame = |app: &mut App, ctx: &egui::Context| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1260.0, 900.0)));
+            raw.time = Some(next_time());
+            ctx.run(raw, |ctx| app.draw(ctx)).shapes
+        };
+        let _ = frame(&mut app, &ctx); // 第一帧建视口
+        let shapes = frame(&mut app, &ctx);
+
+        // 设置窗背景 = (16,18,24) 的圆角矩形。kps_hud_opacity=20 时它的 alpha 仍必须是 255
+        let mut alphas: Vec<u8> = Vec::new();
+        fn visit(sh: &egui::Shape, out: &mut Vec<u8>) {
+            match sh {
+                egui::Shape::Rect(r) if r.fill.r() == 16 && r.fill.g() == 18 && r.fill.b() == 24 => {
+                    out.push(r.fill.a())
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| visit(s, out)),
+                _ => {}
+            }
+        }
+        for cs in &shapes {
+            visit(&cs.shape, &mut alphas);
+        }
+        assert!(!alphas.is_empty(), "没找到设置窗背景矩形");
+        assert!(
+            alphas.iter().all(|a| *a == 255),
+            "设置窗背景不该跟着 kps_hud_opacity 变透明：{alphas:?}"
+        );
+    }
+
+    /// 进帮助页要收起底部「展开更多」（否则窗口停在展开后的高度）—— 用户第三十七轮
+    #[test]
+    fn entering_help_collapses_panel() {
+        let (mut app, ctx) = headless_app(Store::default());
+        app.debug_open_panel();
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        assert!(app.debug_more_open(), "前提：面板已展开");
+
+        // 点一下 "?"（与真实点击同一份 `toggle_help`）
+        app.debug_toggle_help();
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        assert!(app.debug_help_open(), "应该进了帮助页");
+        assert!(!app.debug_more_open(), "进帮助页要收起「展开更多」");
+
+        // 退出帮助页：保持收起状态（不自动弹回去）
+        app.debug_toggle_help();
+        drive(&mut app, &ctx, 1260.0, 900.0, 3, vec![]);
+        assert!(!app.debug_help_open() && !app.debug_more_open());
+    }
+
+    /// 帮助页是**独立页面**：滚轮只滚它自己，不该把日期翻走；
+    /// 退出帮助页后滚轮恢复翻日期。（用户第三十四轮报的 bug）
+    #[test]
+    fn help_page_owns_wheel_and_hides_chrome() {
+        // 要有两天以上的数据，翻页才有东西可翻（空 store 时 nav_history 直接 return）
+        let mut store = Store::default();
+        for (d, k) in [("20261012", 100u64), ("20261013", 200u64)] {
+            let mut day = crate::stats::DayEntry::default();
+            day.bucket.keystrokes = k;
+            store.days.insert(d.to_string(), day);
+        }
+        let (mut app, ctx) = headless_app(store);
+        // 向下滚 = 往更早的日期翻（"总计"视角向上滚本来就是空操作，测不出东西）
+        let wheel = vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -80.0),
+            modifiers: Default::default(),
+        }];
+
+        // 先进帮助页，再滚 —— 日期必须纹丝不动
+        app.debug_open_help();
+        drive(&mut app, &ctx, 1260.0, 500.0, 3, vec![]);
+        let before = app.debug_nav_label();
+        drive(&mut app, &ctx, 1260.0, 500.0, 2, wheel.clone());
+        drive(&mut app, &ctx, 1260.0, 500.0, 2, wheel.clone());
+        assert_eq!(app.debug_nav_label(), before, "帮助页里滚轮不该翻日期");
+
+        // 退出帮助页后，同样的滚轮要能翻
+        app.debug_close_help();
+        drive(&mut app, &ctx, 1260.0, 500.0, 2, vec![]);
+        drive(&mut app, &ctx, 1260.0, 500.0, 2, wheel.clone());
+        drive(&mut app, &ctx, 1260.0, 500.0, 2, wheel);
+        assert_ne!(app.debug_nav_label(), before, "普通页面里滚轮应该照旧翻日期");
+    }
+
     #[test]
     #[ignore]
     fn dump_frame_texts() {
@@ -751,7 +847,12 @@ mod tests {
         if panels.contains("stats") || panels.contains("settings") || panels.contains("both") {
             app.debug_open_panel();
         }
-        if panels.contains("trend") {
+        if panels.contains("kpscfg") || panels.contains("apmcfg") {
+            app.debug_open_hud_settings(&panels);
+        }
+        if panels.contains("help") {
+            app.debug_open_help();
+        } else if panels.contains("trend") {
             app.debug_set_trend_page();
         } else if panels.contains("rank") {
             app.debug_open_rank_page();
@@ -1243,6 +1344,61 @@ mod tests {
                 assert!(*x + *w <= w_68 - 10.0, "68 文本 '{}' 超出窗口安全边界", t);
             }
         }
+    }
+
+    /// 从托盘呼出（解除停放）后：窗口高度回到内容高度，且不被误判成「用户手动缩放」
+    #[test]
+    fn unpark_restores_content_height() {
+        let (mut app, ctx) = headless_app(store_with_days(5));
+
+        // 模拟 WM：把窗口尺寸调成 App 下发的目标（尺寸到位后目标才会清空）
+        let mut w = 1260.0f32;
+        let mut h = 900.0f32;
+        let mut settle = |app: &mut App, ctx: &egui::Context, frames: usize, w: &mut f32, h: &mut f32| {
+            for _ in 0..frames {
+                drive(app, ctx, *w, *h, 1, vec![]);
+                if let Some(t) = app.debug_resize_target() {
+                    *h = t;
+                }
+                if let Some(t) = app.debug_resize_target_w() {
+                    *w = t;
+                }
+            }
+        };
+        settle(&mut app, &ctx, 8, &mut w, &mut h);
+        let (base_h, _, _, _) = app.debug_layout();
+        assert!(base_h > 200.0 && base_h < 700.0, "基准高度应贴合内容：{base_h}");
+        assert!((h - base_h).abs() < 2.0, "稳定后窗口高度应等于基准高度：{h} vs {base_h}");
+        assert!(app.debug_resize_target().is_none(), "尺寸到位后不该还有待下发的目标");
+        assert!(!app.debug_user_sized(), "初始不该被判定为用户缩放");
+
+        // 收起到托盘：Wayland 下是「停放」——窗口被压到 32px，但保持 mapped
+        app.debug_set_ui_hidden(true);
+        drive(&mut app, &ctx, 32.0, 32.0, 3, vec![]);
+        let (base_while_parked, _, _, _) = app.debug_layout();
+        assert!(
+            (base_while_parked - base_h).abs() < 2.0,
+            "停放期间基准高度不该被压扁的布局改写：{base_h} → {base_while_parked}"
+        );
+
+        // 呼出：第一帧窗口还是停放时的尺寸（WM 与 KWin 脚本还没恢复）。
+        // 宽度先摆回正常值，好让「用户手动缩放」的判定只剩高度这一条会误触发
+        app.debug_set_ui_hidden(false);
+        drive(&mut app, &ctx, w, 32.0, 1, vec![]);
+        assert!(!app.debug_user_sized(), "解除停放那一帧不该被当成用户手动缩放");
+        let w0 = w;
+        let h0 = h;
+        w = 32.0;
+        h = 32.0;
+        settle(&mut app, &ctx, 8, &mut w, &mut h);
+        let (base_h2, _, _, _) = app.debug_layout();
+        assert!(!app.debug_user_sized(), "解除停放不该被当成用户手动缩放（自适应会永久停摆）");
+        assert!((base_h2 - base_h).abs() < 2.0, "呼出后基准高度应回到内容高度：{base_h} → {base_h2}");
+        assert!(
+            (h - base_h).abs() < 2.0,
+            "呼出后窗口高度应回到内容高度 {base_h}，实际 {h}（以前会被撑到 BASE_H=500）"
+        );
+        let _ = (w0, h0);
     }
 
     /// 排行页：列出名次、点某一行跳到热力图并选中该键

@@ -330,10 +330,13 @@ impl Config {
                     // 解析失败：先把原文件备份下来再退回默认配置。
                     // 不能当成“首次运行”（否则欢迎横幅重弹，且退出时会把默认配置写回去、
                     // 用户那处笔误就被静默吞掉了）。
-                    let bak = path.with_extension("toml.bak");
-                    match std::fs::copy(path, &bak) {
-                        Ok(_) => log::warn!("配置解析失败({e})，原文件已备份为 {}，本次使用默认配置", bak.display()),
-                        Err(cp) => log::warn!("配置解析失败({e})，使用默认配置（备份失败: {cp}）"),
+                    let bak = crate::fsutil::quarantine_corrupt(path);
+                    match bak {
+                        Some(bak) => log::warn!(
+                            "配置解析失败({e})，原文件已留档为 {}，本次使用默认配置",
+                            bak.display()
+                        ),
+                        None => log::warn!("配置解析失败({e})，使用默认配置（留档失败）"),
                     }
                     (Config::default(), false)
                 }
@@ -688,8 +691,13 @@ mod tests {
         let (cfg, first_run) = Config::load(&path);
         assert!(!first_run, "解析失败不应被当成首次运行");
         assert_eq!(cfg.language, "auto", "退回默认配置");
-        let bak = dir.join("config.toml.bak");
-        assert!(bak.exists(), "原文件应备份为 config.toml.bak");
+        // 留档名带时间戳（`config.toml.corrupt-<时间戳>`），不覆盖以前的留档
+        let bak = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.file_name().map(|n| n.to_string_lossy().contains(".corrupt-")).unwrap_or(false))
+            .expect("原文件应留档为 *.corrupt-*");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "language = \"zh\"\nthis is not toml =\n");
         std::fs::remove_dir_all(dir).ok();
     }

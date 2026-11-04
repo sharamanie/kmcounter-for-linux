@@ -13,6 +13,29 @@ pub fn unique_tmp(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()))
 }
 
+/// 把**损坏**的数据文件改名留档，返回留档路径（`<名字>.corrupt-<YYYYMMDD-HHMMSS>`）。
+///
+/// 为什么带时间戳：固定叫 `.bak` 时，第二次损坏会把第一次的留档覆盖掉 —— 用户真正想找回的
+/// 往往是最早那份（后来写的可能已经是空壳）。改名而不是删，是"损坏也绝不丢数据"的底线。
+pub fn quarantine_corrupt(path: &Path) -> Option<PathBuf> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let name = path.file_name()?.to_string_lossy().to_string();
+    // 同一秒内连续损坏会撞名：加序号，绝不覆盖已有留档
+    let mut bak = path.with_file_name(format!("{name}.corrupt-{stamp}"));
+    let mut seq = 2;
+    while bak.exists() {
+        bak = path.with_file_name(format!("{name}.corrupt-{stamp}-{seq}"));
+        seq += 1;
+    }
+    match std::fs::rename(path, &bak) {
+        Ok(_) => Some(bak),
+        Err(e) => {
+            log::warn!("损坏文件留档失败（{} → {}）: {e}", path.display(), bak.display());
+            None
+        }
+    }
+}
+
 /// 原子写文件：写唯一临时文件 → 落盘 → rename 覆盖目标。
 /// 失败时清理临时文件，目标文件保持原样。
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -92,4 +115,24 @@ mod tests {
         std::fs::remove_file(&fresh).ok();
         std::fs::remove_dir_all(dir).ok();
     }
+    /// 损坏留档要带时间戳：连续两次损坏不能互相覆盖（第二次别把第一次的备份冲掉）
+    #[test]
+    fn quarantine_keeps_every_corrupt_copy() {
+        let dir = std::env::temp_dir().join(format!("kmc_quarantine_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json");
+        std::fs::write(&path, b"bad-1").unwrap();
+        let first = super::quarantine_corrupt(&path).expect("第一次留档");
+        std::fs::write(&path, b"bad-2").unwrap();
+        // 同一秒内连续两次也要能分开（时间戳精度到秒，重名时第二次仍会覆盖 —— 这里只断言第一次还在）
+        let second = super::quarantine_corrupt(&path).map(|p| p);
+        assert!(first.exists(), "第一次的留档不能被覆盖：{first:?}");
+        if let Some(second) = second {
+            assert!(second.exists());
+            assert_ne!(first, second);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

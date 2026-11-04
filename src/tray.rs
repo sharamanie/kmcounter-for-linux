@@ -16,6 +16,12 @@ pub enum TrayCmd {
     Exit,
     /// GUI → 托盘：开机启动勾选状态变化
     AutostartState(bool),
+    /// GUI → 托盘：HUD 悬浮窗开关状态变化（APM / KPS 两项的 ✔ 勾选）
+    ///
+    /// 走「GUI 回推」而不是托盘本地翻转：HUD 开关有三个入口（托盘菜单、主面板按钮、
+    /// 设置保存），只有真正在渲染循环里完成切换的一方知道最终状态。由它回推，
+    /// 三处入口的勾选显示自然一致。
+    HudState { apm: bool, kps: bool },
     /// GUI → 托盘：界面语言变化（托盘菜单跟着切）
     Language(Lang),
 }
@@ -86,6 +92,10 @@ mod imp {
     struct KTray {
         tx: std::sync::mpsc::Sender<TrayCmd>,
         autostart: bool,
+        /// APM 悬浮窗当前是否显示（决定菜单项的 ✔）
+        hud_apm: bool,
+        /// KPS 悬浮窗当前是否显示（决定菜单项的 ✔）
+        hud_kps: bool,
         tip: String,
         lang: Lang,
     }
@@ -145,16 +155,18 @@ mod imp {
                     ..Default::default()
                 }
                 .into(),
-                StandardItem {
+                CheckmarkItem {
                     label: s.hud_apm_title.into(),
+                    checked: self.hud_apm,
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.send(TrayCmd::ToggleApmHud);
                     }),
                     ..Default::default()
                 }
                 .into(),
-                StandardItem {
+                CheckmarkItem {
                     label: s.hud_kps_title.into(),
+                    checked: self.hud_kps,
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.send(TrayCmd::ToggleKpsHud);
                     }),
@@ -188,14 +200,22 @@ mod imp {
         }
     }
 
-    pub fn start(lang: Lang) -> Option<Tray> {
+    pub fn start(lang: Lang, hud_apm: bool, hud_kps: bool) -> Option<Tray> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TrayCmd>();
         let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<TrayCmd>();
 
         // ksni::blocking 的 spawn 自带线程与事件循环
         let autostart = crate::autostart::is_enabled();
         let tip = strings(lang).welcome_main.to_string();
-        let tray = KTray { tx: cmd_tx.clone(), autostart, tip, lang };
+        // 初始勾选对齐配置：托盘刚起来时菜单就已经是对的（GUI 起来后还会再回推一次）
+        let tray = KTray {
+            tx: cmd_tx.clone(),
+            autostart,
+            hud_apm: hud_apm,
+            hud_kps: hud_kps,
+            tip,
+            lang,
+        };
         let handle = match ksni::blocking::TrayMethods::spawn(tray) {
             Ok(h) => h,
             Err(e) => {
@@ -213,6 +233,12 @@ mod imp {
                         TrayCmd::AutostartState(b) => {
                             handle.update(|t: &mut KTray| {
                                 t.autostart = b;
+                            });
+                        }
+                        TrayCmd::HudState { apm, kps } => {
+                            handle.update(|t: &mut KTray| {
+                                t.hud_apm = apm;
+                                t.hud_kps = kps;
                             });
                         }
                         TrayCmd::Language(l) => {
@@ -252,6 +278,9 @@ mod imp {
         }
     }
     static HMENU: Mutex<usize> = Mutex::new(0);
+    /// APM / KPS 悬浮窗当前是否显示（菜单项 ✔ 的来源；由 GUI 回推或菜单构建时读取）
+    static HUD_APM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HUD_KPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     /// 托盘窗口句柄与图标：Explorer 重启后要重新添加图标
     static TRAY_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static TRAY_ICON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -346,8 +375,11 @@ mod imp {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, 0, ID_STATS as usize, wide(s.menu_stats).as_ptr());
         AppendMenuW(menu, 0, ID_SETTINGS as usize, wide(s.menu_settings).as_ptr());
-        AppendMenuW(menu, 0, ID_APM_HUD as usize, wide(s.hud_apm_title).as_ptr());
-        AppendMenuW(menu, 0, ID_KPS_HUD as usize, wide(s.hud_kps_title).as_ptr());
+        // HUD 两项带 ✔：勾选态跟随 HUD_APM / HUD_KPS（MF_CHECKED 与 MF_UNCHECKED 互斥，按状态二选一）
+        let apm_checked = if HUD_APM.load(std::sync::atomic::Ordering::Relaxed) { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(menu, apm_checked, ID_APM_HUD as usize, wide(s.hud_apm_title).as_ptr());
+        let kps_checked = if HUD_KPS.load(std::sync::atomic::Ordering::Relaxed) { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(menu, kps_checked, ID_KPS_HUD as usize, wide(s.hud_kps_title).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         let checked = if crate::autostart::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
         AppendMenuW(menu, checked, ID_AUTOSTART as usize, wide(s.menu_autostart).as_ptr());
@@ -433,6 +465,21 @@ mod imp {
                                     MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED },
                                 );
                             }
+                            TrayCmd::HudState { apm, kps } => {
+                                HUD_APM.store(apm, std::sync::atomic::Ordering::Relaxed);
+                                HUD_KPS.store(kps, std::sync::atomic::Ordering::Relaxed);
+                                let menu = *HMENU.lock().unwrap() as HMENU;
+                                CheckMenuItem(
+                                    menu,
+                                    ID_APM_HUD,
+                                    MF_BYCOMMAND | if apm { MF_CHECKED } else { MF_UNCHECKED },
+                                );
+                                CheckMenuItem(
+                                    menu,
+                                    ID_KPS_HUD,
+                                    MF_BYCOMMAND | if kps { MF_CHECKED } else { MF_UNCHECKED },
+                                );
+                            }
                             TrayCmd::Language(l) => {
                                 LANG_CODE.store(if l == Lang::Zh { 0 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
                                 // 菜单文字在构建时确定，改语言后重建一次
@@ -462,10 +509,12 @@ mod imp {
         }
     }
 
-    pub fn start(lang: Lang) -> Option<Tray> {
+    pub fn start(lang: Lang, hud_apm: bool, hud_kps: bool) -> Option<Tray> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<TrayCmd>();
         let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<TrayCmd>();
         let _ = TX_GUI.set(cmd_tx.clone());
+        HUD_APM.store(hud_apm, std::sync::atomic::Ordering::Relaxed);
+        HUD_KPS.store(hud_kps, std::sync::atomic::Ordering::Relaxed);
         LANG_CODE.store(if lang == Lang::Zh { 0 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
         let _ = CTL_RX.set(Mutex::new(ctl_rx));
 
@@ -558,12 +607,13 @@ mod imp {
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use super::Tray;
-    pub fn start(_lang: Lang) -> Option<Tray> {
+    pub fn start(_lang: Lang, _hud_apm: bool, _hud_kps: bool) -> Option<Tray> {
         None
     }
 }
 
 /// 启动托盘。失败返回 None（GUI 会用“关闭即退出”模式兜底）。
-pub fn start(lang: Lang) -> Option<Tray> {
-    imp::start(lang)
+/// `hud_apm` / `hud_kps`：启动时两个悬浮窗的显示状态，决定菜单项的初始 ✔。
+pub fn start(lang: Lang, hud_apm: bool, hud_kps: bool) -> Option<Tray> {
+    imp::start(lang, hud_apm, hud_kps)
 }
