@@ -15,13 +15,11 @@
 //!
 //! 坐标约定：
 //! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
-//! - 渐隐：**锚定在「条的可见顶端」**，不是锚定在轨道顶。从顶端往下 FADE_BAND_FRAC 那段
-//!   越往下越实，顶端恒为 0。锚点取 min(前沿, 轨道顶)：
-//!   - 条还没长到轨道顶时，锚点 = 前沿，于是**任何时候的条都有顶端淡出**，不会出现
-//!     「短的时候没渐变、长到顶才突然一大段渐变」（主人报过正是这个）；
-//!   - 条越过轨道顶后，锚点 = 轨道顶（可见顶端已被裁在那里），渐变固定在顶部，
-//!     条继续上飘时底部被逐段裁掉，看起来是「从顶部慢慢化开」。
-//!   两个阶段在「前沿正好到达轨道顶」处取值相同，所以切换是连续的。
+//! - 渐隐：**锚定在轨道顶部**。轨道顶部往下 FADE_BAND_FRAC 那一段是渐隐带，
+//!   带内越靠上越透明、到轨道顶恰好 0；**带下方完全满亮**。
+//!   所以一条刚长出来、还贴着键格的短雨是**纯实心**的，不会莫名其妙就淡掉
+//!   （主人明确要求过「没有到达上方就不该有渐隐」）；
+//!   只有当它升到上方、长进这一段之后，上端才开始化开。
 //!   曲线用 smoothstep：两端导数为 0，进入 / 离开渐隐带都不会出现横向"折痕"；
 //! - 条宽 = 键格宽 × `kps_rain_width_pct`（**略窄于键格**，看起来是键格上长出的一根柱子）；
 //! - 颜色固定取 `kps_rain_color`（默认纯白），**不随 KPS 热度变色** —— 雨是"运动轨迹"，
@@ -108,12 +106,13 @@ pub(crate) fn rain_lifespan_secs(_cfg: &Config) -> f32 {
     RAIN_SAMPLE_SECS
 }
 
-/// 渐隐带占**可见条长**的默认比例（配置项 kps_rain_fade_pct 为 0 时用它）。
+/// 渐隐带占**轨道高度**的默认比例（配置项 kps_rain_fade_pct 为 0 时用它）。
 ///
-/// 0.28 是手调的结果：0.1 以下渐变挤在顶端几个像素里、像被砍断；
-/// 0.5 以上整根雨都偏淡，失去"实心柱向上冲"的观感。
-/// 注意分母是**可见条长**而不是轨道高度 —— 见 fade_band_h 的说明。
-pub(crate) const FADE_BAND_FRAC_DEFAULT: f32 = 0.28;
+/// 0.35 是手调的结果：0.1 以下渐变挤在顶部几个像素里、像被砍断；
+/// 0.6 以上几乎整条轨道都在淡，短雨也会显得发灰。
+/// 分母是轨道高度（不是条长）—— 这样渐变区在屏幕上的**位置和长度都是固定的**，
+/// 不会随条的长短忽大忽小。
+pub(crate) const FADE_BAND_FRAC_DEFAULT: f32 = 0.35;
 
 /// 渐隐带占轨道高度的比例（5%~90%，来自配置；0 视为默认）。
 fn fade_band_frac(cfg: &Config) -> f32 {
@@ -124,39 +123,41 @@ fn fade_band_frac(cfg: &Config) -> f32 {
     }
 }
 
-/// 渐隐带高度。两个约束取小：
-/// - 轨道高度 x 比例 —— 条很长时渐变区不再无限变长，观感稳定；
-/// - 可见条长        —— 条还很短时，带不至于比条本身还长（否则整条都被泡淡）。
+/// 渐隐带高度：**只由轨道高度决定**（至少 1px，避免除零）。
 ///
-/// 用「可见条长」作上限而不是原始条长：条顶端出轨道后可见长度会不断缩短，
-/// 让带跟着缩短，整条雨才能干净地化掉，而不是到最后留下一截半透明的残根。
-fn fade_band_h(h: f32, vis_len: f32, cfg: &Config) -> f32 {
-    (h * fade_band_frac(cfg)).min(vis_len).max(1.0)
+/// 刻意不掺入"条长"或"可见长度"：渐变区在屏幕上的位置与长度必须是常量，
+/// 否则条一长一短，渐变区就跟着伸缩，观感会忽强忽弱（主人报过"渐变突然延伸到很靠后"）。
+fn fade_band_h(h: f32, cfg: &Config) -> f32 {
+    (h * fade_band_frac(cfg)).max(1.0)
 }
 
 /// 某个高度处的透明度系数 —— **键雨渐隐的唯一入口，按位置计算**。
 ///
-/// - from_cell：该点到键格顶边的高度（越大越靠屏幕上方）；
-/// - anchor：渐隐锚点 = 可见顶端的高度 min(前沿, 轨道顶)；
-/// - band：从锚点往下多长一段淡完。
+/// - from_cell：该点到键格顶边的高度（0 = 贴着键格，h = 轨道顶）；
+/// - h：轨道高度；
+/// - band：渐隐带高度（由轨道高度 `X` 比例得出，常量）。
 ///
-/// 锚点处 alpha = 0，往下 band 之后 alpha = 1，中间 smoothstep。
-/// **关键：锚点跟着条的可见顶端走**，所以任何长度的条都有顶端淡出，
-/// 不会出现「短的时候没渐变、长到顶才突然一大段渐变」。
-/// 而锚点取 min(前沿, 轨道顶) 又保证条出顶后渐变固定在轨道顶部、继续上飘时从底部被裁。
+/// 三种情形：
+/// - 带下方（from_cell 不超过 h - band）：返回 1.0，**完全满亮** ——
+///   刚长出来的短雨就处在这里，所以它看起来是纯实心的一根；
+/// - 带内：从 1.0 平滑降到 0.0；
+/// - 到轨道顶：恰好 0。
 ///
-/// 从不用"整条统一 alpha 随前沿变淡"：那种观感是「整条一起消失」，主人明确否掉过。
-fn rain_alpha(from_cell: f32, anchor: f32, band: f32) -> f32 {
-    if band <= 0.0 {
-        return if from_cell >= anchor { 0.0 } else { 1.0 };
-    }
-    let depth = (anchor - from_cell).max(0.0);
-    if depth >= band {
+/// 渐变区的位置与长度只由 (h, band) 决定，与条多长、按了多久、第几列无关。
+/// 从来不用"整条统一 alpha 随前沿变淡"：那种观感是「整条一起消失」，主人明确否掉过。
+/// 也**不用"锚点跟条顶端走"**：那样短雨在底部就会淡掉，主人同样否掉了。
+fn rain_alpha(from_cell: f32, h: f32, band: f32) -> f32 {
+    if h <= 0.0 || band <= 0.0 {
         return 1.0;
     }
-    // t: 0 = 恰在锚点（全透明），1 = 带的下边界（满亮）
-    let t = (depth / band).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+    let band_start = h - band;
+    if from_cell <= band_start {
+        return 1.0;
+    }
+    // t: 0 = 带的下边界（满亮），1 = 轨道顶（全透明）
+    let t = ((from_cell - band_start) / band).clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    inv * inv * (3.0 - 2.0 * inv)
 }
 
 /// 某个排的不透明度系数（见 `ROW_ALPHA_TABLE`）。表外的排返回 0 = 完全不画。
@@ -282,10 +283,9 @@ pub(crate) fn paint_kps_rain(
                 }
                 // 渐隐锚点 = 可见顶端：条没到顶时是前沿，出顶后是轨道顶。
                 // 于是任何长度的条都有顶端淡出，且出顶后的渐变固定不动。
-                let anchor = vis_bottom;
-                let band = fade_band_h(h, vis_bottom - vis_top, cfg);
+                let band = fade_band_h(h, cfg);
                 emit_bar(
-                    &painter, cx, w, cell_top, vis_top, vis_bottom, base_alpha, anchor, band,
+                    &painter, cx, w, cell_top, vis_top, vis_bottom, base_alpha, h, band,
                     row_base,
                 );
             }
@@ -296,10 +296,8 @@ pub(crate) fn paint_kps_rain(
 /// 画一根竖条：从 vis_top（距键格的高度）到 vis_bottom，**沿竖直方向做渐隐**。
 ///
 /// 用 Mesh 而不是 rect_filled：整根是一个矩形，但上下两端颜色不同，顶点色插值后
-/// 条内就是连续渐变。必须在两处**切一刀插顶点**，否则只有端点两个 alpha，
+/// 条内就是连续渐变。必须在**轨道顶**与**渐隐带下边界**两处切一刀插顶点，否则只有端点两个 alpha，
 /// 长条会被插值成"整条都在缓缓变淡"：
-/// - 渐隐带下边界 anchor - band（这里 alpha 从 1 开始往上降）；
-/// - 渐隐锚点 anchor 本身（这里 alpha 恰好到 0）。
 ///
 /// 切完之后每个子段内部 alpha 线性、相邻子段在接缝处取值相同，
 /// 所以整条雨连续无断层，同时能正确表达"带下方满亮 / 带内向上淡到 0"。
@@ -312,21 +310,21 @@ fn emit_bar(
     vis_top: f32,
     vis_bottom: f32,
     base_alpha: f32,
-    anchor: f32,
+    h: f32,
     band: f32,
     base: Color32,
 ) {
     // vis_* 是「距键格顶边的高度」：数值大的一端在屏幕上更靠上（y 更小）。
     let (xl, xr) = (cx - w * 0.5, cx + w * 0.5);
     let to_color = |vis: f32| {
-        let a = (base_alpha * rain_alpha(vis, anchor, band) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let a = (base_alpha * rain_alpha(vis, h, band) * 255.0).round().clamp(0.0, 255.0) as u8;
         Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a)
     };
 
     // 顶点按 vis 升序（= 屏幕上从上往下）排列，相邻两两成段。
-    let band_start = anchor - band;
+    let band_start = h - band;
     let mut cuts = vec![vis_bottom, vis_top];
-    for c in [anchor, band_start] {
+    for c in [h, band_start] {
         if c > vis_bottom && c < vis_top {
             cuts.push(c);
         }
@@ -336,7 +334,7 @@ fn emit_bar(
 
     let any_visible = cuts
         .iter()
-        .any(|&v| (base_alpha * rain_alpha(v, anchor, band) * 255.0).round() >= 1.0);
+        .any(|&v| (base_alpha * rain_alpha(v, h, band) * 255.0).round() >= 1.0);
     if !any_visible {
         return;
     }
@@ -364,107 +362,91 @@ mod tests {
         Config::default()
     }
 
-    /// **核心回归**：不论条多长，顶端都必须透明、越往下越实。
+    /// **核心语义**：短雨（还没升到上方）必须是纯实心的，不能有任何渐隐。
     ///
-    /// 这是主人两次报错的正面描述：
-    /// 「长条没到顶端时几乎没渐变」（说明锚点被钉死在轨道顶）与
-    /// 「长到顶端后渐变突然延伸到很靠后的位置」（说明渐变域跟着轨道走而不是条的顶端）。
+    /// 主人原话：「现在即使没有到达上方就有渐隐了」—— 上一版把锚点跟到条自己的顶端，
+    /// 导致刚长出来的短条顶端也是透明的。正确的锚点是**轨道顶**：
+    /// 带下方一律满亮，只有长进带里才淡。
     #[test]
-    fn any_length_has_fade_at_its_top() {
+    fn short_bar_near_cell_is_fully_opaque() {
         let cfg = cfg_default();
         let h = 400.0f32;
-        for &len in &[20.0f32, 60.0, 120.0, 280.0, 400.0] {
-            // 锚点 = 可见顶端 = 条本身高度（未出顶）
-            let anchor = len;
-            let band = fade_band_h(h, len, &cfg);
-            assert!(
-                rain_alpha(anchor, anchor, band) <= 0.01,
-                "长 {len} 的条顶端必须几乎全透明，实际 {}",
-                rain_alpha(anchor, anchor, band)
+        let band = fade_band_h(h, &cfg);
+        let band_start = h - band;
+        // 刚长出来的短雨：顶端远在渐隐带下方
+        for &top in &[10.0f32, 40.0, 90.0, 150.0] {
+            assert!(top < band_start, "取样点 {top} 应落在渐隐带下方");
+            assert_eq!(
+                rain_alpha(top, h, band),
+                1.0,
+                "顶端高度 {top} 的短雨必须完全满亮"
             );
-            // 顶端往下 90% 的位置必须明显更实
-            let below = anchor - band * 0.9;
-            assert!(
-                rain_alpha(below, anchor, band) > 0.5,
-                "长 {len} 的条在带底部附近应明显更实，实际 {}",
-                rain_alpha(below, anchor, band)
-            );
-            // 条根（贴键格处）必须满亮（短条被 band 上限保护，不会被整条泡淡）
-            assert!(
-                rain_alpha(0.0, anchor, band) > 0.99,
-                "长 {len} 的条根部必须满亮，实际 {}",
-                rain_alpha(0.0, anchor, band)
-            );
+            assert_eq!(rain_alpha(0.0, h, band), 1.0, "条根必须满亮");
         }
     }
 
-    /// 条出顶之后锚点固定在轨道顶：渐变不再继续上移，条从底部被裁。
+    /// 渐隐只发生在轨道顶部那一段里，且到顶恰好透明。
     #[test]
-    fn anchor_sticks_to_track_top_after_overflow() {
-        let cfg = cfg_default();
-        let h = 200.0f32;
-        // 前沿超过轨道顶：可见顶端 = 轨道顶
-        let anchor = h;
-        let band = fade_band_h(h, 120.0, &cfg);
-        assert_eq!(rain_alpha(h, anchor, band), 0.0, "轨道顶必须透明");
-        assert!(
-            rain_alpha(h - band, anchor, band) > 0.99,
-            "带下方必须满亮"
-        );
-        // 继续上飘（可见段的下端上移）不应影响同高度处的 alpha
-        for &from in &[150.0f32, 170.0, 190.0] {
-            let a1 = rain_alpha(from, anchor, band);
-            let a2 = rain_alpha(from, anchor, band);
-            assert_eq!(a1, a2);
-        }
-    }
-
-    /// 渐隐带永远不超过可见条长：短条不会被整条泡淡。
-    #[test]
-    fn band_never_exceeds_visible_length() {
+    fn fade_only_in_top_band() {
         let cfg = cfg_default();
         let h = 400.0f32;
-        for &len in &[2.0f32, 8.0, 30.0, 100.0] {
-            let band = fade_band_h(h, len, &cfg);
-            assert!(
-                band <= len.max(1.0) + 1e-3,
-                "len={len} 时带长 {band} 超过可见长度"
-            );
+        let band = fade_band_h(h, &cfg);
+        let band_start = h - band;
+        assert_eq!(rain_alpha(band_start, h, band), 1.0, "带下边界仍是满亮");
+        assert_eq!(rain_alpha(band_start - 1.0, h, band), 1.0, "带下方满亮");
+        let mid = band_start + band * 0.5;
+        let a = rain_alpha(mid, h, band);
+        assert!(a > 0.0 && a < 1.0, "带中段应在 (0,1) 之间，实际 {a}");
+        assert_eq!(rain_alpha(h, h, band), 0.0, "轨道顶必须透明");
+        assert_eq!(rain_alpha(h * 1.5, h, band), 0.0, "越过轨道顶仍透明");
+    }
+
+    /// **渐隐带只由轨道高度决定**：条长、可见长度都不影响它。
+    /// 否则会出现「条一长，渐变就延伸到很靠后」（主人报过）。
+    #[test]
+    fn band_is_independent_of_bar_length() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let expected = h * fade_band_frac(&cfg);
+        // 同一高度处的 alpha 必须是定值，不因调用方传什么长度而变
+        for &from in &[0.0f32, 100.0, 250.0, 320.0, 399.0, 400.0] {
+            let band = fade_band_h(h, &cfg);
+            assert!((band - expected).abs() < 1e-3, "带长应恒为 h x 比例");
+            let a = rain_alpha(from, h, band);
+            assert!((0.0..=1.0).contains(&a));
         }
-        // 长条时由「轨道高度 x 比例」封顶，不与条长一起无限变长
-        let band_long = fade_band_h(h, 400.0, &cfg);
-        assert!((band_long - h * fade_band_frac(&cfg)).abs() < 1e-3);
     }
 
     /// 曲线连续单调：不能出现横向断层。
     #[test]
     fn rain_alpha_is_continuous_and_monotonic() {
-        let anchor = 300.0f32;
-        let band = 100.0f32;
+        let h = 200.0f32;
+        let band = fade_band_h(h, &cfg_default());
         let steps = 400;
-        let mut prev = rain_alpha(anchor - band - 50.0, anchor, band);
-        for i in 0..=steps {
-            let from = anchor - band - 50.0 + (band + 50.0) * (i as f32) / (steps as f32);
-            let v = rain_alpha(from, anchor, band);
+        let mut prev = rain_alpha(0.0, h, band);
+        for i in 1..=steps {
+            let from = h * (i as f32) / (steps as f32);
+            let v = rain_alpha(from, h, band);
             assert!(
                 v <= prev + 1e-4,
-                "越靠近顶端必须越透明（沿 from 增大方向单调不增）：from={from} 时 {v} > {prev}"
+                "越靠上必须越透明（单调不增）：from={from} 时 {v} > {prev}"
             );
-            assert!((v - prev).abs() < 0.02, "渐变必须连续：from={from}");
+            assert!((prev - v).abs() < 0.02, "渐变必须连续：from={from}");
             prev = v;
         }
     }
 
-    /// smoothstep 在锚点与带下边界导数都为 0：没有折角。
+    /// smoothstep 在带下边界与轨道顶导数都为 0：没有折角。
     #[test]
     fn rain_alpha_has_no_kink() {
-        let anchor = 200.0f32;
-        let band = 80.0f32;
+        let h = 200.0f32;
+        let band = fade_band_h(h, &cfg_default());
+        let start = h - band;
         let d = 0.01f32;
-        let at_anchor = (rain_alpha(anchor, anchor, band) - rain_alpha(anchor - d, anchor, band)) / d;
-        let at_start = (rain_alpha(anchor - band, anchor, band) - rain_alpha(anchor - band + d, anchor, band)) / d;
-        assert!(at_anchor.abs() < 1e-2, "锚点斜率应≈0，实际 {at_anchor}");
+        let at_start = (rain_alpha(start + d, h, band) - rain_alpha(start, h, band)) / d;
+        let at_top = (rain_alpha(h, h, band) - rain_alpha(h - d, h, band)) / d;
         assert!(at_start.abs() < 1e-2, "带下边界斜率应≈0，实际 {at_start}");
+        assert!(at_top.abs() < 1e-2, "轨道顶斜率应≈0，实际 {at_top}");
     }
 
     /// 轨道高度上限放宽到 1200，且超范围会被夹住。
