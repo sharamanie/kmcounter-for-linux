@@ -970,6 +970,21 @@ impl eframe::App for App {
         self.draw(ctx);
     }
 
+    /// 清屏色：**必须完全透明**，否则悬浮窗不透明度调到 0 也还是有底色。
+    ///
+    /// eframe 的清屏色是**全视口共用**的（glow 后端在 paint 前对每个 viewport 都调
+    /// painter.clear(.., clear_color)），默认值 Color32::from_rgba_unmultiplied(12,12,12,180)
+    /// 会先给**每个**视口铺一层半透明深灰。悬浮窗的 CentralPanel 在 fill 的 alpha 为 0 时
+    /// 不产生任何图元（epaint 对全透明填充直接跳过），于是露出来的就是那层清屏灰 ——
+    /// 现象就是「不透明度调到 0 了，底板还在」。
+    /// **注意：软件渲染（softshot）根本测不出这个 bug**，因为它不走 eframe 的清屏路径。
+    ///
+    /// 主窗口不透明（没有 with_transparent），glClearColor 的 alpha 对它无效，
+    /// 且它自己的 CentralPanel 铺满整窗，所以改成全透明不影响主界面。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_all();
         // 卸载 HUD 监听脚本（KDE/Wayland），避免 KWin 里留下僵尸脚本

@@ -776,6 +776,23 @@ mod tests {
         );
     }
 
+    /// 清屏色必须是**全透明**（eframe 的 clear_color）。
+    ///
+    /// 来历：不透明度调到 0 时悬浮窗底板还在 —— 真凶不是 CentralPanel，
+    /// 而是 eframe 给**每个**视口铺的清屏色（默认 rgba(12,12,12,180)）；
+    /// egui 对全透明填充不产生图元，于是露出那层灰。
+    /// **软件渲染不走 eframe 的清屏路径，所以当时怎么截图都看不出问题，只有真机暴露。**
+    #[test]
+    fn clear_color_is_fully_transparent() {
+        let (app, _ctx) = headless_app(Store::default());
+        let c = eframe::App::clear_color(&app, &egui::Visuals::dark());
+        assert_eq!(
+            c,
+            [0.0, 0.0, 0.0, 0.0],
+            "清屏色必须全透明，否则 HUD 不透明度调到 0 仍有底色"
+        );
+    }
+
     /// 不透明度可以调到 **0**：底板与外框彻底消失，但键格等内容的文字仍然画出来。
     ///
     /// 主人明确要求过「不透明度必须能到 0」（此前一度把下限卡在 20，被否）。
