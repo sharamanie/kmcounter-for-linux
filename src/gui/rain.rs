@@ -15,12 +15,18 @@
 //!
 //! 坐标约定：
 //! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
-//! - 渐隐：**锚定在轨道顶部**。轨道顶部往下 FADE_BAND_FRAC 那一段是渐隐带，
-//!   带内越靠上越透明、到轨道顶恰好 0；**带下方完全满亮**。
-//!   所以一条刚长出来、还贴着键格的短雨是**纯实心**的，不会莫名其妙就淡掉
-//!   （主人明确要求过「没有到达上方就不该有渐隐」）；
-//!   只有当它升到上方、长进这一段之后，上端才开始化开。
-//!   曲线用 smoothstep：两端导数为 0，进入 / 离开渐隐带都不会出现横向"折痕"；
+//! - 渐隐：**面板上方有一块固定的「滤镜区」**（主人原话：整个面板的上方就像有个滤镜）。
+//!   滤镜区 = 轨道顶部往下 kps_rain_fade_pct 那么高的一条横带，**位置与高度都固定**，
+//!   不随任何一条雨的长度、寿命、列号移动。
+//!   - 雨条**进入**这块区域的部分才开始变淡，越靠上越透明，到轨道顶恰好 0；
+//!   - 滤镜区**下方**的部分一律完全实心 —— 所以短雨是干净的实心柱，
+//!     既不会「还没升上去就淡了」，也不会「整条一起消失」；
+//!   - 条升到顶继续上飘时从底部被裁，滤镜区始终钉在顶部不动，
+//!     所以不会出现「渐变突然延伸到很靠后」。
+//!   前两轮的教训（都试过、都被否）：alpha 跟着**前沿**走 = 整条一起消失；
+//!   alpha 跟着**条自身顶端**走 = 短雨在底部就淡。
+//!   滤镜语义要求锚点是**空间位置**，而不是某条雨的时间状态。
+//!   曲线用 smoothstep：两端导数为 0，进出滤镜区都没有横向折痕；
 //! - 条宽 = 键格宽 × `kps_rain_width_pct`（**略窄于键格**，看起来是键格上长出的一根柱子）；
 //! - 颜色固定取 `kps_rain_color`（默认纯白），**不随 KPS 热度变色** —— 雨是"运动轨迹"，
 //!   跟着热度变色会让人误以为自己按多快，而且和键格本身的发光混在一起看不出层次。
@@ -106,13 +112,12 @@ pub(crate) fn rain_lifespan_secs(_cfg: &Config) -> f32 {
     RAIN_SAMPLE_SECS
 }
 
-/// 渐隐带占**轨道高度**的默认比例（配置项 kps_rain_fade_pct 为 0 时用它）。
+/// 滤镜区占**轨道高度**的默认比例（配置项 kps_rain_fade_pct 为 0 时用它）。
 ///
-/// 0.35 是手调的结果：0.1 以下渐变挤在顶部几个像素里、像被砍断；
-/// 0.6 以上几乎整条轨道都在淡，短雨也会显得发灰。
-/// 分母是轨道高度（不是条长）—— 这样渐变区在屏幕上的**位置和长度都是固定的**，
-/// 不会随条的长短忽大忽小。
-pub(crate) const FADE_BAND_FRAC_DEFAULT: f32 = 0.35;
+/// 0.25：比早期版本的 0.35 薄一截。35% 的问题是滤镜区太厚 ——
+/// 雨条刚一碰到就觉得「渐变延伸得很靠后」，看起来不像顶部滤镜、倒像整根在变淡。
+/// 0.1 以下又会挤成一条硬边、像被砍断，所以取 0.25。
+pub(crate) const FADE_BAND_FRAC_DEFAULT: f32 = 0.25;
 
 /// 渐隐带占轨道高度的比例（5%~90%，来自配置；0 视为默认）。
 fn fade_band_frac(cfg: &Config) -> f32 {
@@ -123,39 +128,37 @@ fn fade_band_frac(cfg: &Config) -> f32 {
     }
 }
 
-/// 渐隐带高度：**只由轨道高度决定**（至少 1px，避免除零）。
+/// 滤镜区高度 = 轨道高度 * 比例。**只与轨道高度有关**。
 ///
-/// 刻意不掺入"条长"或"可见长度"：渐变区在屏幕上的位置与长度必须是常量，
-/// 否则条一长一短，渐变区就跟着伸缩，观感会忽强忽弱（主人报过"渐变突然延伸到很靠后"）。
+/// 刻意不掺入「条长 / 可见长度 / 顶端高度」：滤镜是一块**固定的空间区域**，
+/// 掺进任何与单条雨相关的量，它就变成「跟着条走的渐变」—— 那正是前两版被否掉的形态。
 fn fade_band_h(h: f32, cfg: &Config) -> f32 {
     (h * fade_band_frac(cfg)).max(1.0)
 }
 
-/// 某个高度处的透明度系数 —— **键雨渐隐的唯一入口，按位置计算**。
+/// 某个高度处的透明度系数 —— **键雨渐隐的唯一入口**。
 ///
 /// - from_cell：该点到键格顶边的高度（0 = 贴着键格，h = 轨道顶）；
 /// - h：轨道高度；
-/// - band：渐隐带高度（由轨道高度 `X` 比例得出，常量）。
+/// - band：滤镜区高度（= 轨道高度 * 比例，常量）。
 ///
-/// 三种情形：
-/// - 带下方（from_cell 不超过 h - band）：返回 1.0，**完全满亮** ——
-///   刚长出来的短雨就处在这里，所以它看起来是纯实心的一根；
-/// - 带内：从 1.0 平滑降到 0.0；
-/// - 到轨道顶：恰好 0。
+/// 滤镜区固定为区间 [h - band, h]：
+/// - 区**下方**（from_cell 不超过 h - band）：返回 1.0，**完全实心** ——
+///   刚长出来的短雨整根都在这里，所以它是干干净净的实心柱；
+/// - 区**内**：从 1.0 平滑降到 0.0，越靠上越透明；
+/// - 区**顶**（轨道顶）：恰好 0。
 ///
-/// 渐变区的位置与长度只由 (h, band) 决定，与条多长、按了多久、第几列无关。
-/// 从来不用"整条统一 alpha 随前沿变淡"：那种观感是「整条一起消失」，主人明确否掉过。
-/// 也**不用"锚点跟条顶端走"**：那样短雨在底部就会淡掉，主人同样否掉了。
+/// 入参只有「位置」和「轨道高度」，所以滤镜区与条多长、按了多久、第几列完全无关。
 fn rain_alpha(from_cell: f32, h: f32, band: f32) -> f32 {
     if h <= 0.0 || band <= 0.0 {
         return 1.0;
     }
-    let band_start = h - band;
-    if from_cell <= band_start {
+    let zone_start = h - band;
+    if from_cell <= zone_start {
         return 1.0;
     }
-    // t: 0 = 带的下边界（满亮），1 = 轨道顶（全透明）
-    let t = ((from_cell - band_start) / band).clamp(0.0, 1.0);
+    // t: 0 = 刚进滤镜区（满亮），1 = 轨道顶（全透明）
+    let t = ((from_cell - zone_start) / band).clamp(0.0, 1.0);
     let inv = 1.0 - t;
     inv * inv * (3.0 - 2.0 * inv)
 }
@@ -281,8 +284,8 @@ pub(crate) fn paint_kps_rain(
                 if base_alpha <= 0.004 {
                     continue;
                 }
-                // 渐隐锚点 = 可见顶端：条没到顶时是前沿，出顶后是轨道顶。
-                // 于是任何长度的条都有顶端淡出，且出顶后的渐变固定不动。
+                // 滤镜区固定在轨道顶部：位置与高度都只由轨道高度决定，
+                // 与这条雨多长、按了多久、在第几列无关。
                 let band = fade_band_h(h, cfg);
                 emit_bar(
                     &painter, cx, w, cell_top, vis_top, vis_bottom, base_alpha, h, band,
@@ -296,7 +299,7 @@ pub(crate) fn paint_kps_rain(
 /// 画一根竖条：从 vis_top（距键格的高度）到 vis_bottom，**沿竖直方向做渐隐**。
 ///
 /// 用 Mesh 而不是 rect_filled：整根是一个矩形，但上下两端颜色不同，顶点色插值后
-/// 条内就是连续渐变。必须在**轨道顶**与**渐隐带下边界**两处切一刀插顶点，否则只有端点两个 alpha，
+/// 条内就是连续渐变。必须在**轨道顶**与**滤镜区下边界**两处切一刀插顶点，否则只有端点两个 alpha，
 /// 长条会被插值成"整条都在缓缓变淡"：
 ///
 /// 切完之后每个子段内部 alpha 线性、相邻子段在接缝处取值相同，
@@ -362,90 +365,95 @@ mod tests {
         Config::default()
     }
 
-    /// **核心语义**：短雨（还没升到上方）必须是纯实心的，不能有任何渐隐。
-    ///
-    /// 主人原话：「现在即使没有到达上方就有渐隐了」—— 上一版把锚点跟到条自己的顶端，
-    /// 导致刚长出来的短条顶端也是透明的。正确的锚点是**轨道顶**：
-    /// 带下方一律满亮，只有长进带里才淡。
+    /// **滤镜区是固定的**：高度只由轨道高度决定，与任何一条雨都无关。
     #[test]
-    fn short_bar_near_cell_is_fully_opaque() {
+    fn filter_zone_is_fixed() {
         let cfg = cfg_default();
-        let h = 400.0f32;
-        let band = fade_band_h(h, &cfg);
-        let band_start = h - band;
-        // 刚长出来的短雨：顶端远在渐隐带下方
-        for &top in &[10.0f32, 40.0, 90.0, 150.0] {
-            assert!(top < band_start, "取样点 {top} 应落在渐隐带下方");
-            assert_eq!(
-                rain_alpha(top, h, band),
-                1.0,
-                "顶端高度 {top} 的短雨必须完全满亮"
-            );
-            assert_eq!(rain_alpha(0.0, h, band), 1.0, "条根必须满亮");
-        }
-    }
-
-    /// 渐隐只发生在轨道顶部那一段里，且到顶恰好透明。
-    #[test]
-    fn fade_only_in_top_band() {
-        let cfg = cfg_default();
-        let h = 400.0f32;
-        let band = fade_band_h(h, &cfg);
-        let band_start = h - band;
-        assert_eq!(rain_alpha(band_start, h, band), 1.0, "带下边界仍是满亮");
-        assert_eq!(rain_alpha(band_start - 1.0, h, band), 1.0, "带下方满亮");
-        let mid = band_start + band * 0.5;
-        let a = rain_alpha(mid, h, band);
-        assert!(a > 0.0 && a < 1.0, "带中段应在 (0,1) 之间，实际 {a}");
-        assert_eq!(rain_alpha(h, h, band), 0.0, "轨道顶必须透明");
-        assert_eq!(rain_alpha(h * 1.5, h, band), 0.0, "越过轨道顶仍透明");
-    }
-
-    /// **渐隐带只由轨道高度决定**：条长、可见长度都不影响它。
-    /// 否则会出现「条一长，渐变就延伸到很靠后」（主人报过）。
-    #[test]
-    fn band_is_independent_of_bar_length() {
-        let cfg = cfg_default();
-        let h = 400.0f32;
-        let expected = h * fade_band_frac(&cfg);
-        // 同一高度处的 alpha 必须是定值，不因调用方传什么长度而变
-        for &from in &[0.0f32, 100.0, 250.0, 320.0, 399.0, 400.0] {
+        for &h in &[96.0f32, 200.0, 400.0, 1200.0] {
             let band = fade_band_h(h, &cfg);
-            assert!((band - expected).abs() < 1e-3, "带长应恒为 h x 比例");
-            let a = rain_alpha(from, h, band);
-            assert!((0.0..=1.0).contains(&a));
+            assert!(
+                (band - h * fade_band_frac(&cfg)).abs() < 1e-3,
+                "轨道 {h} 时滤镜区高度应为 h x 比例"
+            );
+            // 同一轨道高度下反复求值必须完全一致（不掺入任何单条雨的量）
+            assert_eq!(fade_band_h(h, &cfg), band);
         }
     }
 
-    /// 曲线连续单调：不能出现横向断层。
+    /// **要求 A**：滤镜区下方完全实心 —— 短雨是干净的实心柱，
+    /// 不会「还没升上去就淡了」。
     #[test]
-    fn rain_alpha_is_continuous_and_monotonic() {
-        let h = 200.0f32;
-        let band = fade_band_h(h, &cfg_default());
-        let steps = 400;
-        let mut prev = rain_alpha(0.0, h, band);
-        for i in 1..=steps {
-            let from = h * (i as f32) / (steps as f32);
+    fn below_filter_zone_is_solid() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let band = fade_band_h(h, &cfg);
+        let zone_start = h - band;
+        for &from in &[0.0f32, 10.0, 50.0, 120.0, 200.0] {
+            assert!(from <= zone_start, "取样点 {from} 应在滤镜区下方");
+            assert_eq!(
+                rain_alpha(from, h, band),
+                1.0,
+                "滤镜区下方（{from}）必须完全实心"
+            );
+        }
+        assert_eq!(
+            rain_alpha(zone_start, h, band),
+            1.0,
+            "滤镜区下边界仍应满亮"
+        );
+    }
+
+    /// **要求 B**：滤镜区内越靠上越透明，到轨道顶恰好 0。
+    /// 这正是「像有个滤镜」的正面描述。
+    #[test]
+    fn inside_filter_zone_fades_out_toward_top() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let band = fade_band_h(h, &cfg);
+        let zone_start = h - band;
+
+        // 越靠上越透明（单调）
+        let mut prev = rain_alpha(zone_start, h, band);
+        for i in 1..=200 {
+            let from = zone_start + band * (i as f32) / 200.0;
             let v = rain_alpha(from, h, band);
             assert!(
                 v <= prev + 1e-4,
-                "越靠上必须越透明（单调不增）：from={from} 时 {v} > {prev}"
+                "区内越靠上必须越透明：from={from} 时 {v} > {prev}"
             );
             assert!((prev - v).abs() < 0.02, "渐变必须连续：from={from}");
             prev = v;
         }
+        assert_eq!(rain_alpha(h, h, band), 0.0, "轨道顶必须恰好透明");
+        assert_eq!(rain_alpha(h * 2.0, h, band), 0.0, "越过轨道顶仍透明");
     }
 
-    /// smoothstep 在带下边界与轨道顶导数都为 0：没有折角。
+    /// **要求 C**：同一高度处的透明度是定值 ——
+    /// 与这条雨多长、按了多久、在第几列完全无关（滤镜是空间区域）。
     #[test]
-    fn rain_alpha_has_no_kink() {
+    fn alpha_depends_only_on_position() {
+        let cfg = cfg_default();
+        let h = 400.0f32;
+        let band = fade_band_h(h, &cfg);
+        for &from in &[0.0f32, 99.0, 150.0, 299.0, 300.0, 380.0, 400.0] {
+            let a = rain_alpha(from, h, band);
+            assert!((0.0..=1.0).contains(&a), "alpha 越界：{a}");
+            // 反复求值一致
+            assert_eq!(rain_alpha(from, h, band), a);
+        }
+    }
+
+    /// smoothstep 在滤镜区下边界与轨道顶导数都为 0：没有折角。
+    #[test]
+    fn filter_zone_has_no_kink() {
+        let cfg = cfg_default();
         let h = 200.0f32;
-        let band = fade_band_h(h, &cfg_default());
-        let start = h - band;
+        let band = fade_band_h(h, &cfg);
+        let zone_start = h - band;
         let d = 0.01f32;
-        let at_start = (rain_alpha(start + d, h, band) - rain_alpha(start, h, band)) / d;
+        let at_start = (rain_alpha(zone_start + d, h, band) - rain_alpha(zone_start, h, band)) / d;
         let at_top = (rain_alpha(h, h, band) - rain_alpha(h - d, h, band)) / d;
-        assert!(at_start.abs() < 1e-2, "带下边界斜率应≈0，实际 {at_start}");
+        assert!(at_start.abs() < 1e-2, "区下边界斜率应≈0，实际 {at_start}");
         assert!(at_top.abs() < 1e-2, "轨道顶斜率应≈0，实际 {at_top}");
     }
 
