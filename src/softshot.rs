@@ -776,6 +776,64 @@ mod tests {
         );
     }
 
+    /// 不透明度可以调到 **0**：底板与外框彻底消失，但键格等内容的文字仍然画出来。
+    ///
+    /// 主人明确要求过「不透明度必须能到 0」（此前一度把下限卡在 20，被否）。
+    /// 这里用图元层面量化：0% 时**不能**再出现 (16,18,24) 的底板矩形，
+    /// 而键格/文字的图元必须还在 —— 否则就是"整个 HUD 消失了"，不是"只剩内容"。
+    #[test]
+    fn hud_opacity_zero_hides_panel_but_keeps_content() {
+        fn shapes_of(cfg: Config) -> Vec<egui::epaint::ClippedShape> {
+            let (mut app, ctx) = headless_app_with_cfg(store_with_days(2), cfg);
+            app.hud_kps_show = true;
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0)));
+            raw.time = Some(next_time());
+            let _ = ctx.run(raw, |ctx| app.draw(ctx));
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0)));
+            raw.time = Some(next_time());
+            ctx.run(raw, |ctx| app.draw(ctx)).shapes
+        }
+
+        fn count_panel_and_mesh(shapes: &[egui::epaint::ClippedShape]) -> (usize, usize, usize) {
+            let mut panel = 0usize;
+            let mut mesh = 0usize;
+            let mut text = 0usize;
+            fn visit(sh: &egui::Shape, panel: &mut usize, mesh: &mut usize, text: &mut usize) {
+                match sh {
+                    // 悬浮窗底板 = (16,18,24) 的圆角矩形
+                    egui::Shape::Rect(r) if r.fill.r() == 16 && r.fill.g() == 18 && r.fill.b() == 24 => {
+                        *panel += 1;
+                    }
+                    egui::Shape::Mesh(_) => *mesh += 1,
+                    egui::Shape::Text(_) => *text += 1,
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| visit(s, panel, mesh, text)),
+                    _ => {}
+                }
+            }
+            for cs in shapes {
+                visit(&cs.shape, &mut panel, &mut mesh, &mut text);
+            }
+            (panel, mesh, text)
+        }
+
+        let mut opaque = Config::default();
+        opaque.kps_show_rain = true;
+        opaque.kps_hud_opacity = 100;
+        let (p100, _, t100) = count_panel_and_mesh(&shapes_of(opaque));
+
+        let mut clear = Config::default();
+        clear.kps_show_rain = true;
+        clear.kps_hud_opacity = 0;
+        let (p0, _, t0) = count_panel_and_mesh(&shapes_of(clear));
+
+        assert!(p100 > 0, "100% 时应有悬浮窗底板矩形");
+        assert!(t100 > 0, "100% 时应有文字");
+        assert_eq!(p0, 0, "不透明度 0 时底板必须完全消失，实际还有 {p0} 个");
+        assert!(t0 > 0, "不透明度 0 时文字内容仍应保留，实际 {t0}");
+    }
+
     /// 进帮助页要收起底部「展开更多」（否则窗口停在展开后的高度）—— 用户第三十七轮
     #[test]
     fn entering_help_collapses_panel() {

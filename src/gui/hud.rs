@@ -1177,6 +1177,7 @@ impl App {
         cfg.kps_rain_speed = self.cfg.kps_rain_speed;
         cfg.kps_rain_height = self.cfg.kps_rain_height;
         cfg.kps_rain_opacity = self.cfg.kps_rain_opacity;
+        cfg.kps_rain_fade_pct = self.cfg.kps_rain_fade_pct;
         cfg.kps_rain_color = self.cfg.kps_rain_color;
         cfg.kps_key_bounce = self.cfg.kps_key_bounce;
         cfg.kps_groups = self.cfg.kps_groups.clone();
@@ -1293,9 +1294,9 @@ impl App {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.cfg.apm_hud_opacity)
-                        // 下限 20：0 会让悬浮窗完全消失（看不见也抓不到，
-                        // 用户想调回来时已经点不到这个设置项了），故保留最小可见度
-                        .range(20..=100)
+                        // 允许 0：整块底板与外框彻底消失，只剩文字内容。
+                        // 设置窗是独立窗口、常驻可点，所以调到 0 之后仍能从这里调回来。
+                        .range(0..=100)
                         .speed(1.0)
                         .suffix("%"),
                 )
@@ -1549,9 +1550,8 @@ impl App {
             if ui
                 .add(
                     egui::DragValue::new(&mut self.cfg.kps_hud_opacity)
-                        // 下限 20：0 会让悬浮窗彻底看不见（连这个设置项自己都点不到），
-                        // 用户没法再调回来，所以保留最小可见度
-                        .range(20..=100)
+                        // 允许 0：底板与外框消失、只剩键格与数字（理由同 APM）
+                        .range(0..=100)
                         .speed(1.0)
                         .suffix("%"),
                 )
@@ -1792,7 +1792,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(s.kps_rain_height).color(HUD_TEXT));
             if ui
-                .add(egui::DragValue::new(&mut self.cfg.kps_rain_height).range(0..=400).speed(4.0))
+                .add(egui::DragValue::new(&mut self.cfg.kps_rain_height).range(0..=1200).speed(4.0))
                 .changed()
             {
                 act.dirty = true;
@@ -1810,6 +1810,30 @@ impl App {
                 act.dirty = true;
             }
             ui.label(egui::RichText::new("%").color(HUD_TEXT));
+        });
+        // 渐隐带：轨道顶部往下这么高的一段，越靠上越透明
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.kps_rain_fade).color(HUD_TEXT));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.cfg.kps_rain_fade_pct)
+                        .range(5..=90)
+                        .speed(1.0),
+                )
+                .on_hover_text(s.kps_rain_fade_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.label(egui::RichText::new("%").color(HUD_TEXT));
+            let band_px = crate::gui::rain::rain_area_h(&self.cfg)
+                * self.cfg.kps_rain_fade_pct.max(5) as f32
+                / 100.0;
+            ui.label(
+                egui::RichText::new(format!("= {band_px:.0} px"))
+                    .small()
+                    .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+            );
         });
         // 键雨颜色：默认纯白。键雨**不跟随 KPS 热度**，所以颜色必须能在设置里自己调。
         ui.horizontal(|ui| {
@@ -2442,6 +2466,7 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.kps_rain_speed = from.kps_rain_speed;
     to.kps_rain_height = from.kps_rain_height;
     to.kps_rain_opacity = from.kps_rain_opacity;
+    to.kps_rain_fade_pct = from.kps_rain_fade_pct;
     to.kps_rain_color = from.kps_rain_color;
     to.kps_key_bounce = from.kps_key_bounce;
     to.kps_groups = from.kps_groups.clone();
