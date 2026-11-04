@@ -317,14 +317,24 @@ impl Config {
             .iter()
             .map(|r| r.iter().map(|c| c.width).sum::<f32>())
             .fold(1.0f32, f32::max);
-        // 自适应键宽：最后一行平分整行宽度（如 5 格宽的行上放 H,J → 各 2.5 格）；
-        // 该行自己写过宽度倍数时不干预。
+        // 自适应键宽：**每一行**各自平分整行宽度。
+        //
+        // 旧行为只处理最后一行，结果多行布局时上面几行还是 1 格宽、
+        // 只有最后一行被撑满，长短不一、看着极不整齐（用户反馈）。
+        // 现在每一行都撑满：一行 n 个键 → 每个键占 cols/n 格，
+        // 所有行左右边缘对齐，观感统一。
+        // 哪一行自己写过宽度倍数（如 1.5H、4X）就不干预那一行。
         if self.kps_auto_width {
-            let last = rows.len().saturating_sub(1);
-            let n = rows[last].len() as f32;
-            let explicit = rows[last].iter().any(|c| (c.width - 1.0).abs() > f32::EPSILON);
-            if n > 0.0 && !explicit {
-                for c in rows[last].iter_mut() {
+            for row in rows.iter_mut() {
+                let n = row.len() as f32;
+                if n <= 0.0 {
+                    continue;
+                }
+                let explicit = row.iter().any(|c| (c.width - 1.0).abs() > f32::EPSILON);
+                if explicit {
+                    continue;
+                }
+                for c in row.iter_mut() {
                     c.width = cols / n;
                 }
             }
@@ -561,6 +571,50 @@ mod tests {
 
     /// 键格布局语法：换行=分行、逗号后无空格也行、空项=空位、数字前缀=宽度倍数、自适应键宽平分最后一行
     #[test]
+    /// 自适应键宽必须作用于**每一行**，而不只是最后一行。
+    ///
+    /// 用户反馈：多行布局时上面几行还是 1 格宽、只有最后一行被撑满，
+    /// 长短不一很难看。现在要求每行各自平分，使所有行左右边缘对齐。
+    #[test]
+    fn auto_width_applies_to_every_row() {
+        let mut cfg = Config::default();
+        // 三行，分别 10 / 10 / 4 个键；最宽行是 10 格
+        cfg.kps_keys = "Q,W,E,R,T,Y,U,I,O,P
+A,S,D,F,G,H,J,K,L,
+Z,X,C,V".into();
+        cfg.kps_auto_width = true;
+        let layout = cfg.kps_key_layout();
+        assert_eq!(layout.rows.len(), 3);
+        let total = layout.cols;
+        assert!((total - 10.0).abs() < 1e-3, "最宽行应为 10 格，实际 {total}");
+        for (i, row) in layout.rows.iter().enumerate() {
+            let sum: f32 = row.iter().map(|c| c.width).sum();
+            assert!(
+                (sum - total).abs() < 1e-3,
+                "第 {i} 行宽度和应为 {total}，实际 {sum}（自适应未生效）"
+            );
+            // 行内各键等宽
+            let w0 = row[0].width;
+            assert!(row.iter().all(|c| (c.width - w0).abs() < 1e-3), "行内各键应等宽");
+        }
+    }
+
+    /// 写了宽度倍数的行不被自适应干预。
+    #[test]
+    fn auto_width_skips_rows_with_explicit_widths() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "Q,W,E,R
+1.5H,J".into();
+        cfg.kps_auto_width = true;
+        let layout = cfg.kps_key_layout();
+        // 第二行写了 1.5H，不应被改写
+        let row1: Vec<f32> = layout.rows[1].iter().map(|c| c.width).collect();
+        assert!((row1[0] - 1.5).abs() < 1e-3, "1.5H 应保留，实际 {row1:?}");
+        // 第一行没写，应被平分到 cols
+        let sum0: f32 = layout.rows[0].iter().map(|c| c.width).sum();
+        assert!((sum0 - layout.cols).abs() < 1e-3, "第一行应平分到 {}，实际 {sum0}", layout.cols);
+    }
+
     fn kps_key_layout_parses_rows_blanks_and_widths() {
         let mut cfg = Config::default();
         // 用户写的四行
