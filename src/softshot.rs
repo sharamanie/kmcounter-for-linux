@@ -2667,31 +2667,33 @@ mod tests {
         let p4 = capture(&mut app, &ctx, &mut shot_textures, "kps-rain-both", true, &feed_scene, false, &hud_spec);
         assert!(p4.exists());
 
-        // 4) 两排键同时按：验证「第一排宽度/不透明度不变，第二排起逐排变窄变淡」
-        //    —— 这是用户报的 bug：两排同列同时按时，雨的宽度不该互相影响，
-        //    否则第一排会莫名其妙变窄。这里两排每次都按满，第一排 Q/W/E 必须保持原宽。
-        app.debug_set_kps_keys("Q, W, E\nA, S, D");
+        // 4) 四排键同时按：验证「第一排保持原宽、第 2 排起逐排变窄变淡、第 3 排起换色相」
+        //    —— 用户报的 bug 是两排同列同时按时第一排的雨被挤窄；这里四排每次都按满，
+        //    第一排 Q/W/E 必须保持原宽原色，后三排依次变窄、变淡、换色。
+        app.debug_set_kps_keys("Q, W, E\nA, S, D\nZ, X, C\nT, Y, U");
         {
             let feed_rows = move |app: &mut App| {
                 app.debug_reset_kps();
-                for _ in 0..5 {
-                    app.debug_record_kps_key(&today_rows, "Q");
-                    app.debug_record_kps_key(&today_rows, "A");
+                for (a, b, c, d) in [("Q", "A", "Z", "T"), ("W", "S", "X", "Y"), ("E", "D", "C", "U")]
+                {
+                    for k in [a, b, c, d] {
+                        app.debug_record_kps_key(&today_rows, k);
+                    }
                 }
-                for _ in 0..3 {
-                    app.debug_record_kps_key(&today_rows, "W");
-                    app.debug_record_kps_key(&today_rows, "S");
-                }
-                app.debug_record_kps_key(&today_rows, "E");
-                app.debug_record_kps_key(&today_rows, "D");
-                // 两排同列（第 1 列 / 第 2 列）同时按住，看宽度是否互相干扰
+                // 四排同列同时按住，看宽度 / 不透明度 / 色相是否逐排递进
                 for (key, start, end) in [
                     ("Q", 3000u64, None),
                     ("A", 3000, None),
+                    ("Z", 3000, None),
+                    ("T", 3000, None),
                     ("W", 2000, Some(600)),
                     ("S", 2000, Some(600)),
+                    ("X", 2000, Some(600)),
+                    ("Y", 2000, Some(600)),
                     ("E", 900, Some(400)),
                     ("D", 900, Some(400)),
+                    ("C", 900, Some(400)),
+                    ("U", 900, Some(400)),
                 ] {
                     app.debug_push_hold(key, start, end);
                 }

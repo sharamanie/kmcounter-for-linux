@@ -21,9 +21,13 @@
 //!   跟着热度变色会让人误以为自己按多快，而且和键格本身的发光混在一起看不出层次。
 //!
 //! 多层布局（`kps_keys` 里换行 = 分行）：所有排共用同一条轨道（轨道底边 = 第一排键格顶边），
-//! 但**排号越大越窄、越透明**（`ROW_WIDTH_STEP` / `ROW_ALPHA_STEP`）：
-//! 第一排永远是原始宽度与不透明度，第二排起逐排收窄并降低 alpha。这样两排同一竖线上的键
-//! 同时按下时，能看到"前景窄条叠在背景宽条上"，而不是两个同宽条糊成一块。
+//! 但**排号越大越窄、越实**（`ROW_WIDTH_STEP` / `ROW_ALPHA_TABLE`），且**第 3 排起换色相**：
+//! - 宽度：第 1 排原始宽度，之后 ×0.70 / ×0.49 / ×0.34，一层套一层地收窄；
+//! - 不透明度：第 1 排刻意压到 0.35（明显淡于实心），之后 0.72 / 0.92 / 1.00 逐排抬升 ——
+//!   窄条画在宽条中心，中心最终呈现的就是最深那一排的颜色，所以必须让后面的排最实，
+//!   否则中心早早被第一排糊成纯白，换色也看不出来；表外为 0 = 完全不画；
+//! - 色相：第 3 排起从基色（默认纯白，先抬饱和度再转）逐排 +0.15，一眼分出前后几层。
+//! 于是多排同列同时按下时，看到的是「淡而宽的底条 + 实而彩的窄心」，而不是两根同宽白条糊成一块。
 //!
 //! 来源（样式参照）：https://github.com/adofaiex/JipperKeyViewer
 
@@ -37,11 +41,27 @@ const BAR_W_RATIO: f32 = 0.72;
 /// 条宽绝对上下限（px）：极小缩放下不至于细成线，极大缩放下不至于糊成整块。
 const BAR_W_MIN: f32 = 4.0;
 const BAR_W_MAX: f32 = 64.0;
-/// 排间宽度递进系数：第 1 排 ×1.00（原始宽度），第 2 排 ×0.85，第 3 排 ×0.72…
-const ROW_WIDTH_STEP: f32 = 0.85;
-/// 排间不透明度递进系数：第 1 排 ×1.00，第 2 排 ×0.72，第 3 排 ×0.52…
-/// **只降 alpha，不改颜色** —— 靠压暗颜色做层次会在深色背景上变成一团脏灰。
-const ROW_ALPHA_STEP: f32 = 0.72;
+/// 排间宽度递进系数：第 1 排 ×1.00，第 2 排 ×0.60，第 3 排 ×0.36，第 4 排 ×0.22…
+/// 给得这么狠是有原因的：**同一列的不同排共用同一条竖线**，窄条整个落在宽条内部，
+/// 只能靠宽条两边露出来的那一圈看出层次；衰减太小就只是一根粗柱子，看不出有几排。
+/// 这样叠出来是一层层「套娃」的效果，一眼就能数出几排同时按着。
+const ROW_WIDTH_STEP: f32 = 0.70;
+/// 每排的不透明度系数（按排号索引，超出表长 = 0，即**彻底透明、完全不画**）。
+/// 方向是**越靠后的排越实**：几排的雨共用同一条轨道与同一水平中心，其实是**层层叠在一起**的，
+/// 又因为后画的排更窄、盖在中心，所以中心最终呈现的正是最深那一排的颜色。
+/// 若第 1 排就已经是实心白，中心早早饱和成纯白，后面的换色排再怎么调都叠不上去 ——
+/// 这正是「深浅对比看不出来」的根因。因此第 1 排压到 0.35（明显淡于实心），
+/// 逐排抬升到 1.00，表外为 0（**允许一路衰减到完全透明**，对标 JipperKeyViewer 的逐排消失）。
+const ROW_ALPHA_TABLE: [f32; 5] = [0.35, 0.72, 0.92, 1.00, 0.0];
+/// 排宽下限（px）：深层排不能被连乘到看不见。
+const ROW_WIDTH_MIN: f32 = 1.5;
+/// 排号 → 色相表（0 起；`None` = 沿用 `kps_rain_color`，不做色相变换）。
+/// 用固定表而不是逐排累加，是为了让相邻两排**一眼就是两种颜色**：
+/// 累加出来的 0.70 / 0.85 都落在紫红一带，叠起来仍是一片粉，分不出前后。
+/// 0.55 ≈ 天青、0.80 ≈ 紫 —— 冷色段彼此距离够远，且不会撞上键格本身的热力青绿。
+const ROW_HUE_TABLE: [Option<f32>; 5] = [None, None, Some(0.55), Some(0.80), None];
+/// 换色排的最低饱和度：纯白没有色相，必须先给饱和度，否则色相原地旋转等于没变。
+const ROW_TINT_SAT: f32 = 0.88;
 /// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
 /// 松手后的雨还要继续上飘、还要能被裁短，若窗口等于走完轨道的时间，
 /// 松手瞬间整条雨就会因为"按下太久"被丢掉 —— 那正是"松手即消失"的根因。
@@ -92,6 +112,30 @@ fn fade_at(d_from_top: f32, h: f32) -> f32 {
     d_from_top.max(0.0).min(band) / band
 }
 
+/// 某个排的不透明度系数（见 `ROW_ALPHA_TABLE`）。表外的排返回 0 = 完全不画。
+fn row_alpha_scale(row: usize) -> f32 {
+    ROW_ALPHA_TABLE.get(row).copied().unwrap_or(0.0)
+}
+
+/// 某个排的雨条颜色：`ROW_TINT_FROM` 之前的排用 `base`，之后按排号旋转色相。
+///
+/// 纯白没有色相，所以白色时先落到 `ROW_HUE_BASE`（天青）并抬起饱和度再按 `ROW_HUE_STEP` 递进 ——
+/// 否则 HSV 色相原地旋转，白色永远是白色，换了颜色也看不出来。
+fn row_color(base: Color32, row: usize) -> Color32 {
+    let Some(hue) = ROW_HUE_TABLE.get(row).copied().flatten() else {
+        return base;
+    };
+    let hsva = egui::ecolor::Hsva::from_srgb([base.r(), base.g(), base.b()]);
+    let tinted = egui::ecolor::Hsva {
+        h: hue,
+        s: hsva.s.max(ROW_TINT_SAT),
+        v: hsva.v.max(0.85),
+        a: 1.0,
+    };
+    let [r, g, b, _] = tinted.to_srgba_unmultiplied();
+    Color32::from_rgb(r, g, b)
+}
+
 /// 键雨的固定基色（`kps_rain_color`，默认纯白）。
 ///
 /// **不跟随 KPS 热度**：雨条是"这次按压的运动轨迹"，与手速无关；跟着热度变色会让同一个键
@@ -127,10 +171,15 @@ pub(crate) fn paint_kps_rain(
 
     let mut info_idx = 0usize;
     for (row, cells) in layout.rows.iter().enumerate() {
-        // 排间递进：第 1 排（row = 0）恒为 1.00，即**原始宽度与原始不透明度**。
-        // 这一点是硬约束：只要第一排按过键，它的雨就必须和你单独按它时一模一样。
+        // 排间递进：宽度逐排收窄、不透明度逐排抬升、第 3 排起换色相。
+        // 第一排刻意压得比实心淡（0.35）—— 多排是叠在同一条竖线上的，
+        // 第一排若已是实心白，中心永远饱和，后面的排无论换色还是调 alpha 都看不出来。
+        let alpha_scale = row_alpha_scale(row);
+        if alpha_scale <= 0.0 {
+            continue; // 表外的排彻底透明，连几何都不必算
+        }
         let step = ROW_WIDTH_STEP.powi(row as i32);
-        let alpha_scale = ROW_ALPHA_STEP.powi(row as i32);
+        let row_base = row_color(base, row);
         for (cell_idx, cell) in cells.iter().enumerate() {
             let Some(&(x_off, box_w)) = row_pos.get(row).and_then(|r| r.get(cell_idx)) else {
                 break;
@@ -151,7 +200,8 @@ pub(crate) fn paint_kps_rain(
                 continue;
             }
             let cx = rain_area.left() + x_off + box_w * 0.5;
-            let w = (box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step;
+            let w = ((box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step)
+                .max(ROW_WIDTH_MIN);
 
             for &(start_age, end_age) in spans {
                 // 前沿：从按下算起按固定速度推进，**松手后继续推进**（这是"飘上去"的动力）。
@@ -177,7 +227,8 @@ pub(crate) fn paint_kps_rain(
                     continue;
                 }
                 emit_bar(
-                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, base, alpha_scale,
+                    &painter, cx, w, cell_top, vis_top, vis_bottom, h, opacity, row_base,
+                    alpha_scale,
                 );
             }
         }
