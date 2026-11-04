@@ -2,15 +2,22 @@
 //!
 //! 与 JipperKeyViewer 的差异：那边是 Unity 对象池 + 逐滴 Update；这里是 egui 立即模式，
 //! **不保存任何粒子状态** —— 每帧从 `KpsTracker::rain_spans` 拿「每个键最近的按压区间
-//! （按下距今 / 松开距今）」，按**纯几何**重建整条雨：
+//! （按下距今 / 松开距今）」，按**纯几何**重建整条雨。
 //!
-//! - **trail 生长竖条**（对齐 JipperKeyViewer 的 RainLayer）：从键格顶边向上长一条连续竖条，
-//!   前沿 = 按下至今的位移；松手后停在原处并按原速继续淡出。
-//! - **block 方块串**（对齐本项目用户截图里的样式）：按住期间以固定间距持续发射短方块，
-//!   串越按越长；松手停发，已发射的继续上飘。
+//! 两种样式都遵守同一个运动学（对齐 JipperKeyViewer 的 RawRain::UpdateLocation）：
+//!
+//! - `front = 按下至今秒数 × speed`：**前沿**（远端）距键格顶边的高度，只要时间在走就一直增大，
+//!   松手也不会停；
+//! - `len`：条的长度。按住期间 `len = front`（从键格一路长到前沿）；**松手那一刻定格**，
+//!   之后不再变长 —— 于是整条雨原速继续向上飘，这就是"松手不消失"的关键；
+//! - 可见区间 = `[front - len, front]` 与轨道 `[0, H]` 求交：前沿出顶后，条的**底部开始被裁**，
+//!   越来越短，直到整条出顶才消失（对齐 JipperKeyViewer 的 `sizeY = FinalSize.y - dropY + height`）。
+//!
+//! - **trail 生长竖条**：一条连续竖条（JipperKeyViewer 的 RainLayer 样式）。
+//! - **block 方块串**：按住期间每 `D` 像素发射一个短方块，`D` 固定，块本身也按 `speed` 上飘。
 //!
 //! 两种样式共用同一套坐标约定：
-//! - `travel = age × speed` 是前沿位移，`speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
+//! - `speed` 由「走完整个轨道要几毫秒」换算（换轨道高度不改观感）；
 //! - 渐隐带固定在**轨道顶部 1/3**：进入 [2H/3, H] 后从满亮线性淡到 0，H 以上完全不可见；
 //! - 多排布局时第 2 排起逐排**变窄 + 加深一档**，所有排共用同一条轨道（轨道底边 = 第一排键格顶边）。
 //!
@@ -27,12 +34,17 @@ const BAR_W_MIN: f32 = 3.0;
 const BAR_W_MAX: f32 = 10.0;
 /// 方块串：条长 = 条宽 × 这个系数。
 const BAR_H_RATIO: f32 = 1.15;
-/// 方块串里条占间距的比例（剩下是缝）。
-const BLOCK_FILL: f32 = 0.5;
+/// 方块串里条占间距的比例（剩下是缝）：0.62 → 缝约 38%，块之间连成「串」而不是散点。
+const BLOCK_FILL: f32 = 0.62;
 /// 生长竖条的宽度系数（比方块略宽，看起来是"柱"）。
 const TRAIL_W_RATIO: f32 = 0.16;
 /// 每排键格的递进系数：第 2 排起宽度 ×0.85、颜色加深一档。
 const ROW_WIDTH_STEP: f32 = 0.85;
+/// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
+/// 松手后的雨还要继续上飘、还要能被裁短，若窗口等于走完轨道的时间，
+/// 松手瞬间整条雨就会因为"按下太久"被丢掉 —— 那正是"松手即消失"的根因。
+/// 取 20 秒：即便速度为 20 秒/轨道这种极端值，条也早已飘出视野。
+const RAIN_SAMPLE_SECS: f32 = 20.0;
 
 /// 键雨轨道的像素高度（16~400；配置 0 = 自动 96px）。
 pub(crate) fn rain_area_h(cfg: &Config) -> f32 {
@@ -49,10 +61,9 @@ fn rain_px_per_sec(cfg: &Config) -> f32 {
     rain_area_h(cfg) / (travel_ms / 1000.0)
 }
 
-/// 取样窗口（秒）：比"走完一条轨道"再宽裕一点（松手前的尾巴 + 帧间隔抖动）。
-pub(crate) fn rain_lifespan_secs(cfg: &Config) -> f32 {
-    let travel_ms = cfg.kps_rain_speed.clamp(200, 20_000) as f32;
-    (travel_ms / 1000.0 * 1.5).clamp(0.3, 30.0)
+/// 取样窗口（秒）：固定一个远大于轨道穿越时间的值，剩余可见性全部交给几何裁剪。
+pub(crate) fn rain_lifespan_secs(_cfg: &Config) -> f32 {
+    RAIN_SAMPLE_SECS
 }
 
 /// 渐隐带高度：轨道顶部 1/3。
@@ -138,34 +149,41 @@ pub(crate) fn paint_kps_rain(
             let dim = row.min(3) as u32;
 
             for &(start_age, end_age) in spans {
-                // 前沿位移：从按下算起按固定速度推进；松手后公式不变，只是不再增长。
-                let travel = start_age as f32 * speed;
-                if travel <= 0.0 {
+                // 前沿：从按下算起按固定速度推进，**松手后继续推进**（这是"飘上去"的动力）。
+                let front = start_age as f32 * speed;
+                if front <= 0.0 {
                     continue;
                 }
+                // 按住时长（秒）：松手后 `start_age - end_age` 恒定 = 实际按住时长，
+                // 所以下面的 len 与发射长度都不会随时间漂移，雨条自然"定格上飘"。
+                let hold_s = if end_age <= 0.0 {
+                    start_age as f32
+                } else {
+                    (start_age - end_age).max(0.0) as f32
+                };
+                let hold_len = hold_s * speed;
+
                 if block_style {
-                    // —— 方块串：按住期间以固定间距持续发射 ——
+                    // —— 方块串：按住期间每 D 像素发射一块；块本身也按 speed 上飘 ——
                     let w = (box_w * BAR_W_RATIO).clamp(BAR_W_MIN, BAR_W_MAX) * step;
                     let bar_h = (w * BAR_H_RATIO).max(MIN_BAR_H);
                     let d = (bar_h / BLOCK_FILL).max(MIN_BAR_H + 2.0);
-                    // 发射窗口 = 按住期间前沿走过的位移
-                    let hold_len = if end_age <= 0.0 {
-                        travel
-                    } else {
-                        ((start_age - end_age) as f32 * speed).max(0.0)
-                    };
-                    let k_min = (((travel - h) / d).ceil() as i64).max(0);
-                    let k_max = (travel / d).floor() as i64;
-                    for kk in k_min..=k_max {
-                        // 第 kk 根在「按下后 kk×D」处发射；越过发射窗口的还没生成
-                        if kk as f32 * d > hold_len {
-                            continue;
-                        }
-                        let top_rise = travel - kk as f32 * d;
-                        if top_rise < 0.0 || top_rise >= h {
-                            continue;
-                        }
-                        let vis_top = top_rise.min(h);
+                    // 已发射的最大序号（松手后固定）
+                    let k_hi = (hold_len / d).floor() as i64;
+                    if k_hi < 0 {
+                        continue;
+                    }
+                    // 近端已飘出轨道顶的最小序号（随时间右移，块从底部被裁）
+                    let k_lo = (((front - h) / d).ceil() as i64).max(0);
+                    // 近端还在键格顶以上的最大序号
+                    let k_top = (front / d).floor() as i64;
+                    let (lo, hi) = (k_lo.max(0), k_hi.min(k_top));
+                    if hi < lo {
+                        continue;
+                    }
+                    for kk in lo..=hi {
+                        let top_rise = front - kk as f32 * d;
+                        let vis_top = top_rise.max(0.0);
                         let vis_bottom = (top_rise + bar_h).min(h);
                         if vis_bottom - vis_top < 0.5 {
                             continue;
@@ -175,17 +193,15 @@ pub(crate) fn paint_kps_rain(
                         );
                     }
                 } else {
-                    // —— 生长竖条：一条连续柱从前沿一直连到键格顶边 ——
+                    // —— 生长竖条：按住时长到前沿，松手后长度定格、整条继续上飘 ——
                     let w = (box_w * TRAIL_W_RATIO).clamp(BAR_W_MIN, BAR_W_MAX) * step;
-                    // 松手后长度定格在「松手那一刻的位移」
-                    let len = if end_age <= 0.0 {
-                        travel
-                    } else {
-                        ((start_age - end_age) as f32 * speed).max(MIN_BAR_H)
-                    };
-                    let seg_top = (travel - len).max(0.0);
-                    let vis_top = seg_top.min(h);
-                    let vis_bottom = travel.min(h);
+                    let len = hold_len.max(MIN_BAR_H);
+                    let near = (front - len).max(0.0);
+                    if near >= h {
+                        continue; // 整条已飘出轨道
+                    }
+                    let vis_top = near.min(h);
+                    let vis_bottom = front.min(h);
                     if vis_bottom - vis_top < 0.5 {
                         continue;
                     }
@@ -219,23 +235,27 @@ fn emit_bar(
     if alpha_top == 0 && alpha_bot == 0 {
         return;
     }
-    // 距轨道顶 → 屏幕 y（cell_top 是轨道底边，向上为负）
-    let y_top = cell_top - vis_top;
-    let y_bot = cell_top - vis_bottom;
+    // vis_* 是「距键格顶边的高度」：数值大的一端离**轨道顶**近，在屏幕上更靠上（y 更小）。
+    // Rect::from_min_max 要求 min <= max，而这里 vis 越大 y 越小，两者方向相反 ——
+    // 必须显式取 min/max，否则画出来是空矩形（rect_filled 直接不可见，
+    // 而 Mesh 分支因不剔除背面仍能看见，表现为「只有跨渐隐带的条才显示一半」）。
+    let y_a = cell_top - vis_top;
+    let y_b = cell_top - vis_bottom;
+    let (y_hi, y_lo) = (y_a.min(y_b), y_a.max(y_b));
     let (xl, xr) = (cx - w * 0.5, cx + w * 0.5);
     if alpha_top == alpha_bot {
         painter.rect_filled(
-            Rect::from_min_max(Pos2::new(xl, y_top), Pos2::new(xr, y_bot)),
+            Rect::from_min_max(Pos2::new(xl, y_hi), Pos2::new(xr, y_lo)),
             1.5,
             rain_color(heat, alpha_bot, dim),
         );
     } else {
         // 跨渐隐带：Mesh 顶点色做竖向渐变
         let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(Pos2::new(xl, y_top), rain_color(heat, alpha_top, dim));
-        mesh.colored_vertex(Pos2::new(xr, y_top), rain_color(heat, alpha_top, dim));
-        mesh.colored_vertex(Pos2::new(xl, y_bot), rain_color(heat, alpha_bot, dim));
-        mesh.colored_vertex(Pos2::new(xr, y_bot), rain_color(heat, alpha_bot, dim));
+        mesh.colored_vertex(Pos2::new(xl, y_a), rain_color(heat, alpha_top, dim));
+        mesh.colored_vertex(Pos2::new(xr, y_a), rain_color(heat, alpha_top, dim));
+        mesh.colored_vertex(Pos2::new(xl, y_b), rain_color(heat, alpha_bot, dim));
+        mesh.colored_vertex(Pos2::new(xr, y_b), rain_color(heat, alpha_bot, dim));
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(1, 3, 2);
         painter.add(egui::Shape::mesh(mesh));
