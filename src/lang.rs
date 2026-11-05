@@ -485,7 +485,7 @@ const ZH: Strings = Strings {
         "计算方式·灵敏：指数平滑：击键立刻反映、松手后掉得更快",
         "缩放：按百分比缩放整个悬浮窗（字号、键格、KPS 图都跟着变，范围 60~400%）",
         "自适应键宽：最后一行平分整行宽度",
-        "KPS 监控按键：逗号分隔（KPS 只统计这些键）。换行 = 分行（默认每行最多 12 个）；空项 = 空位；数字前缀 = 宽度倍数：1.5X、4X",
+        "KPS 监控按键：逗号分隔（KPS 只统计这些键）。换行 = 分行（默认每行最多 12 个）；空项 = 空位；数字前缀 = 宽度倍数：1.5X、4X；单独一个数字 = 间距：F,0.5,G",
         "键数：点它之后依次按下要监控的键",
         "悬浮窗显示项：按键格子 / 统计信息 / KPS 图；「统计信息」里再选 击打次数 / Max 峰值 / 平均 KPS / 单键 KPS",
         "KPS 图：KPS 图显示最近多少秒的曲线",
@@ -512,6 +512,7 @@ const ZH: Strings = Strings {
 • 换行 = 分行
 • 空项（两个逗号挨着） = 空位；**行首 / 行尾的逗号同样算空位**（用来把这行顶格）
 • 1.5X = 宽 1.5 格
+• 单独一个数字 = 间距：F,0.5,G = F 与 G 之间留 0.5 格
 • 2x2H = 宽 2 格、高 2 行（跨行只写一次，下面那行自动让位）
 • 逗号键本身写 < 或 《，句号键写 > 或 》",
     settings_kps_show_hits: "显示按键累计击打次数",
@@ -755,7 +756,7 @@ const EN: Strings = Strings {
         "Method\u{b7}Sensitive: exponentially smoothed: reacts instantly and decays faster",
         "Scale: scales the whole HUD by percent (font, key grid and graph follow, 60-400%)",
         "Auto key width: the last row splits the full width evenly",
-        "Monitored keys: comma separated (only these count). Newline = new row (max 12 per row); empty item = gap; number prefix = width multiplier: 1.5X, 4X",
+        "Monitored keys: comma separated (only these count). Newline = new row (max 12 per row); empty item = gap; number prefix = width multiplier: 1.5X, 4X; a bare number = spacing: F,0.5,G",
         "Key count: press it, then hit the keys you want to monitor",
         "HUD items: key grid / stats / KPS graph; stats can show hits / max / avg / per-key KPS",
         "KPS graph: how many seconds of history the graph shows",
@@ -778,7 +779,7 @@ const EN: Strings = Strings {
     settings_kps_layout: "Layout",
     settings_kps_layout_hint: "Shared with the main window. Switching resets the key table to that layout's real keyboard order (still editable; per-count memory is kept)",
     settings_kps_keys: "KPS Monitored Keys",
-    settings_kps_keys_hint: "Comma separated (only these count).\n• Newline = new row\n• Empty item (adjacent commas) = gap; **leading / trailing commas also count as gaps** (use them to align a row)\n• 1.5X = width 1.5 cells\n• 2x2H = width 2 cells, height 2 rows (declare once, the row below yields automatically)\n• The comma key itself is written < or 《; period key is > or 》",
+    settings_kps_keys_hint: "Comma separated (only these count).\n• Newline = new row\n• Empty item (adjacent commas) = gap; **leading / trailing commas also count as gaps** (use them to align a row)\n• 1.5X = width 1.5 cells\n• A bare number = spacing: F,0.5,G leaves 0.5 cell between F and G\n• 2x2H = width 2 cells, height 2 rows (declare once, the row below yields automatically)\n• The comma key itself is written < or 《; period key is > or 》",
     settings_kps_show_hits: "Show Key Hit Counts",
     settings_kps_show_max: "Show Max Peak",
     kps_show_avg: "Show average KPS",

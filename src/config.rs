@@ -304,6 +304,21 @@ fn parse_kps_cell(item: &str) -> KpsKeyCell {
     };
     let t = t.trim();
 
+    // **纯数字 = 间距**：F,0.5,G = F 与 G 之间留 0.5 格。
+    //
+    // 和「数字前缀 = 宽度」分开：0.5G 是「宽 0.5 格的 G」（有键名），
+    // 而单独一个 0.5（没有键名）是「一道 0.5 格宽的缝」。
+    // 有键名就是宽度，没键名就是间距，不会互相歧义。
+    if let Ok(gap) = t.parse::<f32>() {
+        if gap.is_finite() && gap > 0.0 {
+            return KpsKeyCell {
+                name: String::new(),
+                width: gap.clamp(0.1, 12.0),
+                height: 1.0,
+            };
+        }
+    }
+
     // 取出开头的数字段：2 或 2.5
     let num_end = t
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
@@ -873,6 +888,40 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// 纯数字项 = 间距：F,0.5,G 表示 F 与 G 之间留 0.5 格。
+    #[test]
+    fn bare_number_is_gap_between_keys() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "F, 0.5, G".into();
+        let l = cfg.kps_key_layout();
+        let row = &l.rows[0];
+        assert_eq!(row.len(), 3, "应是 F / 间距 / G 三格：{:?}", row.iter().map(|c| &c.name).collect::<Vec<_>>());
+        assert_eq!(row[0].name, "F");
+        assert_eq!(row[1].name, "", "中间那格应是空位");
+        assert!((row[1].width - 0.5).abs() < 1e-3, "间距宽度应为 0.5，实际 {}", row[1].width);
+        assert_eq!(row[2].name, "G");
+    }
+
+    /// 数字键本身不受影响：单独写 1 仍是 D1 键而不是间距。
+    #[test]
+    fn digit_key_still_parses_as_key() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "A, D1, B".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[0][1].name, "D1", "D1 应仍是键名");
+    }
+
+    /// 有键名的数字前缀仍是宽度（0.5G 不是间距）。
+    #[test]
+    fn number_prefix_with_name_is_width() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "0.5G, H".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[0][0].name, "G", "0.5G 应是键 G");
+        assert!((l.rows[0][0].width - 0.5).abs() < 1e-3);
+    }
+
+
     /// 新布局语法：行尾逗号 = 末尾空位。
     #[test]
     fn trailing_comma_makes_tail_gap() {
