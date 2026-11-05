@@ -829,6 +829,45 @@ mod tests {
         assert_eq!(app.debug_hud_pos(true), Some((88.0, 999.0)));
     }
 
+    /// 分组 KPS 行应在**数据胶囊内**，且不压到下面的 KPS 图。
+    ///
+    /// 用户反馈：分组文本卡在 KPS 图里。根因是高度被算了两次
+    /// （胶囊一次 + graph_top 又加一次），整体下移后正好压在图顶。
+    #[test]
+    fn group_row_sits_inside_meter_not_on_graph() {
+        use crate::gui::kps_hud_metrics;
+        let mut cfg = Config::default();
+        cfg.kps_show_groups = true;
+        cfg.kps_groups = "左手=A,S,D,F\n右手=J,K,L".into();
+        cfg.kps_show_stats = true;
+        cfg.kps_show_graph = true;
+        let layout = cfg.kps_key_layout();
+        let m = kps_hud_metrics(&cfg, &layout);
+
+        // 一、分组行有高度，且宽度同数据行
+        assert!(m.group_h > 0.0, "开了分组就该有高度");
+        assert!(m.group_w > 0.0, "分组行应有可用宽度");
+
+        // 二、胶囊高度已含分组行（group_h 不在别处重复加）
+        assert!(
+            m.top_h > m.group_h,
+            "胶囊高度 {} 应包含分组行 {} 的高度",
+            m.top_h,
+            m.group_h
+        );
+
+        // 三、关掉分组时高度不同（说明确实参与了布局）
+        let mut cfg2 = cfg.clone();
+        cfg2.kps_show_groups = false;
+        let m2 = kps_hud_metrics(&cfg2, &layout);
+        assert!(
+            m.top_h > m2.top_h,
+            "开分组时的胶囊（{}）应高于不开时（{}）",
+            m.top_h,
+            m2.top_h
+        );
+    }
+
     /// 不透明度可以调到 **0**：底板与外框彻底消失，但键格等内容的文字仍然画出来。
     ///
     /// 主人明确要求过「不透明度必须能到 0」（此前一度把下限卡在 20，被否）。
@@ -2618,11 +2657,15 @@ mod tests {
     fn render_kps_hud_shot() {
         let dir = std::env::var("KMCOUNTER_HUD_SHOT_DIR").unwrap_or_else(|_| "/tmp/kmc-hud-shot".into());
         std::fs::create_dir_all(&dir).unwrap();
-        let (mut app, ctx) = headless_app(store_with_days(5));
+        // 这个场景顺带把分组 KPS 也打开：分组行现在是数据胶囊的第二行，
+        // 得有图才看得出它没压到下面的 KPS 图。
+        let mut boot = Config::default();
+        boot.kps_show_groups = true;
+        boot.kps_groups = "左手=A,S,D,F\n右手=J,K,L".to_string();
+        let (mut app, ctx) = headless_app_with_cfg(store_with_days(5), boot);
         let today = chrono::Local::now().format("%Y%m%d").to_string();
         app.hud_kps_show = true;
         app.debug_set_cfg_open(false, false);
-        // —— 场景重建闭包 ——
         // capture 的循环跑的是**真实时间**（软光栅化每帧几十到几百毫秒），所以场景必须
         // **每帧重建一次**：不重建的话雨滴早飘出雨区（block/both 一片空白），
         // 而重复喂击键又会让 KPS 时间轴越叠越高（踩过：KPS 虚高到 112、最新一根柱顶满）。

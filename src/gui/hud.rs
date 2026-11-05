@@ -693,7 +693,11 @@ fn paint_kps_meter(
         content.left() + pad_x
     };
     let mut x = text_start;
-    let cy = row_top + pill_h * 0.5;
+    // 第一行（当前/Max/平均）的垂直中心：
+    // 有分组行时，胶囊高度 = 第一行 + 分组行，所以第一行只占上半部，
+    // 不能再按整个胶囊高度居中（否则会被推到上边缘）。
+    let first_h = (pill_h - m.group_h).max(0.0);
+    let cy = row_top + first_h * 0.5;
     for galley in &texts {
         ui.painter().galley(
             Pos2::new(x, cy - galley.size().y * 0.5),
@@ -702,15 +706,25 @@ fn paint_kps_meter(
         );
         x += galley.size().x + 4.0 * sc;
     }
-    // 分组 KPS 行：胶囊下面一行，每个组一段「名字 值 KPS」
-    if m.group_h > 0.0 && !kd.groups.is_empty() {
-        paint_kps_group_row(ui, content, m, kd, s, sc, keys_h + pill_h);
+    // 分组 KPS这一行**画在胶囊内部**（用户要求：去掉它卡在 KPS 图里 的问题）。
+    //
+    // 以前它画在胶囊下面，但高度又另外计入 group_h，两边叠加后整体下移，
+    // 分组文字恰好压到下面张 KPS 图的顶部 —— 就是用户看到的「文本卡在图里」。
+    // 现在把它当作胶囊的第二行：胶囊本身变高（高度在 kps_hud_metrics 里算好），
+    // 分组文字就在胶囊内的第二行位置，宽度与 KPS 图完全一致（都是 content 宽）。
+    if m.group_w > 0.0 && !kd.groups.is_empty() {
+        paint_kps_group_row(ui, content, m, kd, s, sc, row_top, pill_h, content.width());
     }
 }
 
-/// 下半区：整宽 KPS 图（柱数按实际像素宽推，每根柱 = 一个时间片的平均 KPS）。
-/// 分组 KPS 行：每个组一段「名字 值 KPS」，超出宽度就截断。
-/// 参照 JipperKeyViewer 的 GroupId：只看某几个键的合计 KPS（左手 / 右手、主键区…）。
+/// 分组 KPS 行：每个组一段「名字 值 KPS (次数)」，**画在数据胶囊内的第二行**。
+///
+/// 为什么放胶囊里：
+/// - 以前它画在胶囊下面，但高度又重复计入了总高，导致文字压在 KPS 图顶部（用户反馈）；
+/// - 跟数据行放在同一块胶囊里，看起来就是一个整体，不会像之前那样孤零零浮在图上。
+///
+/// 参数 `pill_top` / `pill_h` 是胶囊自身的位置与高度；第二行就在胶囊内靠下的 `group_h` 那一条，
+/// 与第一行（当前/Max/平均）分开排。
 fn paint_kps_group_row(
     ui: &mut egui::Ui,
     content: Rect,
@@ -718,15 +732,20 @@ fn paint_kps_group_row(
     kd: &KpsHudData,
     s: &'static Strings,
     sc: f32,
-    keys_h: f32,
+    pill_top: f32,
+    pill_h: f32,
+    avail_w: f32,
 ) {
-    let row_top = content.top()
-        + keys_h
-        + if keys_h > 0.0 { m.pad } else { 0.0 }
-        + m.top_h
-        + m.pad;
-    let mut x = content.left();
-    let cy = row_top + m.font_sub * 0.5;
+    // 第二行的垂直中心：胶囊内的下半部分。
+    //
+    // 胶囊高度 = 第一行（font_cur*1.3）+ 分组行（group_h），
+    // 所以分组行的中心应在 胶囊顶 + 第一行高 + group_h/2。
+    // 之前用「胶囊底往上半个 group_h」，而 group_h 是 font_sub*2（比实际文字高一倍），
+    // 于是整行被推到了胶囊上半部，与第一行重叠。
+    let first_h = (pill_h - m.group_h).max(0.0);
+    let cy = pill_top + first_h + m.group_h * 0.5;
+    let mut x = content.left() + 8.0 * sc;
+    let right = content.left() + avail_w - 4.0 * sc;
     for (i, g) in kd.groups.iter().enumerate() {
         let label = format!("{} {} {} ({})", g.name, fmt_kps(g.kps, kd.method), s.kps_label, g.hits);
         let galley = ui.painter().layout_no_wrap(
@@ -735,8 +754,8 @@ fn paint_kps_group_row(
             HUD_TEXT,
         );
         let w = galley.size().x;
-        // 放不下就不再往右排（组很多时按宽度截断，纵向高度固定为一行）
-        if x + w > content.right() && i > 0 {
+        // 放不下就不再往右排（组很多时按宽度截断，总高固定为一行）
+        if x + w > right && i > 0 {
             break;
         }
         ui.painter().galley(
@@ -759,11 +778,12 @@ fn paint_kps_graph_area(
     graph_secs: u32,
 ) {
     let span_secs = graph_secs.clamp(10, 300);
+    // 注意：**不要再单独加 m.group_h** —— 它已经并入 m.top_h（胶囊高度）。
+    // 之前两边都算一次，图被整体压下 group_h，分组文字就卡到了图里。
     let graph_top = content.top()
         + keys_h
         + if keys_h > 0.0 { m.pad } else { 0.0 }
-        + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 }
-        + m.group_h;
+        + if m.meter_w > 0.0 { m.top_h + m.pad } else { 0.0 };
     let rect = Rect::from_min_max(
         Pos2::new(content.left(), graph_top),
         Pos2::new(content.right(), content.bottom()),
@@ -1715,8 +1735,11 @@ impl App {
             .changed()
         {
             // 手改键表时把"键数"跟着对一下，避免两处打架
-            self.cfg.kps_key_count =
-                self.cfg.kps_key_layout().names().len().clamp(1, 26) as u8;
+            let max = crate::config::KPS_KEY_MAX;
+            self.cfg.kps_key_count = self.cfg.kps_key_layout().names().len().clamp(1, max as usize) as u8;
+            // 同步记进「按键数记忆」：用户手改完再切键数，回来还能找到这份
+            let k = self.cfg.kps_key_count.to_string();
+            self.cfg.kps_keys_by_count.insert(k, self.cfg.kps_keys.clone());
             act.dirty = true;
         }
     }
@@ -1727,10 +1750,14 @@ impl App {
             ui.label(egui::RichText::new(s.kps_key_count).color(HUD_TEXT));
             let mut count = self.cfg.kps_key_count as i32;
             if ui
-                .add(egui::DragValue::new(&mut count).range(1..=26).speed(1.0))
+                .add(
+                    egui::DragValue::new(&mut count)
+                        .range(1..=crate::config::KPS_KEY_MAX as i32)
+                        .speed(1.0),
+                )
                 .changed()
             {
-                self.cfg.kps_key_count = count.clamp(1, 26) as u8;
+                self.cfg.kps_key_count = count.clamp(1, crate::config::KPS_KEY_MAX as i32) as u8;
                 self.cfg.resize_kps_keys();
                 act.dirty = true;
             }
@@ -2232,6 +2259,8 @@ pub(crate) struct KpsHudMetrics {
     pub rain_h: f32,
     /// 分组 KPS 行高度（0 = 不显示分组）
     pub group_h: f32,
+    /// 分组行可用宽度（与数据行同宽；0 = 不显示分组行）
+    pub group_w: f32,
 }
 
 /// 计算 KPS 悬浮窗尺寸：**三栏竖排 —— 键位 / 数据 / 图**。
@@ -2271,15 +2300,16 @@ pub(crate) fn kps_hud_metrics(
     };
     // 数据行：一行文字（当前 / Max / 平均），宽度给足，数字变长也不至于被窗口裁掉
     let stats_w = if cfg.kps_show_stats { 210.0 * s } else { 0.0 };
-    let stats_h = if cfg.kps_show_stats { font_cur * 1.3 } else { 0.0 };
-    let graph_h = if cfg.kps_show_graph { 64.0 * s } else { 0.0 };
-    let rain_h = if cfg.kps_show_rain { super::rain::rain_area_h(cfg) } else { 0.0 };
-    // 分组 KPS 行：只在「开了显示」且「配置里确实写了分组」时占高度
+    // 分组 KPS 行现在是胶囊的第二行，所以**高度并入胶囊**，
+    // 不再单独占一块（之前就是因为两边都算了高度才错位）。
     let group_h = if cfg.kps_show_groups && !crate::stats::parse_kps_groups(&cfg.kps_groups).is_empty() {
         font_sub * 2.0
     } else {
         0.0
     };
+    let stats_h = if cfg.kps_show_stats { font_cur * 1.3 + group_h } else { 0.0 };
+    let graph_h = if cfg.kps_show_graph { 64.0 * s } else { 0.0 };
+    let rain_h = if cfg.kps_show_rain { super::rain::rain_area_h(cfg) } else { 0.0 };
     let min_graph_w = 200.0 * s;
 
     let content_w = keys_w.max(stats_w).max(if graph_h > 0.0 { min_graph_w } else { 0.0 }).max(unit);
@@ -2303,10 +2333,6 @@ pub(crate) fn kps_hud_metrics(
             h += v_gap;
         }
         h += stats_h;
-        blocks += 1;
-    }
-    if group_h > 0.0 {
-        h += group_h;
         blocks += 1;
     }
     if graph_h > 0.0 {
@@ -2334,6 +2360,7 @@ pub(crate) fn kps_hud_metrics(
         font_cur,
         rain_h,
         group_h,
+        group_w: if group_h > 0.0 { stats_w } else { 0.0 },
     }
 }
 

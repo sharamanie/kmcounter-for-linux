@@ -2,6 +2,7 @@
 //! 历史保留天数默认 365 天（原版默认 9999，见 `history_days_clamped`）。
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -30,6 +31,12 @@ impl Default for LayoutCfg {
         }
     }
 }
+
+/// KPS 监控键数量上限。
+///
+/// 为什么是 60：键盘最多 6 行、每行最多 12 个 → 理论上 72 个；
+/// 取 60 留余量（宽键、空位占更多地方），同时避免超大键表把 HUD 撑得过宽。
+pub const KPS_KEY_MAX: u8 = 60;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -67,8 +74,15 @@ pub struct Config {
     pub kps_window_ms: u32,
     /// KPS 监控按键列表（逗号隔开，如 "Q, W, E, R"）
     pub kps_keys: String,
-    /// KPS 监控键数量（1~26）：键表按这个数量维护，默认键位取自 QWERTY 序列
+    /// KPS 监控键数量（1~KPS_KEY_MAX）：键表按这个数量维护，默认键位取自 QWERTY 序列
     pub kps_key_count: u8,
+    /// **按键数记忆的键表**：`{6: "A,S,D,F,G,H", 10: "..."}`。
+    ///
+    /// 用户把键数从 6 改到 12 再改回 6 时，希望 6 键的那套键位还在。
+    /// 键的 key 是 `u8` 转字符串（TOML 的 table key 只能是字符串，用 BTreeMap 保证写盘顺序稳定）。
+    /// 空表 = 旧版本配置，行为回退到「只保留当前一份」。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kps_keys_by_count: std::collections::BTreeMap<String, String>,
     /// KPS 悬浮窗是否显示按键累计次数
     pub kps_show_hits: bool,
     /// KPS 悬浮窗是否显示 Max 峰值
@@ -173,6 +187,7 @@ impl Default for Config {
             kps_window_ms: 1000,
             kps_keys: "Q, W, E, R".into(),
             kps_key_count: 4,
+            kps_keys_by_count: std::collections::BTreeMap::new(),
             kps_show_hits: true,
             kps_show_max: true,
             kps_show_avg: true,
@@ -355,23 +370,64 @@ impl Config {
     /// - 还是默认表 → 直接按新数量重排（所以"6 键"就是 q, w, e, r, t, y）；
     /// - 自定义表（用户设置过键位）→ 保留前 N 个，不足的从默认序列补（跳过已经用过的）。
     pub fn resize_kps_keys(&mut self) {
-        let n = (self.kps_key_count.clamp(1, 26)) as usize;
+        let n = (self.kps_key_count.clamp(1, KPS_KEY_MAX)) as usize;
+        // ① 先把**当前**键表存进「按键数记忆」。
+        //
+        // 这一步必须在探索新键表之前：否则用户把 6 改成 12 时，
+        // 第九个键起就被覆盖了，改回 6 也找不回原来那套。
+        // 这里必须用「上一份键表的键数」作 key：
+        // 用户把 6 改成 12 时，当前键表还是 6 键那份，直接用它的名字个数做 key。
+        let prev_names = self.kps_key_layout().names();
+        if !prev_names.is_empty() {
+            let cur = self.kps_keys.clone();
+            if !cur.trim().is_empty() {
+                self.kps_keys_by_count.insert(prev_names.len().to_string(), cur);
+            }
+        }
+
+        // ② 如果这个键数之前存过，**直接恢复**（这就是「随时切换」的体验）
+        if let Some(saved) = self.kps_keys_by_count.get(&n.to_string()).cloned() {
+            let names = Self::parse_names(&saved);
+            if names.len() >= n {
+                self.kps_keys = saved;
+                self.kps_key_count = n as u8;
+                return;
+            }
+        }
+
+        // ③ 没存过：按旧规则推导一份
         let cur = self.kps_key_layout().names();
-        if cur.is_empty() || self.kps_keys_is_default() {
-            self.kps_keys = Self::default_kps_keys_for(n).join(", ");
-            return;
-        }
-        let mut list: Vec<String> = cur.into_iter().take(n).collect();
-        let used: std::collections::BTreeSet<String> = list.iter().map(|s| s.to_lowercase()).collect();
-        for c in DEFAULT_KPS_KEY_SEQUENCE.chars() {
-            if list.len() >= n {
-                break;
+        let result = if cur.is_empty() || self.kps_keys_is_default() {
+            Self::default_kps_keys_for(n).join(", ")
+        } else {
+            let mut list: Vec<String> = cur.into_iter().take(n).collect();
+            let used: std::collections::BTreeSet<String> =
+                list.iter().map(|s| s.to_lowercase()).collect();
+            for c in DEFAULT_KPS_KEY_SEQUENCE.chars() {
+                if list.len() >= n {
+                    break;
+                }
+                if !used.contains(&c.to_string()) {
+                    list.push(c.to_uppercase().to_string());
+                }
             }
-            if !used.contains(&c.to_string()) {
-                list.push(c.to_uppercase().to_string());
-            }
-        }
-        self.kps_keys = list.join(", ");
+            list.join(", ")
+        };
+        self.kps_keys = result;
+        self.kps_key_count = n as u8;
+    }
+
+    /// 从键表字符串里取出真实键名（去掉空位 / 宽度前缀）。
+    fn parse_names(keys: &str) -> Vec<String> {
+        keys.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                // 宽度前缀："1.5H" / "4X" → 取后面的键名
+                let t = s.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+                if t.is_empty() { s.to_string() } else { t.to_string() }
+            })
+            .collect()
     }
 
     pub fn load(path: &Path) -> (Config, bool) {
@@ -683,6 +739,45 @@ Z,X,C,V".into();
 
     /// 键数与默认键位：默认表按 QWERTY 序列重排（6 键 = Q..Y）；自定义表保留并补齐（跳过已用过的键）
     #[test]
+    /// **按键数记忆键表**：6 改 12 再改回 6，要能找回原来那套键位。
+    #[test]
+    fn key_count_memory_roundtrip() {
+        let mut cfg = Config::default();
+        // 起点：6 键的自定义键位
+        cfg.kps_key_count = 6;
+        cfg.kps_keys = "A,S,D,F,G,H".into();
+        // 切到 12 键（应记住 6 键那份）
+        cfg.kps_key_count = 12;
+        cfg.resize_kps_keys();
+        assert_eq!(cfg.kps_key_count, 12);
+        assert!(
+            cfg.kps_keys_by_count.contains_key("6"),
+            "切走时应记住 6 键那份，实际 {:?}",
+            cfg.kps_keys_by_count
+        );
+
+        // 再切回 6：应恢复 A,S,D,F,G,H
+        cfg.kps_key_count = 6;
+        cfg.resize_kps_keys();
+        assert_eq!(
+            cfg.kps_keys, "A,S,D,F,G,H",
+            "切回 6 键时应恢复原来那套键位，实际 {}",
+            cfg.kps_keys
+        );
+    }
+
+    /// 键数上限提到 KPS_KEY_MAX，且超出会被夹住。
+    #[test]
+    fn key_count_allows_more_than_26() {
+        assert!(KPS_KEY_MAX >= 60, "上限至少要能装下 6 行 x 10 个");
+        let mut cfg = Config::default();
+        cfg.kps_key_count = 40;
+        cfg.resize_kps_keys();
+        let names = cfg.kps_key_layout().names();
+        assert!(!names.is_empty(), "40 键应能生成键表");
+        assert!(cfg.kps_key_count <= KPS_KEY_MAX);
+    }
+
     fn kps_key_count_rewrites_default_table() {
         let mut cfg = Config::default();
         assert_eq!(cfg.kps_keys, "Q, W, E, R", "默认键位是 QWERTY 前 4 个");
