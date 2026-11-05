@@ -978,23 +978,71 @@ impl KpsTracker {
 
 pub fn normalize_kps_key(k: &str) -> String {
     let s = k.trim().to_lowercase();
-    match s.as_str() {
-        "m1" | "mouse1" | "left" | "lbutton" => "m1".into(),
-        "m2" | "mouse2" | "right" | "rbutton" => "m2".into(),
-        "m3" | "mouse3" | "middle" | "mbutton" => "m3".into(),
-        "m4" | "mouse4" | "side" | "xbutton" | "xb1" => "m4".into(),
-        "m5" | "mouse5" | "extra" | "xb2" => "m5".into(),
-        "d0" => "0".into(),
-        "d1" => "1".into(),
-        "d2" => "2".into(),
-        "d3" => "3".into(),
-        "d4" => "4".into(),
-        "d5" => "5".into(),
-        "d6" => "6".into(),
-        "d7" => "7".into(),
-        "d8" => "8".into(),
-        "d9" => "9".into(),
-        _ => s,
+    // 符号键：用户在「监控按键」里写的是**键面上那个字符**（[ ] ; ' , . / \ - = `），
+    // 而输入层上报的是 `KEYS[i].name` 的内部名（BracketL / Semicolon …）。
+    // 两者对不上就是「无法映射」：写 [ 永远匹配不到上报的 BracketL。
+    // 这里把符号归一到内部名，于是两种写法都能用。
+    //
+    // 同时处理「按住 Shift 后的形态」（{ } : " 等）与数字键上排符号（! @ # …）：
+    // 它们和对应的主键位是**同一颗键**，归一到同一个名字。
+    let canon: Option<&str> = match s.as_str() {
+        // 鼠标键
+        "m1" | "mouse1" | "left" | "lbutton" => Some("m1"),
+        "m2" | "mouse2" | "right" | "rbutton" => Some("m2"),
+        "m3" | "mouse3" | "middle" | "mbutton" => Some("m3"),
+        "m4" | "mouse4" | "side" | "xbutton" | "xb1" => Some("m4"),
+        "m5" | "mouse5" | "extra" | "xb2" => Some("m5"),
+        // 主键区下排符号（写法 → 内部名）
+        "[" | "bracketl" | "leftbracket" | "lbracket" => Some("bracketl"),
+        "]" | "bracketr" | "rightbracket" | "rbracket" => Some("bracketr"),
+        ";" | "semicolon" => Some("semicolon"),
+        "'" | "quote" | "apostrophe" => Some("quote"),
+        "," | "comma" => Some("comma"),
+        "." | "period" | "dot" => Some("period"),
+        "/" | "slash" => Some("slash"),
+        "\\" | "backslash" => Some("backslash"),
+        "-" | "minus" | "hyphen" => Some("minus"),
+        "=" | "equal" | "equals" => Some("equal"),
+        "`" | "backquote" | "grave" => Some("backquote"),
+        // Shift 形态（与对应下排键同一颗）
+        "{" | "braceleft" => Some("bracketl"),
+        "}" | "braceright" => Some("bracketr"),
+        ":" | "colon" => Some("semicolon"),
+        "\"" | "doublequote" => Some("quote"),
+        "<" | "less" => Some("comma"),
+        ">" | "greater" => Some("period"),
+        "?" | "question" => Some("slash"),
+        "|" | "bar" | "pipe" => Some("backslash"),
+        "_" | "underscore" => Some("minus"),
+        "+" | "plus" => Some("equal"),
+        "~" | "tilde" => Some("backquote"),
+        // 数字键上排符号（与对应数字键同一颗）
+        "!" | "exclam" => Some("1"),
+        "@" | "at" => Some("2"),
+        "#" | "hash" => Some("3"),
+        "$" | "dollar" => Some("4"),
+        "%" | "percent" => Some("5"),
+        "^" | "caret" => Some("6"),
+        "&" | "amp" | "ampersand" => Some("7"),
+        "*" | "asterisk" => Some("8"),
+        "(" | "lparen" => Some("9"),
+        ")" | "rparen" => Some("0"),
+        // D1..D9 写法 → 对应数字
+        "d0" => Some("0"),
+        "d1" => Some("1"),
+        "d2" => Some("2"),
+        "d3" => Some("3"),
+        "d4" => Some("4"),
+        "d5" => Some("5"),
+        "d6" => Some("6"),
+        "d7" => Some("7"),
+        "d8" => Some("8"),
+        "d9" => Some("9"),
+        _ => None,
+    };
+    match canon {
+        Some(c) => c.to_string(),
+        None => s,
     }
 }
 
@@ -1476,6 +1524,64 @@ pub fn key_name(idx: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// 端到端：输入层上报 "BracketL"，用户在键表里写 "["，两者的归一化结果必须一致，
+    /// 否则 record() 会认为它不在监控列表里，KPS 永远为 0。
+    #[test]
+    fn bracket_press_counts_when_user_writes_symbol() {
+        let mut kps = KpsTracker::new("20261105");
+        kps.set_monitored(&["[".to_string(), "]".to_string()]);
+        // 输入层上报的是内部名
+        kps.record("20261105", "BracketL", 1000);
+        kps.record("20261105", "BracketR", 1000);
+        let infos = kps.query_keys(&["[".to_string(), "]".to_string()], 1000);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].hits, 1, "写 [ 应能统计到 BracketL 的按下");
+        assert_eq!(infos[1].hits, 1, "写 ] 应能统计到 BracketR 的按下");
+        assert!(
+            infos[0].kps > 0.0 || infos[1].kps > 0.0,
+            "KPS 不应为 0：{:?}",
+            infos.iter().map(|i| i.kps).collect::<Vec<_>>()
+        );
+    }
+    /// 符号键必须能用「键面字符」写进监控列表。
+    ///
+    /// 用户反馈「无法映射 [ ]」：输入层上报的是内部名 BracketL，
+    /// 而用户写的是 [，归一化后两者对不上就被当成未监控键。
+    #[test]
+    fn symbol_keys_normalize_to_internal_names() {
+        let cases = [
+            ("[", "bracketl"),
+            ("]", "bracketr"),
+            ("BracketL", "bracketl"),
+            ("{", "bracketl"),
+            ("}", "bracketr"),
+            (";", "semicolon"),
+            ("'", "quote"),
+            (",", "comma"),
+            (".", "period"),
+            ("/", "slash"),
+            ("-", "minus"),
+            ("=", "equal"),
+            ("!", "1"),
+            ("@", "2"),
+            ("#", "3"),
+            ("~", "backquote"),
+            ("_", "minus"),
+            ("+", "equal"),
+            ("?", "slash"),
+        ];
+        for (user, want) in cases {
+            assert_eq!(
+                normalize_kps_key(user),
+                want,
+                "用户写 {user:?} 应归一为 {want}"
+            );
+        }
+        // 大写字母仍然正常（to_lowercase 已处理）
+        assert_eq!(normalize_kps_key("Q"), "q");
+        // 未识别的名字原样返回，不能瞎改
+        assert_eq!(normalize_kps_key("F5"), "f5");
+    }
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
