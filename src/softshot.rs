@@ -793,6 +793,42 @@ mod tests {
         );
     }
 
+    /// **位置记忆回归**：从托盘关掉 HUD 时，必须先把**当前位置**写进配置。
+    ///
+    /// 曾经的 bug：位置是「安静 1.2 秒后才写盘」的防抖式，而关窗后渲染回调不再跑，
+    /// 防抖永远不会到期 —— 于是「拖完立即关掉」的新位置丢了，重开又回到旧位置。
+    #[test]
+    fn closing_hud_persists_current_position() {
+        let (mut app, _ctx) = headless_app(Store::default());
+        app.hud_kps_show = true;
+        // 假装窗口现在在 (250, 340)（与配置里的旧值不同）
+        app.debug_set_hud_seen(false, (250.0, 340.0));
+        assert_ne!(
+            app.debug_hud_pos(false),
+            Some((250.0, 340.0)),
+            "前提：配置里应该还不是这个位置"
+        );
+        // 关掉（等于托盘取消勾选）
+        app.toggle_kps_hud();
+        assert!(!app.hud_kps_show, "应已关闭");
+        assert_eq!(
+            app.debug_hud_pos(false),
+            Some((250.0, 340.0)),
+            "关闭时必须把当前位置落盘，否则重开会回到旧位置"
+        );
+    }
+
+    /// APM 侧同样必须在关闭时落盘当前位置。
+    #[test]
+    fn closing_apm_hud_persists_current_position() {
+        let (mut app, _ctx) = headless_app(Store::default());
+        app.hud_apm_show = true;
+        app.debug_set_hud_seen(true, (88.0, 999.0));
+        app.toggle_apm_hud();
+        assert!(!app.hud_apm_show);
+        assert_eq!(app.debug_hud_pos(true), Some((88.0, 999.0)));
+    }
+
     /// 不透明度可以调到 **0**：底板与外框彻底消失，但键格等内容的文字仍然画出来。
     ///
     /// 主人明确要求过「不透明度必须能到 0」（此前一度把下限卡在 20，被否）。

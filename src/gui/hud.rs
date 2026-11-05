@@ -82,9 +82,20 @@ impl App {
     }
 
     pub fn toggle_apm_hud(&mut self) {
+        let turning_off = self.hud_apm_show;
         self.hud_apm_show = !self.hud_apm_show;
         // 留痕：悬浮窗开关有 3 个入口（托盘 / 主面板按钮 / HUD 设置窗），出问题时能查是谁关的
         log::info!("APM 悬浮窗 → {}", if self.hud_apm_show { "开" } else { "关" });
+        // 关掉之前先把当前实际位置落盘（理由同 toggle_kps_hud）
+        if turning_off {
+            let seen = self.hud_apm_seen.lock().pos;
+            if let Some(pos) = seen {
+                log::info!("关闭 APM 前落盘位置: {:?}", pos);
+                self.save_hud_pos(true, pos);
+            } else {
+                log::warn!("关闭 APM 时拿不到当前位置，位置记忆可能停在旧值");
+            }
+        }
         self.cfg.hud_apm_show = self.hud_apm_show;
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_apm_show = self.hud_apm_show;
@@ -96,8 +107,24 @@ impl App {
     }
 
     pub fn toggle_kps_hud(&mut self) {
+        let turning_off = self.hud_kps_show;
         self.hud_kps_show = !self.hud_kps_show;
         log::info!("KPS 悬浮窗 → {}", if self.hud_kps_show { "开" } else { "关" });
+        // 关掉之前先把**当前实际位置**落盘。
+        //
+        // 为什么要在这里补一刀：位置记忆是「等它安静 1.2 秒后才写盘」的防抖式，
+        // 而关窗之后渲染回调不再跑，防抖定时器永远没机会到期 ——
+        // 于是「拖完马上从托盘关掉」时，新位置根本没写进去，
+        // 再打开就回到上一个记忆位置（用户反馈的就是这个）。
+        if turning_off {
+            let seen = self.hud_kps_seen.lock().pos;
+            if let Some(pos) = seen {
+                log::info!("关闭 KPS 前落盘位置: {:?}", pos);
+                self.save_hud_pos(false, pos);
+            } else {
+                log::warn!("关闭 KPS 时拿不到当前位置，位置记忆可能停在旧值");
+            }
+        }
         self.cfg.hud_kps_show = self.hud_kps_show;
         let mut cfg = self.cfg_shared.lock();
         cfg.hud_kps_show = self.hud_kps_show;
@@ -106,6 +133,21 @@ impl App {
         self.kps_pos = HudPosState::default();
         // 托盘菜单的 ✔ 跟着走
         self.push_hud_state();
+    }
+
+    /// 调试：把「HUD 看到的位置」直接写成某个值（离屏渲染下没有真窗口，
+    /// 没法靠渲染回调填 seen）。仅测试用。
+    #[cfg(feature = "softshot")]
+    pub(crate) fn debug_set_hud_seen(&mut self, is_apm: bool, pos: (f32, f32)) {
+        let slot = if is_apm { &self.hud_apm_seen } else { &self.hud_kps_seen };
+        let mut s = slot.lock();
+        s.pos = Some(pos);
+    }
+
+    /// 调试：读当前记忆的 HUD 位置（从 cfg）。
+    #[cfg(feature = "softshot")]
+    pub(crate) fn debug_hud_pos(&self, is_apm: bool) -> Option<(f32, f32)> {
+        if is_apm { self.cfg.apm_hud_pos } else { self.cfg.kps_hud_pos }
     }
 
     /// 把 HUD 开关状态回推给托盘菜单（APM / KPS 两项的 ✔ 勾选）
