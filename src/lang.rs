@@ -540,7 +540,7 @@ const ZH: Strings = Strings {
     kps_show_groups: "显示分组 KPS",
     kps_group_empty: "未分组",
     kps_auto_width: "自适应键宽",
-    kps_auto_width_hint: "每一行各自平分整行宽度（行内各键等宽）；哪一行写了宽度倍数（如 1.5H、4X）则跳过那一行",
+    kps_auto_width_hint: "每一行各自平分整行宽度（行内各键等宽）；哪一行写了宽度倍数（如 1.5H、4X）则跳过那一行；键数上限 60（键盘最多 6 行），每个键数都会记住自己那套键位",
     kps_reset: "重置",
     kps_reset_counts: "按键总次数",
     kps_reset_peak: "最大 KPS",
