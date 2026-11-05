@@ -978,66 +978,69 @@ impl KpsTracker {
 
 pub fn normalize_kps_key(k: &str) -> String {
     let s = k.trim().to_lowercase();
-    // 符号键：用户在「监控按键」里写的是**键面上那个字符**（[ ] ; ' , . / \ - = `），
-    // 而输入层上报的是 `KEYS[i].name` 的内部名（BracketL / Semicolon …）。
-    // 两者对不上就是「无法映射」：写 [ 永远匹配不到上报的 BracketL。
-    // 这里把符号归一到内部名，于是两种写法都能用。
+    // 键名有两套口径：用户在「监控按键」里写的是**键面上的字符**，
+    // 而输入层上报的是 `KEYS[i].name` 的内部名（BracketL / Semicolon / Quote …）。
+    // 两者对不上就是「无法映射」。这里把各种写法归一到内部名。
     //
-    // 同时处理「按住 Shift 后的形态」（{ } : " 等）与数字键上排符号（! @ # …）：
-    // 它们和对应的主键位是**同一颗键**，归一到同一个名字。
+    // 覆盖三类：
+    // 1. **同一颗键的所有字符形态**——上排数字键及其 Shift 符号（1 与 !）、
+    //    下排标点及其 Shift 符号（, 与 <，还有中文全角《）、括号的三种形态（[ { 【）…
+    //    用户写哪个都指向同一颗物理键，这正是他要的「& * ) 【 [ { 这种也一样」。
+    // 2. **英文全名**（BracketL / Semicolon / Comma …），照旧可用。
+    // 3. **鼠标键与 D1..D0 老写法**。
+    //
+    // 注意：逗号是**分隔符**，所以逗号键本身必须写 `<` 或 `《`（见 parse_kps_cell 的说明）；
+    // 句号键可以直接写 `.` / `>` / `》`。
     let canon: Option<&str> = match s.as_str() {
-        // 鼠标键
+        // ---- 鼠标键 ----
         "m1" | "mouse1" | "left" | "lbutton" => Some("m1"),
         "m2" | "mouse2" | "right" | "rbutton" => Some("m2"),
         "m3" | "mouse3" | "middle" | "mbutton" => Some("m3"),
         "m4" | "mouse4" | "side" | "xbutton" | "xb1" => Some("m4"),
         "m5" | "mouse5" | "extra" | "xb2" => Some("m5"),
-        // 主键区下排符号（写法 → 内部名）
-        "[" | "bracketl" | "leftbracket" | "lbracket" => Some("bracketl"),
-        "]" | "bracketr" | "rightbracket" | "rbracket" => Some("bracketr"),
-        ";" | "semicolon" => Some("semicolon"),
-        "'" | "quote" | "apostrophe" => Some("quote"),
-        "," | "comma" => Some("comma"),
-        "." | "period" | "dot" => Some("period"),
-        "/" | "slash" => Some("slash"),
-        "\\" | "backslash" => Some("backslash"),
-        "-" | "minus" | "hyphen" => Some("minus"),
-        "=" | "equal" | "equals" => Some("equal"),
-        "`" | "backquote" | "grave" => Some("backquote"),
-        // Shift 形态（与对应下排键同一颗）
-        "{" | "braceleft" => Some("bracketl"),
-        "}" | "braceright" => Some("bracketr"),
-        ":" | "colon" => Some("semicolon"),
-        "\"" | "doublequote" => Some("quote"),
-        "<" | "less" => Some("comma"),
-        ">" | "greater" => Some("period"),
-        "?" | "question" => Some("slash"),
-        "|" | "bar" | "pipe" => Some("backslash"),
-        "_" | "underscore" => Some("minus"),
-        "+" | "plus" => Some("equal"),
-        "~" | "tilde" => Some("backquote"),
-        // 数字键上排符号（与对应数字键同一颗）
-        "!" | "exclam" => Some("1"),
-        "@" | "at" => Some("2"),
-        "#" | "hash" => Some("3"),
-        "$" | "dollar" => Some("4"),
-        "%" | "percent" => Some("5"),
-        "^" | "caret" => Some("6"),
-        "&" | "amp" | "ampersand" => Some("7"),
-        "*" | "asterisk" => Some("8"),
-        "(" | "lparen" => Some("9"),
-        ")" | "rparen" => Some("0"),
-        // D1..D9 写法 → 对应数字
-        "d0" => Some("0"),
-        "d1" => Some("1"),
-        "d2" => Some("2"),
-        "d3" => Some("3"),
-        "d4" => Some("4"),
-        "d5" => Some("5"),
-        "d6" => Some("6"),
-        "d7" => Some("7"),
-        "d8" => Some("8"),
-        "d9" => Some("9"),
+
+        // ---- 下排标点：本形 + Shift 形态 + 对应中文全角 ----
+        // 方括号 [ ] 与 { } 与 【 】
+        "[" | "{" | "【" | "｛" | "bracketl" | "leftbracket" | "lbracket" => Some("bracketl"),
+        "]" | "}" | "】" | "｝" | "bracketr" | "rightbracket" | "rbracket" => Some("bracketr"),
+        // 分号 ; 与 : 与 ；
+        ";" | ":" | "；" | "semicolon" => Some("semicolon"),
+        // 引号 ' 与 " 与 ‘ ’ “
+        "'" | "\"" | "‘" | "’" | "“" | "”" | "quote" | "apostrophe" => Some("quote"),
+        // 逗号键（不能直接写 , —— 那是分隔符）与 《 》 及英文全名
+        "<" | "《" | "〈" | "comma" => Some("comma"),
+        // 句号键 . 与 > 与 》 与 。
+        "." | ">" | "》" | "〉" | "。" | "period" | "dot" => Some("period"),
+        // 斜杠 / 与 ? 与 ？ 与 ÷
+        "/" | "?" | "？" | "slash" => Some("slash"),
+        // 反斜杠 \ 与 | 与 ｜
+        "\\" | "|" | "｜" | "backslash" => Some("backslash"),
+        // 减号 - 与 _ 与 — –
+        "-" | "_" | "—" | "–" | "minus" | "hyphen" => Some("minus"),
+        // 等号 = 与 + 与 ＝
+        "=" | "+" | "＝" | "equal" | "equals" => Some("equal"),
+        // 反引号 ` 与 ~ 与 ～
+        "`" | "~" | "～" | "backquote" | "grave" => Some("backquote"),
+
+        // ---- 上排数字键与它们的 Shift 符号 ----
+        "1" | "!" | "！" | "d1" => Some("1"),
+        "2" | "@" | "＠" | "d2" => Some("2"),
+        "3" | "#" | "＃" | "d3" => Some("3"),
+        "4" | "$" | "＄" | "d4" => Some("4"),
+        "5" | "%" | "％" | "d5" => Some("5"),
+        "6" | "^" | "＾" | "d6" => Some("6"),
+        "7" | "&" | "＆" | "d7" => Some("7"),
+        "8" | "*" | "＊" | "d8" => Some("8"),
+        "9" | "(" | "（" | "d9" => Some("9"),
+        "0" | ")" | "）" | "d0" => Some("0"),
+
+        // ---- 小键盘：与主键盘同形但要区分开 ----
+        "num/" | "numslash" => Some("numslash"),
+        "num*" | "numasterisk" => Some("numasterisk"),
+        "num-" | "numminus" => Some("numminus"),
+        "num+" | "numplus" => Some("numplus"),
+        "num." | "numperiod" | "numdot" => Some("numperiod"),
+
         _ => None,
     };
     match canon {
@@ -1543,43 +1546,53 @@ mod tests {
             infos.iter().map(|i| i.kps).collect::<Vec<_>>()
         );
     }
-    /// 符号键必须能用「键面字符」写进监控列表。
+    /// 同一颗物理键的各种字符形态都必须归一到同一个内部名。
     ///
-    /// 用户反馈「无法映射 [ ]」：输入层上报的是内部名 BracketL，
-    /// 而用户写的是 [，归一化后两者对不上就被当成未监控键。
+    /// 用户原话：「, 和《和< 这三个代表逗号，。和》和> 一样，其他类似 & * ) 【 [ { 这种也一样」
     #[test]
-    fn symbol_keys_normalize_to_internal_names() {
-        let cases = [
-            ("[", "bracketl"),
-            ("]", "bracketr"),
-            ("BracketL", "bracketl"),
-            ("{", "bracketl"),
-            ("}", "bracketr"),
-            (";", "semicolon"),
-            ("'", "quote"),
-            (",", "comma"),
-            (".", "period"),
-            ("/", "slash"),
-            ("-", "minus"),
-            ("=", "equal"),
-            ("!", "1"),
-            ("@", "2"),
-            ("#", "3"),
-            ("~", "backquote"),
-            ("_", "minus"),
-            ("+", "equal"),
-            ("?", "slash"),
+    fn same_physical_key_many_spellings() {
+        let groups: &[(&str, &[&str])] = &[
+            ("bracketl", &["[", "{", "【", "｛", "BracketL"]),
+            ("bracketr", &["]", "}", "】", "｝", "BracketR"]),
+            ("semicolon", &[";", ":", "；", "Semicolon"]),
+            ("quote", &["'", "‘", "’", "Quote"]),
+            ("comma", &["<", "《", "〈", "comma"]),
+            ("period", &[".", ">", "》", "〉", "。", "period"]),
         ];
-        for (user, want) in cases {
-            assert_eq!(
-                normalize_kps_key(user),
-                want,
-                "用户写 {user:?} 应归一为 {want}"
-            );
+        for (want, spellings) in groups {
+            for sp in *spellings {
+                assert_eq!(
+                    normalize_kps_key(sp),
+                    *want,
+                    "写法 {sp:?} 应归一为 {want}"
+                );
+            }
         }
-        // 大写字母仍然正常（to_lowercase 已处理）
-        assert_eq!(normalize_kps_key("Q"), "q");
-        // 未识别的名字原样返回，不能瞎改
+        // 数字键与上排符号
+        for (want, spellings) in [
+            ("1", &["1", "!", "！", "D1"][..]),
+            ("2", &["2", "@", "＠", "D2"][..]),
+            ("7", &["7", "&", "＆", "D7"][..]),
+            ("9", &["9", "(", "（", "D9"][..]),
+            ("0", &["0", ")", "）", "D0"][..]),
+        ] {
+            for sp in spellings {
+                assert_eq!(normalize_kps_key(sp), want, "写法 {sp:?} 应归一为 {want}");
+            }
+        }
+        // 减号/等号/斜杠/反斜杠/反引号
+        for (want, spellings) in [
+            ("minus", &["-", "_", "—"][..]),
+            ("equal", &["=", "+"][..]),
+            ("slash", &["/", "?", "？"][..]),
+            ("backslash", &["|", "｜"][..]),
+            ("backquote", &["~", "～"][..]),
+        ] {
+            for sp in spellings {
+                assert_eq!(normalize_kps_key(sp), want, "写法 {sp:?} 应归一为 {want}");
+            }
+        }
+        // 未识别名字原样返回
         assert_eq!(normalize_kps_key("F5"), "f5");
     }
     use super::*;

@@ -596,7 +596,7 @@ pub static KEYS_87: &[LayoutKey] = &[
 ];
 
 pub static KEYS_60: &[LayoutKey] = &[
-    lko(13, 0.0, 0.0, 1.0, 0, "Esc"), // Backquote
+    lk(0, 0.0, 0.0, 1.0, 0), // Esc（真正的 Esc 键，KEYS[0]）
     lk(14, 1.0, 0.0, 1.0, 0), // D1
     lk(15, 2.0, 0.0, 1.0, 0), // D2
     lk(16, 3.0, 0.0, 1.0, 0), // D3
@@ -660,7 +660,7 @@ pub static KEYS_60: &[LayoutKey] = &[
 ];
 
 pub static KEYS_64: &[LayoutKey] = &[
-    lko(13, 0.0, 0.0, 1.0, 0, "Esc"), // Backquote as Esc
+    lk(0, 0.0, 0.0, 1.0, 0), // Esc（真正的 Esc 键，KEYS[0]）
     lk(14, 1.0, 0.0, 1.0, 0), // D1
     lk(15, 2.0, 0.0, 1.0, 0), // D2
     lk(16, 3.0, 0.0, 1.0, 0), // D3
@@ -1156,6 +1156,25 @@ mod tests {
     }
 
     #[test]
+    /// **60 / 64 配列的第一颗键必须是真正的 Esc**（KEYS[0]）。
+    ///
+    /// 曾经的 bug：那里写的是 `lko(13, ..., "Esc")` —— idx=13 是 Backquote，
+    /// 只是把标签改成 "Esc"。后果：
+    ///   - 在 60/64 配列下按 Esc，统计里记的是 Backquote 键；
+    ///   - 按 ` 反而在键盘图上显示成 Esc，两边对不上。
+    #[test]
+    fn compact_layouts_use_real_esc() {
+        for id in ["60", "64", "68", "75", "87", "98", "104"] {
+            let profile = crate::keys::layout_profile(id);
+            let first = profile.keys.first().expect("配列不应为空");
+            assert_eq!(
+                KEYS[first.idx].name, "Esc",
+                "{id} 配列第一颗键应是真 Esc，实际 {} (idx={})",
+                KEYS[first.idx].name, first.idx
+            );
+        }
+    }
+
     fn lookup_works() {
         assert_eq!(idx_by_win_sc(57), Some(KEYS.iter().position(|k| k.name == "Space").unwrap()));
         assert_eq!(idx_by_lin_code(57), idx_by_win_sc(57));

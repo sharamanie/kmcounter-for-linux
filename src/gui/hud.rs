@@ -583,6 +583,19 @@ fn settings_section(ui: &mut egui::Ui, title: &str) {
     );
 }
 
+/// 配列 id → 界面显示名（与主界面设置里的名称一致）。
+fn layout_label(id: &str, s: &'static Strings) -> &'static str {
+    match id {
+        "98" => s.layout_98,
+        "87" => s.layout_87,
+        "75" => s.layout_75,
+        "68" => s.layout_68,
+        "64" => s.layout_64,
+        "60" => s.layout_60,
+        _ => s.layout_104,
+    }
+}
+
 /// KPS 算法的显示名。
 fn kps_method_label(m: crate::stats::KpsMethod, s: &'static Strings) -> &'static str {
     match m {
@@ -1721,6 +1734,49 @@ impl App {
     /// 布局：标签单独一行、输入框占满整行宽度。原来标签和输入框挤在同一行，
     /// 输入框只剩 180px，多排键表必须横向滚动才看得全（这正是"乱"的来源之一）。
     fn kps_settings_key_list(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
+        // 配列选择：与主界面共用 `layout.keyboard_layout`。
+        //
+        // 为什么放在 HUD 设置里：用户希望「选了 104 就和真实键盘完全一致」，
+        // 不用跑回主界面改。改完主界面的键盘图也会跟着变。
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(s.settings_kps_layout).color(HUD_TEXT));
+            let cur = self.cfg.layout.keyboard_layout.clone();
+            egui::ComboBox::from_id_salt("kps_layout")
+                .selected_text(layout_label(&cur, s))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for (id, label) in [
+                        ("104", s.layout_104),
+                        ("98", s.layout_98),
+                        ("87", s.layout_87),
+                        ("75", s.layout_75),
+                        ("68", s.layout_68),
+                        ("64", s.layout_64),
+                        ("60", s.layout_60),
+                    ] {
+                        if ui.selectable_label(cur == id, egui::RichText::new(label)).clicked()
+                            && cur != id
+                        {
+                            self.cfg.layout.keyboard_layout = id.to_string();
+                            // 切换配列：键表重置为**该配列的真实键盘顺序**（取当前键数）。
+                            //
+                            // 不清空「按键数记忆」：用户自己改过的那套仍然在，
+                            // 只是配列本身的默认序变了。这就是「保留自动保存」。
+                            let n = self.cfg.kps_key_count.max(1) as usize;
+                            self.cfg.kps_keys =
+                                crate::config::Config::default_kps_keys_for_layout(id, n).join(", ");
+                            act.dirty = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(s.settings_kps_layout_hint);
+            ui.label(
+                egui::RichText::new(format!("上限 {} 键", crate::config::KPS_KEY_MAX))
+                    .small()
+                    .color(Color32::from_rgb(0xC8, 0xCC, 0xD4)),
+            );
+        });
         ui.label(egui::RichText::new(s.settings_kps_keys).color(HUD_TEXT));
         // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
         if ui

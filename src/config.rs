@@ -32,11 +32,12 @@ impl Default for LayoutCfg {
     }
 }
 
-/// KPS 监控键数量上限。
+/// KPS 监控键数量上限 = 模型里的全部物理键个数（" + "KEYS.len()）。
 ///
-/// 为什么是 60：键盘最多 6 行、每行最多 12 个 → 理论上 72 个；
-/// 取 60 留余量（宽键、空位占更多地方），同时避免超大键表把 HUD 撑得过宽。
-pub const KPS_KEY_MAX: u8 = 60;
+/// 为什么是 104：与主界面键盘图完全对齐 —— 用户能在键盘上看到的每一颗键
+/// 都应该能被监控（Esc、F1-F12、整个主键区、导航区、小键盘、系统键）。
+/// 以前取 60 是拍脑袋留余量，实际上键盘图里就有 104 个可选键。
+pub const KPS_KEY_MAX: u8 = 104;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -268,6 +269,16 @@ fn parse_kps_cell(item: &str) -> KpsKeyCell {
     if t.is_empty() {
         return KpsKeyCell { name: String::new(), width: 1.0 };
     }
+    // 逗号是**分隔符**，想监控逗号键本身就不能直接写 ","。
+    // 这里把它的其他形态统一换回 "," 再交给 normalize_kps_key：
+    //   `<`  `《`  `〈`  —— 都是逗号键。
+    // 同样地，句号键的 `>`  `》`  `〉`  `。` 也归一到 "."（它不是分隔符，但一起处理更一致）。
+    let t: &str = match t {
+        "<" | "《" | "〈" => ",",
+        ">" | "》" | "〉" | "。" => ".",
+        _ => t,
+    };
+    let t = t.trim();
     // 数字前缀 = 宽度倍数（纯数字的项是数字键本身，不当倍数）
     let digits_end = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
     if digits_end > 0 && digits_end < t.len() {
@@ -281,19 +292,45 @@ fn parse_kps_cell(item: &str) -> KpsKeyCell {
 }
 
 impl Config {
-    /// 默认键位的前 n 个（如 6 → Q, W, E, R, T, Y）
-    pub fn default_kps_keys_for(n: usize) -> Vec<String> {
-        DEFAULT_KPS_KEY_SEQUENCE
-            .chars()
-            .take(n.clamp(1, DEFAULT_KPS_KEY_SEQUENCE.len()))
-            .map(|c| c.to_uppercase().to_string())
+    /// 默认键位的前 n 个，**按键盘物理顺序从第一排到最后一排**：
+    /// Esc, F1, F2, … F12, `, 1, 2, … 0, -, =, Backspace, Tab, Q, W, …
+    ///
+    /// 以前用的是 "qwertyuiopasdfghjklzxcvbnm"（字母键优先），但用户想监控 F 键、方向键、
+    /// 小键盘等时就得手写，不如直接按键盘图的顺序给。
+    ///
+    /// 按「当前配列」的真实键盘顺序取前 n 个键名（Esc, F1, F2, …）。
+    ///
+    /// 为什么要按配列：104 / 98 / 87 … 的实际布局并不一样（小键盘、导航区的位置与是否存在都不同），
+    /// 主界面选了 98 配列，HUD 就不该把 104 才有的键给列进来。
+    /// `LayoutProfile::keys` 本身已按配列排好序（行 → x），直接取其 idx 就行。
+    pub fn default_kps_keys_for_layout(layout_id: &str, n: usize) -> Vec<String> {
+        let profile = crate::keys::layout_profile(layout_id);
+        let n = n.clamp(1, profile.keys.len());
+        profile
+            .keys
+            .iter()
+            .take(n)
+            .map(|k| {
+                // 优先用配列自己的显示名（紧凑配列里 ` 位置就是 Esc），
+                // 没有覆盖时用键本身的 name。这样用户看到的名字与
+                // 主界面键盘图完全一致。
+                match k.label_override {
+                    Some(l) => l.to_string(),
+                    None => crate::keys::KEYS[k.idx].name.to_string(),
+                }
+            })
             .collect()
+    }
+
+    /// 默认键位的前 n 个（不带配列信息时的退化版本：按 104 配列）。
+    pub fn default_kps_keys_for(n: usize) -> Vec<String> {
+        Self::default_kps_keys_for_layout("104", n)
     }
 
     /// 当前键表是否还是"默认序列的前 N 个"（用户没自定义过）
     pub fn kps_keys_is_default(&self) -> bool {
         let cur = self.kps_key_layout().names();
-        let want = Self::default_kps_keys_for(cur.len());
+        let want = Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, cur.len());
         cur.iter().map(|s| s.to_lowercase()).eq(want.iter().map(|s| s.to_lowercase()))
     }
 
@@ -398,7 +435,7 @@ impl Config {
         // ③ 没存过：按旧规则推导一份
         let cur = self.kps_key_layout().names();
         let result = if cur.is_empty() || self.kps_keys_is_default() {
-            Self::default_kps_keys_for(n).join(", ")
+            Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, n).join(", ")
         } else {
             let mut list: Vec<String> = cur.into_iter().take(n).collect();
             let used: std::collections::BTreeSet<String> =
@@ -741,6 +778,87 @@ Z,X,C,V".into();
     #[test]
     /// **按键数记忆键表**：6 改 12 再改回 6，要能找回原来那套键位。
     #[test]
+    /// 默认键序是**按键盘物理顺序从第一排到最后一排**。
+    #[test]
+    fn default_keys_follow_keyboard_order() {
+        let first12 = Config::default_kps_keys_for(12);
+        assert_eq!(
+            first12.first().map(|s| s.as_str()),
+            Some("Esc"),
+            "第一个应是 Esc，实际 {:?}",
+            first12.first()
+        );
+        assert_eq!(first12.get(1).map(|s| s.as_str()), Some("F1"));
+        assert_eq!(first12.get(2).map(|s| s.as_str()), Some("F2"));
+        // 前 13 个应是 Esc + F1..F12
+        let first13 = Config::default_kps_keys_for(13);
+        assert_eq!(first13.len(), 13);
+        assert_eq!(first13[12], "F12");
+        // 第 14 个开始是主键区第二排
+        assert_eq!(Config::default_kps_keys_for(14)[13], "Backquote");
+    }
+
+    /// 逗号键本身要能写：逗号是分隔符，所以用 < 或 《 代替。
+    #[test]
+    fn comma_key_can_be_written_with_angle_or_cjk() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "A, <, B".into();
+        let names = cfg.kps_key_layout().names();
+        assert_eq!(names, vec!["A", ",", "B"], "写 < 应被当成逗号键");
+
+        cfg.kps_keys = "A, 《, B".into();
+        let names = cfg.kps_key_layout().names();
+        assert_eq!(names, vec!["A", ",", "B"], "写 《 也应被当成逗号键");
+    }
+
+    /// 上限应与键盘图里的键数一致。
+    #[test]
+    /// 默认键序应**跟随配列**：不同配列的起始键都是 Esc、F1…，
+    /// 但键数上限与具体键集不同。
+    #[test]
+    fn default_keys_follow_layout() {
+        // 大配列（带 F 区）：Esc, F1, F2 …
+        for id in ["104", "98", "87", "75"] {
+            let keys = Config::default_kps_keys_for_layout(id, 5);
+            assert_eq!(keys.len(), 5, "{id} 配列应能取 5 个键");
+            assert_eq!(keys[0], "Esc", "{id} 配列第一个应是 Esc");
+            assert_eq!(keys[1], "F1", "{id} 配列第二个应是 F1");
+        }
+        // 紧凑配列（68/64/60）**没有 F 区**，第二个键是 D1。
+        // 这不是 bug —— 这些配列的键盘图上就没有 F1-F12。
+        for id in ["68", "64", "60"] {
+            let keys = Config::default_kps_keys_for_layout(id, 5);
+            assert_eq!(keys.len(), 5, "{id} 配列应能取 5 个键");
+            assert_eq!(keys[0], "Esc", "{id} 配列第一个应是 Esc");
+            assert_eq!(
+                keys[1], "D1",
+                "{id} 配列没有 F 区，第二个应是 D1，实际 {:?}",
+                keys[1]
+            );
+        }
+        // 87 配列没有小键盘：取全部时不应出现 Num 键
+        let all87 = Config::default_kps_keys_for_layout("87", 999);
+        assert!(
+            !all87.iter().any(|k| k.starts_with("Num")),
+            "87 配列不应包含小键盘键：{:?}",
+            all87.iter().filter(|k| k.starts_with("Num")).collect::<Vec<_>>()
+        );
+        // 104 配列应包含小键盘
+        let all104 = Config::default_kps_keys_for_layout("104", 999);
+        assert!(
+            all104.iter().any(|k| k.starts_with("Num")),
+            "104 配列应包含小键盘"
+        );
+    }
+
+    fn key_max_matches_keyboard_model() {
+        assert_eq!(
+            KPS_KEY_MAX as usize,
+            crate::keys::SYS_END,
+            "KPS 监控上限应等于模型里的全部键"
+        );
+    }
+
     fn key_count_memory_roundtrip() {
         let mut cfg = Config::default();
         // 起点：6 键的自定义键位
