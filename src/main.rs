@@ -469,6 +469,7 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     #[cfg(target_os = "linux")]
     {
         let skip = cfg.skip_taskbar;
+        let hud_on_top = cfg.hud_always_on_top;
         // HUD 位置记忆 + 限制在屏幕内（KDE/Wayland）：DBus 上报服务 + KWin 监听脚本
         let (ac, kc, ap, kp) = (
             cfg.apm_keep_in_screen,
@@ -479,7 +480,7 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
         std::thread::Builder::new()
             .name("kmcounter-kwin".into())
             .spawn(move || {
-                kwin::set_skip_taskbar(skip);
+                kwin::set_skip_taskbar(skip, hud_on_top);
                 kwin::start_hud_pos_service();
                 kwin::sync_hud_listener(ac, kc, ap, kp);
                 // 位置恢复的正道：KWin 窗口规则（窗口 map 时由 KWin 核心应用位置）

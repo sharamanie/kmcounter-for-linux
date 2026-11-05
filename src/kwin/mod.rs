@@ -29,7 +29,7 @@ pub(crate) use listener::{
     hud_pos_reports, start_hud_pos_service, stop_hud_listener,
     sync_hud_listener, take_main_hidden,
 };
-pub(crate) use rules::{set_skip_taskbar, sync_hud_rules};
+pub(crate) use rules::{set_hud_above_public, set_skip_taskbar, sync_hud_rules};
 pub(crate) use script::{
     clear_keep_above, enforce_skip_taskbar, park_main_window, unminimize_activate,
     unpark_main_window,

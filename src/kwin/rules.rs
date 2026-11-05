@@ -33,17 +33,46 @@ fn main_rule_body() -> String {
 /// （`ViewportBuilder::with_always_on_top()` 在 Wayland 下完全无效），所以 HUD 的"置顶"
 /// 只能由合成器侧的 KWin 规则（`above=true` 强制）来保证。
 /// 用标题子串（`titlematch=2`）把 HUD（"KMC - APM" / "KMC - KPS"）与主窗口（"KMCounter-rs"）区分开。
-fn hud_rule_body() -> String {
+fn hud_rule_body(above: bool) -> String {
+    // above=true + aboverule=2 = **强制**保持在所有窗口之上（rule=2 是"强制"）。
+    // 关掉 「始终置顶」时这两行必须整条去掉，否则 KWin 会一直把 HUD 压在最上层，
+    // winit 侧 with_always_on_top(false) 完全无效（Wayland 下该调用本来就是空实现）。
+    let above_part = if above { "above=true\naboverule=2\n" } else { "" };
     format!(
-        "above=true\naboverule=2\nskiptaskbar=true\nskiptaskbarrule=2\nskipswitcher=true\nskipswitcherrule=2\nwmclass={WM_CLASS}\nwmclassmatch=1\nwmclasscomplete=false\ntitle=KMC -\ntitlematch=2\ntypes=1\n"
+        "{above_part}skiptaskbar=true\nskiptaskbarrule=2\nskipswitcher=true\nskipswitcherrule=2\nwmclass={WM_CLASS}\nwmclassmatch=1\nwmclasscomplete=false\ntitle=KMC -\ntitlematch=2\ntypes=1\n"
     )
+}
+
+/// 运行时切换 HUD 始终置顶（设置面板里改开关时调用，立即生效）。
+///
+/// 只动已有 HUD 规则的 above 两行，不新建规则（那是 set_skip_taskbar 的职责）。
+pub fn set_hud_above_public(above: bool) {
+    if !is_kde() {
+        return;
+    }
+    let path = rules_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let new_text = set_hud_above(&text, above);
+    if new_text == text {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, &new_text) {
+        log::error!("写入 HUD 置顶规则失败: {e}");
+        return;
+    }
+    match reconfigure() {
+        Ok(_) => log::info!("HUD 置顶规则已同步（always_on_top={above}）"),
+        Err(e) => log::warn!("HUD 置顶规则已写入但 KWin 重载失败: {e}"),
+    }
 }
 
 /// 启用/停用「跳过任务栏 + 跳过 Alt-Tab」规则（幂等）。
 ///
 /// 同时维护两条规则：主窗口一条、HUD 悬浮窗一条（后者额外 `above=true` 强制置顶，
 /// 因为 Wayland 下 winit 的 always_on_top 是空实现）。关掉时两条一起移除。
-pub fn set_skip_taskbar(enabled: bool) {
+pub fn set_skip_taskbar(enabled: bool, hud_above: bool) {
     if !is_kde() {
         if enabled {
             log::info!("非 KDE 会话，跳过任务栏规则不适用（Windows/X11 可直接隐藏窗口）");
@@ -54,15 +83,26 @@ pub fn set_skip_taskbar(enabled: bool) {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let has_main = text.contains(MARKER);
     let has_hud = text.contains(HUD_MARKER);
-    if enabled == (has_main && has_hud) {
+    // 开关状态已对上，**且** HUD 规则里的 above 也已经是期望值时才能提前返回。
+    // 旧写法只看 has_main && has_hud，于是「两条规则都在、但 above 开关刚好变了」的情况
+    // 会直接 return，导致开关改了也不生效（实测真实发生过）。
+    let above_ok = text.contains(HUD_MARKER)
+        && (if hud_above {
+            text.contains("above=true") && text.contains("aboverule=2")
+        } else {
+            !text.contains("aboverule=")
+        });
+    if enabled == (has_main && has_hud) && above_ok {
         return; // 已是目标状态
     }
     let new_text = if enabled {
         // 逐条补齐：从旧版本升级过来时可能只有主窗口那条（HUD 置顶则缺失）
         let mut t = if has_main { text.clone() } else { add_rule(&text) };
         if !has_hud {
-            t = add_hud_rule(&t);
+            t = add_hud_rule(&t, hud_above);
         }
+        // 已存在的 HUD 规则要把 above 同步过去（开关改了也要能生效）
+        t = set_hud_above(&t, hud_above);
         t
     } else {
         remove_rule(&text)
@@ -117,8 +157,8 @@ fn add_rule(text: &str) -> String {
 }
 
 /// 在 INI 文本中追加 HUD 悬浮窗规则（置顶 + 跳过任务栏 / Alt-Tab）
-fn add_hud_rule(text: &str) -> String {
-    add_rule_with(text, HUD_MARKER, &hud_rule_body())
+fn add_hud_rule(text: &str, above: bool) -> String {
+    add_rule_with(text, HUD_MARKER, &hud_rule_body(above))
 }
 
 /// 在 INI 文本中追加一条带标记的规则（自动分配新 id 并登记到 [General] rules）
@@ -145,6 +185,54 @@ fn add_rule_with(text: &str, marker: &str, body: &str) -> String {
         out.push_str(&format!("\n[{name}]\n{group_body}"));
     }
     out.push_str(&format!("\n[{id}]\nDescription={marker}\n{body}"));
+    out
+}
+
+/// 在已有的 HUD 规则里**开/关置顶**（原地增或删 `above=true` + `aboverule=2` 两行）。
+///
+/// 为什么不能只改 winit：Wayland 下 `with_always_on_top()` 是**空实现**，
+/// HUD 的置顶完全靠 KWin 规则。不把这两行拿掉，关掉开关也不会有任何变化。
+fn set_hud_above(text: &str, above: bool) -> String {
+    if !text.contains(HUD_MARKER) {
+        return text.to_string();
+    }
+    // 用与其他规则函数相同的 INI 解析 / 重建路径。
+    //
+    // 曾经用逐行拼接，结果把 `[General]` 段的 count/rules 也弄丢了 ——
+    // KWin 发现 rules 列表与实际段不一致就会丢弃其他规则（实测：
+    // 主窗口与 APM 两条规则被整条吞掉）。
+    let (mut general, groups) = split_ini(text);
+    let mut out = render_general(&general);
+    for (name, body) in &groups {
+        if !body.contains(HUD_MARKER) {
+            out.push_str(&format!("\n[{name}]\n{body}"));
+            continue;
+        }
+        // 重建这一段：过滤掉旧的 above 两行，需要时在开头补回
+        let mut kw: Vec<(String, String)> = Vec::new();
+        for l in body.lines() {
+            let t = l.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with("above=") || t.starts_with("aboverule=") {
+                continue;
+            }
+            if let Some((k, v)) = t.split_once('=') {
+                kw.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        if above {
+            kw.insert(0, ("aboverule".into(), "2".into()));
+            kw.insert(0, ("above".into(), "true".into()));
+        }
+        let mut body2 = String::new();
+        for (k, v) in &kw {
+            body2.push_str(&format!("{k}={v}\n"));
+        }
+        out.push_str(&format!("\n[{name}]\n{body2}"));
+    }
+    let _ = &mut general;
     out
 }
 
@@ -407,9 +495,81 @@ mod tests {
     /// HUD 规则：强制置顶（Wayland 下 winit 的 always_on_top 是空实现）+ 标题子串匹配；
     /// 主窗口规则不能被带上置顶；删除时两条规则一起走、别人的规则保留
     #[test]
+    /// **关掉「始终置顶」时，规则里的 above 两行必须真的没了。
+    ///
+    /// 用户反馈：取消置顶后 HUD 仍然一直在最上层。
+    /// 原因：Wayland 下 winit 的 with_always_on_top() 是空实现，置顶完全靠 KWin 规则
+    /// 里写死的 above=true；光改 winit 层没用。
+    #[test]
+    fn hud_above_toggles_in_rule() {
+        let with_main = add_rule("");
+        // 默认开：规则里有 above
+        let on = add_hud_rule(&with_main, true);
+        assert!(on.contains("above=true"), "开启时应置顶：{on}");
+        assert!(on.contains("aboverule=2"), "必须是强制置顶");
+
+        // 关掉：above 两行应被删掉，但跳过任务栏等规则要保留
+        let off = set_hud_above(&on, false);
+        assert!(!off.contains("above=true"), "关掉后不该再有 above=true：{off}");
+        assert!(!off.contains("aboverule="), "关掉后不该再有 aboverule：{off}");
+        assert!(off.contains("skiptaskbar=true"), "跳过任务栏应保留");
+        assert!(off.contains(HUD_MARKER), "HUD 规则本身应保留");
+        assert!(off.contains("title=KMC -"), "匹配条件应保留");
+
+        // 再开回来：above 重新出现（幂等）
+        let back_on = set_hud_above(&off, true);
+        assert!(back_on.contains("above=true"), "重新开启应恢复置顶：{back_on}");
+        assert!(back_on.contains("aboverule=2"));
+        // 幂等：再调一次应不再变
+        assert_eq!(set_hud_above(&back_on, true), back_on);
+    }
+
+    /// **修复回归**：改 above 不能把 `[General]` 或其他规则弄丢。
+    ///
+    /// 曾经用逐行拼接重建文件，结果 `count`/`rules` 丢失，
+    /// KWin 随即丢弃了主窗口与 APM 两条规则（实测真实发生过）。
+    #[test]
+    fn set_hud_above_preserves_general_and_other_rules() {
+        // 构造：主窗口规则 + HUD 规则 + 一条别人的规则
+        let mut text = add_rule("");
+        text = add_hud_rule(&text, true);
+        text = add_rule_with(
+            &text,
+            "别人的规则",
+            "wmclass=konsole\nopacityactive=90\n",
+        );
+        assert!(text.contains("count=3"), "前提：应有 3 条规则\n{text}");
+
+        let off = set_hud_above(&text, false);
+        assert!(off.contains("[General]"), "必须保留 General 段\n{off}");
+        assert!(off.contains("count=3"), "必须保留 count\n{off}");
+        assert!(off.contains("rules="), "必须保留 rules 列表\n{off}");
+        assert!(!off.contains("above=true"), "above 应已移除\n{off}");
+        // 主窗口规则与别人的规则都还在
+        assert!(off.contains(MARKER), "主窗口规则丢了\n{off}");
+        assert!(off.contains(HUD_MARKER), "HUD 规则丢了\n{off}");
+        assert!(off.contains("别人的规则"), "他人规则丢了\n{off}");
+        assert!(off.contains("opacityactive=90"), "他人规则内容丢了\n{off}");
+        assert!(off.contains("wmclass=konsole"), "他人规则内容丢了\n{off}");
+
+        // 再开回来，依然完整
+        let on = set_hud_above(&off, true);
+        assert!(on.contains("above=true"));
+        assert!(on.contains("count=3"), "重开后 count 也要在\n{on}");
+        assert!(on.contains("别人的规则"));
+    }
+
+    /// 没有 HUD 规则时不该凭空造一条。
+    #[test]
+    fn set_hud_above_is_noop_without_rule() {
+        let text = "[General]\ncount=0\nrules=\n";
+        assert_eq!(set_hud_above(text, true), text);
+        assert_eq!(set_hud_above(text, false), text);
+    }
+
     fn hud_rule_forces_above_and_is_removed_together() {
         let with_main = add_rule(SAMPLE);
-        let both = add_hud_rule(&with_main);
+        let both = add_hud_rule(&with_main, true);
         assert!(both.contains(HUD_MARKER), "应有 HUD 规则标记");
         assert!(both.contains("above=true"), "HUD 规则应置顶");
         assert!(both.contains("aboverule=2"), "置顶必须是强制规则（rule=2）");
@@ -434,7 +594,7 @@ mod tests {
     #[test]
     #[ignore = "会写入真实的 ~/.config/kwinrulesrc"]
     fn write_kde_rules_now() {
-        set_skip_taskbar(true);
+        set_skip_taskbar(true, true);
         let text = std::fs::read_to_string(rules_path()).unwrap_or_default();
         println!("---- {}\n{text}", rules_path().display());
         assert!(text.contains(MARKER), "应写入主窗口规则");

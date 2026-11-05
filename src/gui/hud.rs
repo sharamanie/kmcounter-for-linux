@@ -1224,6 +1224,10 @@ impl App {
         self.sync_hud_runtime();
         self.persist_hud_cfg();
         self.sync_hud_kwin_scripts();
+        // KDE/Wayland：置顶完全靠 KWin 规则，winit 那个开关是空实现。
+        // 所以改了「始终置顶」必须同步把规则里的 above 两行增/删。
+        #[cfg(target_os = "linux")]
+        crate::kwin::set_hud_above_public(self.cfg.hud_always_on_top);
     }
 
     /// 把窗口时长 / KPS 方法推到运行中的共享状态（下一帧 HUD 立刻按新值算）。
