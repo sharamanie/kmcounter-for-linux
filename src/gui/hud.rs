@@ -356,7 +356,9 @@ fn render_kps_hud(ctx: &egui::Context, hs: &HudShared) {
                     content.min,
                     Pos2::new(content.right(), content.top() + m.rain_h),
                 );
-                super::rain::paint_kps_rain(ui, rain_area, &layout, &m, &kd, cfg);
+                // 把键格的实际列宽传过去：雨条必须跟键格用同一套排布，
+                // 否则雨滴不在键格上（用户反馈「严重错位」）。
+                super::rain::paint_kps_rain(ui, rain_area, &layout, &m, &kd, cfg, content.width());
                 Rect::from_min_max(
                     Pos2::new(content.left(), content.top() + m.rain_h),
                     content.max,
@@ -2528,13 +2530,19 @@ pub(crate) fn key_rows_layout_for_width(
             }
             let row_w = box_w * u + gap * (u - 1.0);
             // 少行在目标宽度内居中（与 key_rows_layout 的行为一致）
-            let mut x = (target_w - row_w).max(0.0) * 0.5;
+            let x0 = (target_w - row_w).max(0.0) * 0.5;
+            // **累积格数再一次性乘出位置**，不要逐格 x += bw + gap。
+            //
+            // 逐次累加会把浮点误差一路放大：一行 20 多格、格宽又是循环小数时，
+            // 行尾能差出零点几像素 —— 用户看到的「PrtScr 和 Insert 没对准」就是它。
             let mut out = Vec::with_capacity(r.len());
+            let mut units_before = 0.0f32;
             for c in r {
                 let w = c.width.max(0.1);
                 let bw = w * box_w + (w - 1.0).max(0.0) * gap;
+                let x = x0 + units_before * (box_w + gap);
                 out.push((x, bw));
-                x += bw + gap;
+                units_before += w;
             }
             out
         })
@@ -2548,6 +2556,11 @@ pub(crate) fn key_rows_layout_for_width(
 ///
 /// 返回每行每格的 `(相对内容区左缘的 x, 格宽)`，与 `rows` 逐格对应；
 /// 宽度倍数 `w` 的格宽 = `w × 盒宽 + (w−1) × 缝宽`。
+/// 旧的排布函数：**只保留给测试**。
+///
+/// 生产路径（键格与键雨）都改用 `key_rows_layout_for_width` —— 它按「行应该多宽」
+/// 排布，两处用同一个函数才能保证雨条永远落在键格上。
+#[cfg(test)]
 pub(crate) fn key_rows_layout(
     rows: &[Vec<crate::config::KpsKeyCell>],
     box_w: f32,

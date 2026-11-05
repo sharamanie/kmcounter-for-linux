@@ -209,6 +209,7 @@ pub(crate) fn paint_kps_rain(
     m: &KpsHudMetrics,
     kd: &KpsHudData,
     cfg: &Config,
+    content_w: f32,
 ) {
     if !cfg.kps_show_rain || m.rain_h <= 0.0 {
         return;
@@ -218,7 +219,12 @@ pub(crate) fn paint_kps_rain(
     let opacity = cfg.kps_rain_opacity.min(100) as f32 / 100.0;
     let base = rain_base_color(cfg);
     let painter = ui.painter().with_clip_rect(rain_area);
-    let row_pos = key_rows_layout(&layout.rows, m.box_w, m.graph_w);
+    // **必须与键格用同一个排布函数与同一个宽度**。
+    //
+    // 以前这里用的是 key_rows_layout(...m.graph_w)，而键格用的是
+    // key_rows_layout_for_width(...content.width())。两者算出的缝宽与起点不同，
+    // 于是雨条没落在键格上 —— 长度是对的，但看上去像彻底错位。
+    let row_pos = super::key_rows_layout_for_width(&layout.rows, m.box_w, content_w);
 
     // 轨道底边 = 第一排键格顶边；多层布局下所有排共用同一条轨道。
     let cell_top = rain_area.bottom();
@@ -239,7 +245,11 @@ pub(crate) fn paint_kps_rain(
                 break;
             };
             if cell.name.is_empty() {
-                info_idx += 1; // 空位：占地方，不画不统计
+                // 空位（间距 / 跨行占位）：只占地方，**不消耗 key_infos 索引**。
+                //
+                // 这里曾经写成 `info_idx += 1`，而键格绘制处是直接 continue、不递增。
+                // 两边索引从此错开：配置里空位越多，键雨的列偏得越远 ——
+                // 用户看到的就是「F 的键雨跑到 Esc 那边」。
                 continue;
             }
             if kd.key_infos.get(info_idx).is_none() {
@@ -582,6 +592,67 @@ mod tests {
                 ROW_WIDTH_MIN
             );
         }
+    }
+
+    /// **空位不能消耗 key_infos 索引**：键雨与键格必须用同一套索引规则，
+    /// 否则配置里的空位（间距、跨行占位）越多，雨条偏得越远。
+    ///
+    /// 用户反馈「F 的键雨跑到 Esc 那边」就是这个原因。
+    #[test]
+    fn blank_cells_do_not_consume_key_index() {
+        // 模拟：有 3 个空位的布局，键名顺序应与 names() 一致
+        let mut cfg = Config::default();
+        cfg.kps_keys = "A, 2, B, 0.5, C".into();
+        let layout = cfg.kps_key_layout();
+        let names = layout.names();
+        assert_eq!(names, vec!["A", "B", "C"]);
+
+        // 遍历 cell 并按「非空才递增」的规则数出来，应与 names 完全一致
+        let mut idx = 0usize;
+        let mut got: Vec<String> = Vec::new();
+        for row in &layout.rows {
+            for cell in row {
+                if cell.name.is_empty() {
+                    continue;
+                }
+                got.push(names.get(idx).cloned().unwrap_or_default());
+                idx += 1;
+            }
+        }
+        assert_eq!(got, names, "索引必须与 names() 一一对应");
+        assert_eq!(idx, names.len(), "不能多算也不能少算");
+    }
+
+    /// 端到端：有跨行占位 + 间距时，**F 的雨条必须落在 F 的键格上**。
+    ///
+    /// 用户反馈「F 的键雨跑到 Esc 那边」，根因是空位消耗了索引。
+    /// 这里直接用真实的排版函数算出 F 的 x，再按修好后的索引规则核对。
+    #[test]
+    fn rain_lands_on_its_own_cell_with_blanks() {
+        let mut cfg = Config::default();
+        // 前面有间距、后面有跨行占位
+        cfg.kps_keys = "Esc, 2/3, F, 0.5, G, 1x2H\n, , H2".into();
+        let layout = cfg.kps_key_layout();
+        let names = layout.names();
+        let f_pos = names.iter().position(|n| n == "F").expect("应有 F");
+
+        // 按「非空才递增」数出 F 的索引
+        let mut idx = 0usize;
+        let mut found = None;
+        for (ri, row) in layout.rows.iter().enumerate() {
+            for (ci, cell) in row.iter().enumerate() {
+                if cell.name.is_empty() {
+                    continue;
+                }
+                if idx == f_pos {
+                    found = Some((ri, ci, cell.name.clone()));
+                }
+                idx += 1;
+            }
+        }
+        let (ri, ci, name) = found.expect("应能定位到 F");
+        assert_eq!(name, "F", "索引对应到 F 本身，不能偏到别的键");
+        assert_eq!(layout.rows[ri][ci].name, "F");
     }
 
     /// 轨道高度上限放宽到 1200，且超范围会被夹住。

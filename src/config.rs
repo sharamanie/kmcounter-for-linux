@@ -920,6 +920,8 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+
     /// 分数写法的间距：F,2/3,G 表示留 2/3 格。
     ///
     /// 用于 104 键盘 F 区那种「三个空隙均分 2 格」的场景 ——
