@@ -123,6 +123,13 @@ pub struct Config {
     pub apm_keep_in_screen: bool,
     /// KPS 悬浮窗：同上
     pub kps_keep_in_screen: bool,
+    /// 悬浮窗固定位置：开启后**禁止拖动**（两个悬浮窗共用）。
+    /// 默认关：保持现有的“拖到哪记到哪”体验。
+    /// 注意与 `*_hud_pos`（位置记忆）的区别：那个是自动记录，这个是是否允许拖动。
+    pub hud_lock_pos: bool,
+    /// 悬浮窗是否**始终置顶**（在所有窗口之上）。
+    /// 默认开；关掉后悬浮窗会像普通窗口一样可被其他窗口盖住。
+    pub hud_always_on_top: bool,
     /// 上次退出时的 APM 悬浮窗位置（窗口左上角，逻辑像素；自动记录、重启恢复，无设置项）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apm_hud_pos: Option<(f32, f32)>,
@@ -191,6 +198,8 @@ impl Default for Config {
             apm_hud_opacity: 94,
             apm_keep_in_screen: true,
             kps_keep_in_screen: true,
+            hud_lock_pos: false,
+            hud_always_on_top: true,
             apm_hud_pos: None,
             kps_hud_pos: None,
             kps_hud_opacity: 94,
@@ -430,7 +439,10 @@ impl Config {
 # limit_move_km: 某小时鼠标移动超过该值（公里）则该小时作废（原始值仍记录，只是不计入当日/总计；0 = 关闭）
 # limit_clicks / limit_keystrokes: 某小时鼠标点击 / 键盘敲击超过该值则作废（0 = 关闭）
 # [layout]: 键盘热力图的尺寸(像素)
-# apm_scale / kps_scale: 悬浮窗缩放百分比; *_keep_in_screen: 拖出屏幕自动推回; *_hud_pos: 位置记忆(自动记录,勿手改)
+# apm_scale / kps_scale: 悬浮窗缩放百分比; *_keep_in_screen: 拖出屏幕自动推回;
+# hud_lock_pos: 固定位置(禁止拖动悬浮窗),默认 false;
+# hud_always_on_top: 悬浮窗始终置顶(在所有窗口之上),默认 true;
+# *_hud_pos: 位置记忆(自动记录,勿手改)
 ";
         // 原子写：GUI 与后台 saver 可能同时保存配置，直接截断写会互相覆盖
         crate::fsutil::atomic_write(path, format!("{header}{body}").as_bytes())
@@ -804,6 +816,29 @@ Z,X,C,V".into();
 
     /// 悬浮窗位置记忆：配置可来回序列化，None 不写进文件
     #[test]
+    /// 新增的两个开关默认值：固定位置**默认关**、始终置顶**默认开**。
+    #[test]
+    fn hud_lock_and_on_top_defaults() {
+        let c = Config::default();
+        assert!(!c.hud_lock_pos, "固定位置应默认关");
+        assert!(c.hud_always_on_top, "始终置顶应默认开");
+    }
+
+    /// 两个开关要能存盘并读回。
+    #[test]
+    fn hud_lock_and_on_top_roundtrip() {
+        let mut c = Config::default();
+        c.hud_lock_pos = true;
+        c.hud_always_on_top = false;
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("hud_lock_pos"), "要写进配置
+{text}");
+        assert!(text.contains("hud_always_on_top"));
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.hud_lock_pos);
+        assert!(!back.hud_always_on_top);
+    }
+
     fn hud_pos_config_roundtrip() {
         let mut c = Config::default();
         assert_eq!(c.apm_hud_pos, None);

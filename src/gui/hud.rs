@@ -51,6 +51,8 @@ pub(crate) struct HudShared {
     pub last_size: Arc<parking_lot::Mutex<(f32, f32)>>,
     /// 主窗口置顶标记（双击 / 右键叫回主窗口时沿用）
     pub keep_on_top: bool,
+    /// 固定位置：true 时禁止拖动悬浮窗（cfg.hud_lock_pos，默认关）
+    pub lock_pos: bool,
 }
 
 impl App {
@@ -133,13 +135,14 @@ impl App {
             seen: self.hud_apm_seen.clone(),
             last_size: self.apm_hud_size.clone(),
             keep_on_top: self.cfg.keep_on_top,
+            lock_pos: self.cfg.hud_lock_pos,
         };
         let size = self.apm_hud_initial_size();
         // **deferred 视口**：回调持久存储、视口自己渲染 —— 主窗口最小化（update 停摆）后
         // HUD 照常更新。immediate 视口只能由父视口驱动渲染，父窗口一最小化 HUD 就冻结（踩过）。
         ctx.show_viewport_deferred(
             vp_id,
-            hud_viewport_builder("KMC - APM", size),
+            hud_viewport_builder("KMC - APM", size, self.cfg.hud_always_on_top),
             move |hud_ctx, _class| render_apm_hud(hud_ctx, &hs),
         );
 
@@ -226,11 +229,12 @@ impl App {
             seen: self.hud_kps_seen.clone(),
             last_size: self.kps_hud_size.clone(),
             keep_on_top: self.cfg.keep_on_top,
+            lock_pos: self.cfg.hud_lock_pos,
         };
         // **deferred 视口**（原因见 APM：immediate 视口在主窗口最小化后断粮冻结）
         ctx.show_viewport_deferred(
             vp_id,
-            hud_viewport_builder("KMC - KPS", (m.w, m.h)),
+            hud_viewport_builder("KMC - KPS", (m.w, m.h), self.cfg.hud_always_on_top),
             move |hud_ctx, _class| render_kps_hud(hud_ctx, &hs),
         );
 
@@ -777,7 +781,9 @@ fn hud_background_gestures(
     hint: &'static str,
 ) {
     let resp = ui.interact(rect, ui.id().with(drag_id), Sense::click_and_drag());
-    if resp.drag_started() {
+    // 固定位置时不发 StartDrag：双击叫主窗口、右键开设置照常有效，
+    // 只是拖不动。（位置仍由 KWin 规则 / 上次位置记忆恢复。）
+    if resp.drag_started() && !hs.lock_pos {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     if resp.double_clicked() {
@@ -792,17 +798,24 @@ fn hud_background_gestures(
 /// 悬浮窗视口：无边框、透明、置顶、尺寸锁死。
 /// min/max 也显式给出（与 inner_size 相同 = 尺寸固定）：
 /// winit 在 Wayland 下非 resizable 的窗口会把 min==max 锁死，改尺寸必须连它俩一起动。
-fn hud_viewport_builder(title: &str, size: (f32, f32)) -> egui::ViewportBuilder {
+fn hud_viewport_builder(title: &str, size: (f32, f32), always_on_top: bool) -> egui::ViewportBuilder {
     let (w, h) = size;
-    egui::ViewportBuilder::default()
+    let b = egui::ViewportBuilder::default()
         .with_title(title)
         .with_inner_size([w, h])
         .with_min_inner_size([w, h])
         .with_max_inner_size([w, h])
         .with_resizable(false)
         .with_decorations(false)
-        .with_always_on_top()
-        .with_transparent(true)
+        .with_transparent(true);
+    // 置顶可配置（cfg.hud_always_on_top，默认开）。
+    // egui 0.29 的 with_always_on_top() 不接受参数，只能分支调用。
+    // 关掉后悬浮窗像普通窗口一样会被其他窗口盖住。
+    if always_on_top {
+        b.with_always_on_top()
+    } else {
+        b
+    }
 }
 
 /// 诊断心跳：每 5 秒一条，证明 HUD 视口在**自己**渲染（主窗口收起后是否还在更新，
@@ -1198,6 +1211,8 @@ impl App {
         cfg.apm_scale = self.cfg.apm_scale;
         cfg.apm_keep_in_screen = self.cfg.apm_keep_in_screen;
         cfg.kps_keep_in_screen = self.cfg.kps_keep_in_screen;
+        cfg.hud_lock_pos = self.cfg.hud_lock_pos;
+        cfg.hud_always_on_top = self.cfg.hud_always_on_top;
         let _ = cfg.save(&self.cfg_path);
     }
 
@@ -1355,6 +1370,23 @@ impl App {
             if ui
                 .checkbox(&mut self.cfg.apm_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
                 .on_hover_text(s.hud_keep_in_screen_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.add_space(12.0);
+            if ui
+                .checkbox(&mut self.cfg.hud_lock_pos, egui::RichText::new(s.hud_lock_pos).color(HUD_TEXT))
+                .on_hover_text(s.hud_lock_pos_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.cfg.hud_always_on_top, egui::RichText::new(s.hud_always_on_top).color(HUD_TEXT))
+                .on_hover_text(s.hud_always_on_top_hint)
                 .changed()
             {
                 act.dirty = true;
@@ -1743,6 +1775,26 @@ impl App {
             if ui
                 .checkbox(&mut self.cfg.kps_keep_in_screen, egui::RichText::new(s.hud_keep_in_screen).color(HUD_TEXT))
                 .on_hover_text(s.hud_keep_in_screen_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+            ui.add_space(12.0);
+            // 固定位置（默认关）
+            if ui
+                .checkbox(&mut self.cfg.hud_lock_pos, egui::RichText::new(s.hud_lock_pos).color(HUD_TEXT))
+                .on_hover_text(s.hud_lock_pos_hint)
+                .changed()
+            {
+                act.dirty = true;
+            }
+        });
+        // 始终置顶（默认开）单独一行：
+        // 与上一行三个控件挤在一起时，最右边会被 430px 窗口右缘裁掉（实测）。
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.cfg.hud_always_on_top, egui::RichText::new(s.hud_always_on_top).color(HUD_TEXT))
+                .on_hover_text(s.hud_always_on_top_hint)
                 .changed()
             {
                 act.dirty = true;
@@ -2548,6 +2600,8 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.apm_scale = from.apm_scale;
     to.apm_keep_in_screen = from.apm_keep_in_screen;
     to.kps_keep_in_screen = from.kps_keep_in_screen;
+    to.hud_lock_pos = from.hud_lock_pos;
+    to.hud_always_on_top = from.hud_always_on_top;
     to.apm_hud_pos = from.apm_hud_pos;
     to.kps_hud_pos = from.kps_hud_pos;
 }
