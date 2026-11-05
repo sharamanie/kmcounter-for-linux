@@ -993,8 +993,8 @@ pub fn normalize_kps_key(k: &str) -> String {
     // 句号键可以直接写 `.` / `>` / `》`。
     let canon: Option<&str> = match s.as_str() {
         // ---- 鼠标键 ----
-        "m1" | "mouse1" | "left" | "lbutton" => Some("m1"),
-        "m2" | "mouse2" | "right" | "rbutton" => Some("m2"),
+        "m1" | "mouse1" | "lbutton" => Some("m1"),
+        "m2" | "mouse2" | "rbutton" => Some("m2"),
         "m3" | "mouse3" | "middle" | "mbutton" => Some("m3"),
         "m4" | "mouse4" | "side" | "xbutton" | "xb1" => Some("m4"),
         "m5" | "mouse5" | "extra" | "xb2" => Some("m5"),
@@ -1550,6 +1550,25 @@ mod tests {
     ///
     /// 用户原话：「, 和《和< 这三个代表逗号，。和》和> 一样，其他类似 & * ) 【 [ { 这种也一样」
     #[test]
+    /// **方向键 Left / Right 不能被当成鼠标左右键。**
+    ///
+    /// 曾经把 "left" / "right" 归一到 m1/m2，而键盘上方向键的内部名
+    /// 恰好就是 Left / Right —— 于是按方向键的数据跑到了鼠标上，
+    /// 键盘图上的 ← → 也不亮（用户反馈「还有鼠标左右键」）。
+    #[test]
+    fn arrow_keys_do_not_collide_with_mouse() {
+        assert_eq!(normalize_kps_key("Left"), "left", "Left 应保留为方向键");
+        assert_eq!(normalize_kps_key("Right"), "right", "Right 应保留为方向键");
+        assert_eq!(normalize_kps_key("Up"), "up");
+        assert_eq!(normalize_kps_key("Down"), "down");
+        // 鼠标只认这些无歧义写法
+        assert_eq!(normalize_kps_key("M1"), "m1");
+        assert_eq!(normalize_kps_key("mouse1"), "m1");
+        assert_eq!(normalize_kps_key("LButton"), "m1");
+        assert_eq!(normalize_kps_key("M2"), "m2");
+        assert_eq!(normalize_kps_key("RButton"), "m2");
+    }
+
     fn same_physical_key_many_spellings() {
         let groups: &[(&str, &[&str])] = &[
             ("bracketl", &["[", "{", "【", "｛", "BracketL"]),

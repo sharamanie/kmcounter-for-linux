@@ -56,21 +56,24 @@ const BAR_W_MAX: f32 = 64.0;
 /// 给得这么狠是有原因的：**同一列的不同排共用同一条竖线**，窄条整个落在宽条内部，
 /// 只能靠宽条两边露出来的那一圈看出层次；衰减太小就只是一根粗柱子，看不出有几排。
 /// 这样叠出来是一层层「套娃」的效果，一眼就能数出几排同时按着。
-const ROW_WIDTH_STEP: f32 = 0.70;
+const ROW_WIDTH_STEP: f32 = 0.76;
 /// 每排的不透明度系数（按排号索引，超出表长 = 0，即**彻底透明、完全不画**）。
+///
+/// 长度对齐**键盘最多 6 行**（用户反馈：四行以上没分配颜色）。
+/// 以前只有 5 项且第 5 项是 0，所以第 4 排以后的雨根本不画。
 /// 方向是**越靠后的排越实**：几排的雨共用同一条轨道与同一水平中心，其实是**层层叠在一起**的，
 /// 又因为后画的排更窄、盖在中心，所以中心最终呈现的正是最深那一排的颜色。
 /// 若第 1 排就已经是实心白，中心早早饱和成纯白，后面的换色排再怎么调都叠不上去 ——
 /// 这正是「深浅对比看不出来」的根因。因此第 1 排压到 0.35（明显淡于实心），
 /// 逐排抬升到 1.00，表外为 0（**允许一路衰减到完全透明**，对标 JipperKeyViewer 的逐排消失）。
-const ROW_ALPHA_TABLE: [f32; 5] = [0.35, 0.72, 0.92, 1.00, 0.0];
+const ROW_ALPHA_TABLE: [f32; 6] = [0.30, 0.62, 0.84, 0.95, 1.00, 1.00];
 /// 排宽下限（px）：深层排不能被连乘到看不见。
 const ROW_WIDTH_MIN: f32 = 1.5;
 /// 排号 → 色相表（0 起；`None` = 沿用 `kps_rain_color`，不做色相变换）。
 /// 用固定表而不是逐排累加，是为了让相邻两排**一眼就是两种颜色**：
 /// 累加出来的 0.70 / 0.85 都落在紫红一带，叠起来仍是一片粉，分不出前后。
 /// 0.55 ≈ 天青、0.80 ≈ 紫 —— 冷色段彼此距离够远，且不会撞上键格本身的热力青绿。
-const ROW_HUE_TABLE: [Option<f32>; 5] = [None, None, Some(0.55), Some(0.80), None];
+const ROW_HUE_TABLE: [Option<f32>; 6] = [None, None, Some(0.55), Some(0.78), Some(0.13), Some(0.33)];
 /// 换色排的最低饱和度：纯白没有色相，必须先给饱和度，否则色相原地旋转等于没变。
 const ROW_TINT_SAT: f32 = 0.88;
 /// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
@@ -527,6 +530,56 @@ mod tests {
                 rain_alpha(from, h, band),
                 1.0,
                 "滤镜区下方 {from} 处必须完全实心"
+            );
+        }
+    }
+
+    /// **键盘最多 6 行，每一行的雨都必须画得出来。**
+    ///
+    /// 用户反馈：四行以上的键位没分配颜色。
+    /// 原因：ROW_ALPHA_TABLE 只有 5 项且第 5 项是 0，ROW_HUE_TABLE 也只有 5 项，
+    /// 所以第 4 排（0 起算）之后根本不画。
+    #[test]
+    fn all_six_rows_are_visible_and_colored() {
+        for row in 0..6usize {
+            assert!(
+                row_alpha_scale(row) > 0.0,
+                "第 {} 排的不透明度应 > 0，实际 {}",
+                row + 1,
+                row_alpha_scale(row)
+            );
+        }
+        // 非白基色下，每排都应能算出一个颜色
+        let base = Color32::WHITE;
+        let mut seen: Vec<String> = Vec::new();
+        for row in 0..6usize {
+            let c = row_color(base, row);
+            assert!(
+                c.a() > 0,
+                "第 {} 排应有颜色",
+                row + 1
+            );
+            seen.push(format!("{:?}", (c.r(), c.g(), c.b())));
+        }
+        // 至少要有 3 种不同颜色（基色 + 两个换色相），否则分不出层次
+        seen.sort();
+        seen.dedup();
+        println!("各排颜色: {:?}", seen);
+        assert!(seen.len() >= 3, "多排应至少有 3 种颜色区分层次，实际 {:?}", seen);
+    }
+
+    /// 每排的宽度都得看得见（不能因为连乘变成 0 像素）。
+    #[test]
+    fn all_six_rows_have_visible_width() {
+        let base_w = 60.0f32;
+        for row in 0..6usize {
+            let w = (base_w * ROW_WIDTH_STEP.powi(row as i32)).max(ROW_WIDTH_MIN);
+            assert!(
+                w >= ROW_WIDTH_MIN - 0.01,
+                "第 {} 排宽度 {} 应 >= {}",
+                row + 1,
+                w,
+                ROW_WIDTH_MIN
             );
         }
     }

@@ -829,6 +829,22 @@ mod tests {
         assert_eq!(app.debug_hud_pos(true), Some((88.0, 999.0)));
     }
 
+    /// 量一下 104 真实布局下的 KPS 悬浮窗尺寸（每行 21 个键 + 宽键）。
+    #[test]
+    fn measure_kps_size_for_104_layout() {
+        use crate::gui::kps_hud_metrics;
+        let mut cfg = Config::default();
+        cfg.kps_keys = Config::kps_keys_text_for_layout("104");
+        cfg.kps_key_count = 104;
+        cfg.kps_scale = 90;
+        cfg.kps_show_rain = true;
+        cfg.kps_show_graph = true;
+        let layout = cfg.kps_key_layout();
+        let m = kps_hud_metrics(&cfg, &layout);
+        println!("行数={} 列数={} 宽={} 高={}", m.rows, m.cols, m.w, m.h);
+        assert!(m.rows == 6, "应是 6 行，实际 {}", m.rows);
+    }
+
     /// 分组 KPS 行应在**数据胶囊内**，且不压到下面的 KPS 图。
     ///
     /// 用户反馈：分组文本卡在 KPS 图里。根因是高度被算了两次
@@ -2660,6 +2676,8 @@ mod tests {
         // 这个场景顺带把分组 KPS 也打开：分组行现在是数据胶囊的第二行，
         // 得有图才看得出它没压到下面的 KPS 图。
         let mut boot = Config::default();
+        boot.kps_keys = Config::kps_keys_text_for_layout("104");
+        boot.kps_key_count = 104;
         boot.kps_show_groups = true;
         boot.kps_groups = "左手=A,S,D,F\n右手=J,K,L".to_string();
         let (mut app, ctx) = headless_app_with_cfg(store_with_days(5), boot);
@@ -2897,7 +2915,7 @@ mod tests {
         ctx.set_pixels_per_point(ppp);
         // 画布必须等于设置窗的真实内高（430x588）：分四组后内容变高，
         // 仍按旧的 486 渲染会把底栏（打开主程序 / 显示悬浮窗 / 重置）整条截掉。
-        let (w, h) = (430.0_f32, 588.0_f32);
+        let (w, h) = (430.0_f32, 620.0_f32);
         let mut textures: HashMap<TextureId, Tex> = HashMap::new();
         let mut last = Vec::new();
         for _ in 0..4 {

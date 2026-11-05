@@ -39,6 +39,12 @@ impl Default for LayoutCfg {
 /// 以前取 60 是拍脑袋留余量，实际上键盘图里就有 104 个可选键。
 pub const KPS_KEY_MAX: u8 = 104;
 
+/// 单行最多几个键（未显式写换行时的自动折行宽度）。
+///
+/// 21 是 104 键盘的物理宽度：数字行与 Tab 行都是 21 个键（
+/// 含 Ins/Home/PgUp 与小键盘那一组）。取 21 才能把真实布局完整排下来。
+pub const KPS_ROW_MAX: usize = 21;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -264,6 +270,13 @@ impl KpsKeyLayout {
 }
 
 /// 解析一格：`H` / `1.5H` / `4H` / 空
+/// 把 1.5 / 2.0 / 6.25 这种宽度写成最短形式（去掉无意义的 ".0"）。
+fn trim_float(v: f32) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
+
 fn parse_kps_cell(item: &str) -> KpsKeyCell {
     let t = item.trim();
     if t.is_empty() {
@@ -322,6 +335,94 @@ impl Config {
             .collect()
     }
 
+    /// **迁移：把旧版单行键表换成配列的真实多行布局。**
+    ///
+    /// 旧版只能写成一长串，靠「每行 21 个硬折行」排版 —— 排出来是
+    /// 每行堆砌、宽键不对、方向键跑到别的位置。
+    ///
+    /// 只在两个前提同时满足时才迁移，保证不会动用户自定义的键表：
+    /// 1. 键表是**单行**（没有换行）；
+    /// 2. 它的键名序列与该配列的默认顺序**完全一致**（说明没自定义过）。
+    /// 返回 true 表示确实发生了迁移（调用方需立即写盘）。
+    pub fn migrate_flat_kps_keys(&mut self) -> bool {
+        // 已经是多行了：不动
+        if self.kps_keys.contains('\n') {
+            return false;
+        }
+        let cur = self.kps_key_layout().names();
+        if cur.is_empty() {
+            return false;
+        }
+        // 判断“没自定义过”用**键集合**而不是顺序：
+        //
+        // 旧版默认序列按“字母优先”排（qwertyuiop…），后来又改过一次按
+        // 键盘物理顺序，两种都不一定与当前配列的生成顺序完全一致。
+        // 但只要**键名集合**对得上，就说明用户没增删过键，可以安全重排。
+        let want = Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, cur.len());
+        if cur.len() != want.len() {
+            return false;
+        }
+        let mut a: Vec<String> = cur.iter().map(|s| s.to_lowercase()).collect();
+        let mut b: Vec<String> = want.iter().map(|s| s.to_lowercase()).collect();
+        a.sort();
+        b.sort();
+        if a != b {
+            return false; // 键集合不一样：用户自定义过，不碰
+        }
+        let new_text = Self::kps_keys_text_for_layout(&self.layout.keyboard_layout);
+        if new_text != self.kps_keys {
+            log::info!("键表迁移：单行 → 配列 {} 的真实行布局", self.layout.keyboard_layout);
+            self.kps_keys = new_text;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 把配列的**真实几何**转成键表文本（换行 = 分行、宽度倍数 = 宽键）。
+    ///
+    /// 这就是「在 HUD 上按真实键盘排列」的实现：
+    /// - **分行**：直接用 `LayoutKey.y`（键盘图的行号）归类；
+    /// - **顺序**：每行按 `LayoutKey.x` 升序；
+    /// - **宽键**：`LayoutKey.w` ≠ 1 时写成前缀（如 `1.5Tab`、`6.25Space`）。
+    ///
+    /// 为什么不用横坐标差算缝：真实键盘的 F 区、导航区、小键盘之间有大段空隙。
+    /// 若把它们也用空位补齐，键表会长到无法阅读；而只保留行内顺序与宽键，
+    /// 观感上已经就是真实键盘。要精确对齐某个空位时，用户自己写 "," 占位即可。
+    pub fn kps_keys_text_for_layout(layout_id: &str) -> String {
+        let profile = crate::keys::layout_profile(layout_id);
+        let mut rows: Vec<(f32, Vec<(f32, &crate::keys::LayoutKey)>)> = Vec::new();
+        for k in profile.keys.iter() {
+            match rows.iter_mut().find(|(y, _)| (*y - k.y).abs() < 0.01) {
+                Some((_, list)) => list.push((k.x, k)),
+                None => rows.push((k.y, vec![(k.x, k)])),
+            }
+        }
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+        for (_, mut list) in rows {
+            list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let items: Vec<String> = list
+                .iter()
+                .map(|(_, k)| {
+                    let name = match k.label_override {
+                        Some(l) => l.to_string(),
+                        None => crate::keys::KEYS[k.idx].name.to_string(),
+                    };
+                    // 宽度倍数只在真的不是 1 格时才写，免得键表到处是 "1.0"
+                    if (k.w - 1.0).abs() < 0.01 {
+                        name
+                    } else {
+                        format!("{}{}", trim_float(k.w), name)
+                    }
+                })
+                .collect();
+            lines.push(items.join(", "));
+        }
+        lines.join("\n")
+    }
+
     /// 默认键位的前 n 个（不带配列信息时的退化版本：按 104 配列）。
     pub fn default_kps_keys_for(n: usize) -> Vec<String> {
         Self::default_kps_keys_for_layout("104", n)
@@ -351,13 +452,13 @@ impl Config {
             }
         }
         // 没写换行 → 默认每行最多 12 个
-        if rows.len() == 1 && rows[0].len() > 12 {
+        if rows.len() == 1 && rows[0].len() > KPS_ROW_MAX {
             let flat = rows.pop().unwrap_or_default();
             let mut wrapped: Vec<Vec<KpsKeyCell>> = Vec::new();
             let mut cur: Vec<KpsKeyCell> = Vec::new();
             for c in flat {
                 cur.push(c);
-                if cur.len() == 12 {
+                if cur.len() == KPS_ROW_MAX {
                     wrapped.push(std::mem::take(&mut cur));
                 }
             }
@@ -470,8 +571,22 @@ impl Config {
     pub fn load(path: &Path) -> (Config, bool) {
         crate::fsutil::clean_stale_tmp(path);
         match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(c) => (c, false),
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(mut c) => {
+                    // 旧版的键表是**单行**字符串，只能靠每行 21 个硬折行，
+                    // 排出来是“每行堆砌”。配列真实布局需要换行与宽键倍数。
+                    // 这里做一次性迁移：只要键表恰好是该配列的默认顺序
+                    // （说明用户没自定义过），就换成多行真实布局。
+                    // 迁移若生效，**立即写盘**。
+                    // 不能等退出时的 save_all：那路径保存的是 cfg_shared，
+                    // 而用户可能直接 kill / 异常退出，迁移结果就丢了。
+                    if c.migrate_flat_kps_keys() {
+                        if let Err(e) = c.save(path) {
+                            log::warn!("键表迁移后写盘失败: {e}");
+                        }
+                    }
+                    (c, false)
+                }
                 Err(e) => {
                     // 解析失败：先把原文件备份下来再退回默认配置。
                     // 不能当成“首次运行”（否则欢迎横幅重弹，且退出时会把默认配置写回去、
@@ -849,6 +964,32 @@ Z,X,C,V".into();
             all104.iter().any(|k| k.starts_with("Num")),
             "104 配列应包含小键盘"
         );
+    }
+
+    #[test]
+    
+    /// 迁移后应该能写成多行字符串并读回。
+    #[test]
+    fn migration_roundtrip() {
+        let mut c = Config::default();
+        c.layout.keyboard_layout = "104".into();
+        // 模拟旧版：单行、顺序与配列默认一致
+        c.kps_keys = Config::default_kps_keys_for_layout("104", 104).join(", ");
+        assert!(!c.kps_keys.contains('\n'));
+        c.migrate_flat_kps_keys();
+        assert!(
+            c.kps_keys.contains('\n'),
+            "迁移后应是多行，实际
+{}",
+            c.kps_keys
+        );
+        assert_eq!(c.kps_keys.lines().count(), 6, "应是 6 行");
+
+        // 能写成 TOML 并读回
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("\n"), "TOML 里应保留换行");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.kps_keys, c.kps_keys, "读回后键表应一致");
     }
 
     fn key_max_matches_keyboard_model() {

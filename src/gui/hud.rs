@@ -1545,10 +1545,12 @@ impl App {
             vp_id,
             egui::ViewportBuilder::default()
                 .with_title(format!("{}{}", SETTINGS_TITLE_PREFIX, s.kps_cfg_title))
-                // 高度按内容实测定。分四组（基础 / 按键 / 显示 / 键雨）后每组多一行小标题，
-                // 同时键表输入框独占整行（原来挤在 label 后面只有 180px 宽）。
-                // 实测值须与 render_kps_settings_shot 的截图画布一致，否则底栏会被截断。
-                .with_inner_size([430.0, 588.0])
+                // 高度固定，**内容超出就滚动**（见 settings_shell 里的 ScrollArea）。
+                //
+                // 之前是按内容实测定高度：键位一多（比如 104 配列的 6 行键表）
+                // 就会把窗口撑到比屏幕还高，底部按钮被挤出去、点不到（用户反馈）。
+                // 现在固定 620 高：常规配置一屏能看完，超长时滚轮。
+                .with_inner_size([430.0, 620.0])
                 .with_resizable(false)
                 .with_decorations(false)
                 .with_always_on_top()
@@ -1762,9 +1764,17 @@ impl App {
                             //
                             // 不清空「按键数记忆」：用户自己改过的那套仍然在，
                             // 只是配列本身的默认序变了。这就是「保留自动保存」。
-                            let n = self.cfg.kps_key_count.max(1) as usize;
+                            // 用**真实几何**生成：分行 / 顺序 / 宽键倍数全部跟键盘图一致，
+                            // 而不是一味地堆在一行。
                             self.cfg.kps_keys =
-                                crate::config::Config::default_kps_keys_for_layout(id, n).join(", ");
+                                crate::config::Config::kps_keys_text_for_layout(id);
+                            self.cfg.kps_key_count = self
+                                .cfg
+                                .kps_key_layout()
+                                .names()
+                                .len()
+                                .clamp(1, crate::config::KPS_KEY_MAX as usize)
+                                as u8;
                             act.dirty = true;
                         }
                     }
@@ -1781,9 +1791,11 @@ impl App {
         // 多行输入：支持"换行 = 分行 / 空项 = 空位 / 1.5H、4H = 宽度倍数"
         if ui
             .add(
+                // **固定 4 行高**：键表可能有 6 行（104 配列），不能让输入框
+                // 自己长高去把窗口撑开。超出的部分在框内自己滚动。
                 egui::TextEdit::multiline(&mut self.cfg.kps_keys)
                     .desired_width(f32::INFINITY)
-                    .desired_rows(3)
+                    .desired_rows(4)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J"),
             )
@@ -1829,10 +1841,18 @@ impl App {
                 .on_hover_text(s.kps_default_keys_hint)
                 .clicked()
             {
-                self.cfg.kps_keys = crate::config::Config::default_kps_keys_for(
-                    self.cfg.kps_key_count as usize,
-                )
-                .join(", ");
+                // 「默认键位」= 当前配列的**真实键盘布局**（多行 + 宽键倍数），
+                // 不是单行 join —— 否则点一下就把真实行布局拍平成“每行 21 个堆砌”。
+                // 这与切换配列时用的是同一个生成函数。
+                self.cfg.kps_keys =
+                    crate::config::Config::kps_keys_text_for_layout(&self.cfg.layout.keyboard_layout);
+                self.cfg.kps_key_count = self
+                    .cfg
+                    .kps_key_layout()
+                    .names()
+                    .len()
+                    .clamp(1, crate::config::KPS_KEY_MAX as usize)
+                    as u8;
                 act.dirty = true;
             }
         });
@@ -2848,7 +2868,16 @@ pub(crate) fn settings_shell(
             }
             btn.on_hover_text(close_hint);
             ui.add_space(4.0);
-            body(ui);
+            // **内容区可滚动**（标题行固定）。
+            //
+            // 为什么需要：键位一多（例如 104 配列 6 行），设置项会把窗口
+            // 撑得比屏幕还高，底部的按钮被挤到屏幕外 —— 点都点不到。
+            // 现在窗口高度固定，内容超出就滚轮。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    body(ui);
+                });
         });
     // Esc 也能关掉设置窗口
     if cfg_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
