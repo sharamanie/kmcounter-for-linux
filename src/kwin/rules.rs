@@ -16,6 +16,8 @@ use super::{hud_pos_supported, is_kde, rules_path};
 const MARKER: &str = "KMCounter-rs (auto)";
 /// HUD 悬浮窗规则（置顶）单独一个标记，便于与主窗口规则分开维护
 const HUD_MARKER: &str = "KMCounter-rs HUD (auto)";
+/// HUD **设置窗**规则（与 HUD 本体分开）
+const SETTINGS_MARKER: &str = "KMCounter HUD settings (auto)";
 const HUD_POS_APM_MARKER: &str = "KMCounter HUD APM (auto)";
 const HUD_POS_KPS_MARKER: &str = "KMCounter HUD KPS (auto)";
 const WM_CLASS: &str = "kmcounter";
@@ -25,6 +27,24 @@ fn main_rule_body() -> String {
     format!(
         "skiptaskbar=true\nskiptaskbarrule=2\nskipswitcher=true\nskipswitcherrule=2\nwmclass={WM_CLASS}\nwmclassmatch=1\nwmclasscomplete=false\ntypes=1\n"
     )
+}
+
+/// HUD 设置窗规则体：**强制置顶** + 跳过任务栏/Alt-Tab。
+///
+/// 为什么要单独一条：
+/// HUD 自己的规则用 `title=KMC -` 子串匹配，设置窗如果也叫 "KMC - ..."，
+/// 就会被同一条规则拿下 —— 两个窗口在同一个 above 层上，
+/// 固定 HUD 后设置窗会被压在下面、点不到。现在设置窗用 "KMC# " 前缀，
+/// 匹配条件也独立，两者互不干扰。
+fn settings_rule_body() -> String {
+    format!(
+        "above=true\naboverule=2\nskiptaskbar=true\nskiptaskbarrule=2\nskipswitcher=true\nskipswitcherrule=2\nwmclass={WM_CLASS}\nwmclassmatch=1\nwmclasscomplete=false\ntitle=KMC# \ntitlematch=2\ntypes=1\n"
+    )
+}
+
+/// 在 INI 文本中追加设置窗规则（若不存在）
+fn add_settings_rule(text: &str) -> String {
+    add_rule_with(text, SETTINGS_MARKER, &settings_rule_body())
 }
 
 /// HUD 悬浮窗规则体：**强制置顶** + 跳过任务栏/Alt-Tab。
@@ -92,7 +112,8 @@ pub fn set_skip_taskbar(enabled: bool, hud_above: bool) {
         } else {
             !text.contains("aboverule=")
         });
-    if enabled == (has_main && has_hud) && above_ok {
+    let has_settings = text.contains(SETTINGS_MARKER);
+    if enabled == (has_main && has_hud) && above_ok && (has_settings || !enabled) {
         return; // 已是目标状态
     }
     let new_text = if enabled {
@@ -100,6 +121,11 @@ pub fn set_skip_taskbar(enabled: bool, hud_above: bool) {
         let mut t = if has_main { text.clone() } else { add_rule(&text) };
         if !has_hud {
             t = add_hud_rule(&t, hud_above);
+        }
+        // 设置窗规则（独立前缀 "KMC# "）：不建它的话，固定 HUD 后
+        // 设置窗会被 HUD 盖住、点不到。
+        if !t.contains(SETTINGS_MARKER) {
+            t = add_settings_rule(&t);
         }
         // 已存在的 HUD 规则要把 above 同步过去（开关改了也要能生效）
         t = set_hud_above(&t, hud_above);
@@ -241,7 +267,9 @@ fn remove_rule(text: &str) -> String {
     let (mut general, groups) = split_ini(text);
     let kept: Vec<(String, String)> = groups
         .iter()
-        .filter(|(_, body)| !body.contains(MARKER) && !body.contains(HUD_MARKER))
+        .filter(|(_, body)| {
+            !body.contains(MARKER) && !body.contains(HUD_MARKER) && !body.contains(SETTINGS_MARKER)
+        })
         .cloned()
         .collect();
     if kept.len() == groups.len() {
@@ -501,6 +529,58 @@ mod tests {
     /// 原因：Wayland 下 winit 的 with_always_on_top() 是空实现，置顶完全靠 KWin 规则
     /// 里写死的 above=true；光改 winit 层没用。
     #[test]
+    /// **设置窗规则必须存在且与 HUD 规则分开。**
+    ///
+    /// 用户反馈：固定 HUD 后，HUD 设置窗被压在 HUD 下面、点不到。
+    /// 根因：设置窗原来也叫 "KMC - …"，被 HUD 的 title=KMC - 规则一并拿下，
+    /// 两个窗口同层，谁在上面取决于创建顺序。
+    #[test]
+    fn settings_rule_is_separate_from_hud() {
+        let mut text = add_rule("");
+        text = add_hud_rule(&text, true);
+        text = add_settings_rule(&text);
+
+        // 设置窗规则自己存在、强制置顶、用独立前缀
+        let sec = text
+            .split("[")
+            .find(|s| s.contains(SETTINGS_MARKER))
+            .expect("应有设置窗规则");
+        assert!(sec.contains("above=true"), "设置窗应强制置顶
+{sec}");
+        assert!(sec.contains("aboverule=2"));
+        assert!(
+            sec.contains("title=KMC# "),
+            "设置窗规则应匹配 KMC# 前缀（与 HUD 的 KMC - 分开）
+{sec}"
+        );
+
+        // HUD 规则的匹配条件不应该能匹配到设置窗
+        let hud_sec = text
+            .split("[")
+            .find(|s| s.contains(HUD_MARKER))
+            .expect("应有 HUD 规则");
+        assert!(
+            !hud_sec.contains("KMC#"),
+            "HUD 规则不应匹配 KMC# 前缀
+{hud_sec}"
+        );
+    }
+
+    /// 关掉跳过任务栏时，三条规则要一起清掉。
+    #[test]
+    fn settings_rule_removed_together() {
+        let mut text = add_rule("");
+        text = add_hud_rule(&text, true);
+        text = add_settings_rule(&text);
+        assert!(text.contains(SETTINGS_MARKER));
+        let off = remove_rule(&text);
+        assert!(
+            !off.contains(SETTINGS_MARKER),
+            "关掉后设置窗规则也要清掉
+{off}"
+        );
+    }
+
     fn hud_above_toggles_in_rule() {
         let with_main = add_rule("");
         // 默认开：规则里有 above

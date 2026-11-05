@@ -1360,7 +1360,7 @@ impl App {
         ctx.show_viewport_immediate(
             vp_id,
             egui::ViewportBuilder::default()
-                .with_title(format!("KMC - {}", s.apm_cfg_title))
+                .with_title(format!("{}{}", SETTINGS_TITLE_PREFIX, s.apm_cfg_title))
                 .with_inner_size([336.0, 196.0])
                 .with_resizable(false)
                 .with_decorations(false)
@@ -1544,7 +1544,7 @@ impl App {
         ctx.show_viewport_immediate(
             vp_id,
             egui::ViewportBuilder::default()
-                .with_title(format!("KMC - {}", s.kps_cfg_title))
+                .with_title(format!("{}{}", SETTINGS_TITLE_PREFIX, s.kps_cfg_title))
                 // 高度按内容实测定。分四组（基础 / 按键 / 显示 / 键雨）后每组多一行小标题，
                 // 同时键表输入框独占整行（原来挤在 label 后面只有 180px 宽）。
                 // 实测值须与 render_kps_settings_shot 的截图画布一致，否则底栏会被截断。
@@ -2776,6 +2776,16 @@ pub(crate) fn hud_bg_color(rgb: (u8, u8, u8), opacity: u8) -> Color32 {
 
 /// 悬浮窗设置窗口的公共外壳：深色圆角背景 + 可拖动标题行（右端是关闭按钮）+ Esc 关闭。
 /// `body` 里画各自的设置项；返回 true 表示用户要求关闭本窗口。
+/// 设置窗标题前缀。
+///
+/// **必须与 HUD 的“KMC - ”前缀不同**：
+/// HUD 在 KDE 下靠 KWin 规则强制置顶（`title=KMC -` 子串匹配，titlematch=2）。
+/// 以前设置窗也叫 "KMC - KPS 设置"，于是**也被同一条规则拿下**，
+/// 两个窗口跟在同一个 above 层上，谁在上面取决于创建顺序 ——
+/// 固定 HUD 后设置窗被压在下面，点都点不到（用户反馈）。
+/// 改用独立前缀后，设置窗不再匹配 HUD 规则，自己有一条只管它的规则。
+pub(crate) const SETTINGS_TITLE_PREFIX: &str = "KMC# ";
+
 pub(crate) fn settings_shell(
     cfg_ctx: &egui::Context,
     icon: &str,
