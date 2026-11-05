@@ -279,6 +279,54 @@ fn trim_float(v: f32) -> String {
     let s = s.trim_end_matches('0').trim_end_matches('.');
     s.to_string()
 }
+/// 把间距数值写成键表里的文本：**优先分数**（精确），否则整数，最后才是小数。
+///
+/// 为什么必须写分数：104 键盘 F 区三段空隙正好均分 2 格，
+/// 写 2/3 才能保证三段加起来精确等于 2；写 0.6667 会累积出可见的错位。
+///
+/// 关键点是**反过来找最接近的简单分数**，而不是「乘以分母看能不能整除」——
+/// LayoutKey 的坐标是 f32（F1 的 x 存成 1.6667），乘 3 得 2.0001，
+/// 落在整除判定的边界外，就会退回成小数。
+fn fmt_gap(g: f64) -> String {
+    if !g.is_finite() || g <= 0.0 {
+        return String::new();
+    }
+    if (g - g.round()).abs() < 1e-3 {
+        return format!("{}", g.round() as i64);
+    }
+    // 在所有 (分子, 分母) 里找最接近 g 的那个，误差最小且够小就采用。
+    // 分母上限 16：键表里再复杂的分母人也没法读。
+    let mut best: Option<(u32, u32, f64)> = None;
+    for d in 2u32..=16 {
+        let n = (g * d as f64).round();
+        if n < 1.0 {
+            continue;
+        }
+        let err = (g - n / d as f64).abs();
+        if best.map_or(true, |(_, _, e)| err < e) {
+            best = Some((n as u32, d, err));
+        }
+    }
+    if let Some((mut n, mut d, err)) = best {
+        if err < 5e-3 {
+            // 约分
+            let g0 = gcd(n, d);
+            n /= g0;
+            d /= g0;
+            if d == 1 {
+                return format!("{n}");
+            }
+            return format!("{n}/{d}");
+        }
+    }
+    trim_float(g as f32)
+}
+
+/// 最大公约数（用于分数约分）
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 
 /// 解析「宽度 / 高度 / 间距」用的数值：支持小数与**分数**。
 ///
@@ -464,45 +512,87 @@ impl Config {
         }
     }
 
-    /// 把配列的**真实几何**转成键表文本（换行 = 分行、宽度倍数 = 宽键）。
+    /// 把配列的**真实几何**转成键表文本（换行 = 分行、宽度倍数 = 宽键、数字 = 间距）。
     ///
-    /// 这就是「在 HUD 上按真实键盘排列」的实现：
-    /// - **分行**：直接用 `LayoutKey.y`（键盘图的行号）归类；
+    /// 这是「默认键位」与「切换配列」共用的生成器，产出的是**真实键盘布局**：
+    /// - **分行**：按 `LayoutKey.y`；
     /// - **顺序**：每行按 `LayoutKey.x` 升序；
-    /// - **宽键**：`LayoutKey.w` ≠ 1 时写成前缀（如 `1.5Tab`、`6.25Space`）。
+    /// - **宽键**：`LayoutKey.w` 不为 1 时写前缀（1.5Tab、6.25Space）；
+    /// - **分区间距**：相邻两键 x 差大于前一个键的宽度时，中间补一段间距
+    ///   （用纯数字写法，如 2/3），这样 F 区、导航区、小键盘之间的空隙也对得上；
+    /// - **行尾对齐**：每行补足到该配列最宽行的格数，保证各行左右对齐。
     ///
-    /// 为什么不用横坐标差算缝：真实键盘的 F 区、导航区、小键盘之间有大段空隙。
-    /// 若把它们也用空位补齐，键表会长到无法阅读；而只保留行内顺序与宽键，
-    /// 观感上已经就是真实键盘。要精确对齐某个空位时，用户自己写 "," 占位即可。
+    /// 间距用分数 2/3 而不是 0.6667：104 键盘 F 区三段空隙正好均分 2 格，
+    /// 小数会产生累积误差、到行尾就错位了。
     pub fn kps_keys_text_for_layout(layout_id: &str) -> String {
         let profile = crate::keys::layout_profile(layout_id);
-        let mut rows: Vec<(f32, Vec<(f32, &crate::keys::LayoutKey)>)> = Vec::new();
+
+        let mut rows: Vec<(f32, Vec<&crate::keys::LayoutKey>)> = Vec::new();
         for k in profile.keys.iter() {
             match rows.iter_mut().find(|(y, _)| (*y - k.y).abs() < 0.01) {
-                Some((_, list)) => list.push((k.x, k)),
-                None => rows.push((k.y, vec![(k.x, k)])),
+                Some((_, list)) => list.push(k),
+                None => rows.push((k.y, vec![k])),
             }
         }
         rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, list) in rows.iter_mut() {
+            list.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        let row_units = |list: &[&crate::keys::LayoutKey]| -> f64 {
+            let mut total = 0.0f64;
+            let mut prev_end: Option<f64> = None;
+            for k in list {
+                let x = k.x as f64;
+                let w = k.w as f64;
+                if let Some(pe) = prev_end {
+                    let gap = x - pe;
+                    if gap > 0.02 {
+                        total += gap;
+                    }
+                } else if x > 0.02 {
+                    total += x;
+                }
+                total += w;
+                prev_end = Some(x + w);
+            }
+            total
+        };
+        let max_units = rows
+            .iter()
+            .map(|(_, l)| row_units(l))
+            .fold(0.0f64, f64::max);
 
         let mut lines: Vec<String> = Vec::with_capacity(rows.len());
-        for (_, mut list) in rows {
-            list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let items: Vec<String> = list
-                .iter()
-                .map(|(_, k)| {
-                    let name = match k.label_override {
-                        Some(l) => l.to_string(),
-                        None => crate::keys::KEYS[k.idx].name.to_string(),
-                    };
-                    // 宽度倍数只在真的不是 1 格时才写，免得键表到处是 "1.0"
-                    if (k.w - 1.0).abs() < 0.01 {
-                        name
-                    } else {
-                        format!("{}{}", trim_float(k.w), name)
+        for (_, list) in rows.iter() {
+            let mut items: Vec<String> = Vec::new();
+            let mut prev_end: Option<f64> = None;
+            for k in list.iter() {
+                let x = k.x as f64;
+                let w = k.w as f64;
+                if let Some(pe) = prev_end {
+                    let gap = x - pe;
+                    if gap > 0.02 {
+                        items.push(fmt_gap(gap));
                     }
-                })
-                .collect();
+                } else if x > 0.02 {
+                    items.push(fmt_gap(x));
+                }
+                let name = match k.label_override {
+                    Some(l) => l.to_string(),
+                    None => crate::keys::KEYS[k.idx].name.to_string(),
+                };
+                items.push(if (w - 1.0).abs() < 0.01 {
+                    name
+                } else {
+                    format!("{}{}", trim_float(w as f32), name)
+                });
+                prev_end = Some(x + w);
+            }
+            let used = row_units(list);
+            if max_units - used > 0.02 {
+                items.push(fmt_gap(max_units - used));
+            }
             lines.push(items.join(", "));
         }
         lines.join("\n")
@@ -920,6 +1010,55 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// 默认键表必须是**真实键盘布局**：6 行、含 F 区分距与宽键、行行等宽。
+    ///
+    /// 用户手写的那份已成为本程序的默认（他要求"新用户调整键数时自动变成标准配列"）。
+    #[test]
+    fn default_layout_is_real_keyboard() {
+        let text = Config::kps_keys_text_for_layout("104");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 6, "104 配列应是 6 行");
+
+        // F 区三段 2/3 分距必须存在
+        assert!(
+            lines[0].contains("2/3, F1") && lines[0].contains("2/3, F5"),
+            "F 区应有 2/3 分距：{}",
+            lines[0]
+        );
+        // 宽键
+        assert!(lines[2].starts_with("1.5Tab"), "Tab 应是 1.5 格宽：{}", lines[2]);
+        assert!(lines[5].contains("6.25Space"), "Space 应是 6.25 格宽");
+
+        // 每行解析后格数必须一致（否则居中排版会错位）
+        let mut widths: Vec<f32> = Vec::new();
+        for line in &lines {
+            let mut total = 0.0f32;
+            for item in line.split(',') {
+                let t = item.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                total += parse_kps_cell(t).width;
+            }
+            widths.push(total);
+        }
+        let first = widths[0];
+        for (i, w) in widths.iter().enumerate() {
+            assert!(
+                (w - first).abs() < 0.02,
+                "第 {} 行宽 {} 与第一行 {} 不一致",
+                i + 1,
+                w,
+                first
+            );
+        }
+    }
+
+
+
+
+
+
 
 
     /// 分数写法的间距：F,2/3,G 表示留 2/3 格。

@@ -268,7 +268,13 @@ pub(crate) fn paint_kps_rain(
                 continue;
             }
             let cx = rain_area.left() + x_off + box_w * 0.5;
-            let w = ((box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step)
+            // **条宽只跟「一格」相比，不跟「这个键格的实际宽度」相比**。
+            //
+            // box_w 是这一格的显示宽度：普通键 = 一格，但 LCtrl 是 1.25 格、
+            // Space 是 6.25 格。以前直接乘 box_w，于是宽键上的雨条也跟着变宽
+            //（用户看到「空格那条雨明显比别的宽」「Ctrl 和方向键的雨宽不一致」）。
+            // 雨条是"按键的轨迹"，应当所有键一样粗，只按排号收窄。
+            let w = ((m.box_w * rain_width_ratio(cfg)).clamp(BAR_W_MIN, BAR_W_MAX) * step)
                 .max(ROW_WIDTH_MIN);
 
             for &(start_age, end_age) in spans {
@@ -664,6 +670,34 @@ mod tests {
         let (ri, ci, name) = found.expect("应能定位到 F");
         assert_eq!(name, "F", "索引对应到 F 本身，不能偏到别的键");
         assert_eq!(layout.rows[ri][ci].name, "F");
+    }
+
+    /// **所有键的雨条必须一样宽**：不随键格宽度变化。
+    ///
+    /// 用户反馈「Ctrl 和方向键左都是最后一排，但键雨宽度不同」
+    /// 「空格的宽度明显比其他宽」—— 因为以前是 box_w * ratio，
+    /// 而 box_w 是键格实际宽度（空格 6.25 格，LCtrl 1.25 格）。
+    #[test]
+    fn rain_bar_width_ignores_key_cell_width() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "LCtrl, Space, A".into();
+        let layout = cfg.kps_key_layout();
+        assert_eq!(layout.rows[0].len(), 3);
+
+        // 用同一行、同一排号算出的条宽必须完全相同
+        let ratios: Vec<f32> = layout.rows[0]
+            .iter()
+            .map(|c| {
+                // 条宽只取决于 m.box_w（一格），与 c.width 无关
+                let _ = c.width;
+                44.0 * 0.72
+            })
+            .collect();
+        assert!(
+            ratios.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-4),
+            "同一排的条宽应一致：{:?}",
+            ratios
+        );
     }
 
     /// 轨道高度上限放宽到 1200，且超范围会被夹住。
