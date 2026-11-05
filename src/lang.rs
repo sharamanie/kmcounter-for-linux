@@ -508,7 +508,12 @@ const ZH: Strings = Strings {
     settings_kps_layout: "配列",
     settings_kps_layout_hint: "与主界面共用同一个配列；切换后键表会按该配列的真实键盘顺序重置（仍可继续手改，且按键数记忆不清空）",
     settings_kps_keys: "KPS 监控按键",
-    settings_kps_keys_hint: "逗号分隔（KPS 只统计这些键）。换行 = 分行（默认每行最多 12 个）；空项 = 空位；数字前缀 = 宽度倍数：1.5X、4X",
+    settings_kps_keys_hint: "逗号分隔（KPS 只统计这些键）。
+• 换行 = 分行
+• 空项（两个逗号挨着） = 空位；**行首 / 行尾的逗号同样算空位**（用来把这行顶格）
+• 1.5X = 宽 1.5 格
+• 2x2H = 宽 2 格、高 2 行（跨行只写一次，下面那行自动让位）
+• 逗号键本身写 < 或 《，句号键写 > 或 》",
     settings_kps_show_hits: "显示按键累计击打次数",
     settings_kps_show_max: "显示 Max 峰值",
     kps_show_avg: "显示平均 KPS",
@@ -773,7 +778,7 @@ const EN: Strings = Strings {
     settings_kps_layout: "Layout",
     settings_kps_layout_hint: "Shared with the main window. Switching resets the key table to that layout's real keyboard order (still editable; per-count memory is kept)",
     settings_kps_keys: "KPS Monitored Keys",
-    settings_kps_keys_hint: "Comma separated (only these count). Newline = new row (max 12 per row); empty item = gap; number prefix = width multiplier: 1.5X, 4X",
+    settings_kps_keys_hint: "Comma separated (only these count).\n• Newline = new row\n• Empty item (adjacent commas) = gap; **leading / trailing commas also count as gaps** (use them to align a row)\n• 1.5X = width 1.5 cells\n• 2x2H = width 2 cells, height 2 rows (declare once, the row below yields automatically)\n• The comma key itself is written < or 《; period key is > or 》",
     settings_kps_show_hits: "Show Key Hit Counts",
     settings_kps_show_max: "Show Max Peak",
     kps_show_avg: "Show average KPS",

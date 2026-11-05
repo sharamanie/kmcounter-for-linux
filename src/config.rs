@@ -247,6 +247,9 @@ pub struct KpsKeyCell {
     pub name: String,
     /// 宽度（单位是"格"；`1.5H` / `4H` 这种写法就是 1.5 / 4）
     pub width: f32,
+    /// 高度（单位是"行"，默认 1）。`2x2H` = 宽 2 格、高 2 行。
+    /// 跨行时**只在第一行写一次**，后面那几行自动让位。
+    pub height: f32,
 }
 
 /// KPS 键格布局：按用户写的分行，或默认每行最多 12 个自动换行
@@ -277,31 +280,66 @@ fn trim_float(v: f32) -> String {
     s.to_string()
 }
 
+/// 解析一格。支持的写法：
+///
+/// - `H`            普通键，1 格宽 x 1 行高
+/// - `2J` / `2.5J`  宽 2 / 2.5 格
+/// - `2x2H`         宽 2 格、高 2 行（跨行只在本行写一次）
+/// - 空（两个逗号挨着） 空位，占 1 格
+///
+/// 宽度与高度用 `x` 分隔；只写一个数字时是**宽度**（向后兼容 `1.5H`）。
 fn parse_kps_cell(item: &str) -> KpsKeyCell {
     let t = item.trim();
     if t.is_empty() {
-        return KpsKeyCell { name: String::new(), width: 1.0 };
+        return KpsKeyCell { name: String::new(), width: 1.0, height: 1.0 };
     }
     // 逗号是**分隔符**，想监控逗号键本身就不能直接写 ","。
     // 这里把它的其他形态统一换回 "," 再交给 normalize_kps_key：
-    //   `<`  `《`  `〈`  —— 都是逗号键。
-    // 同样地，句号键的 `>`  `》`  `〉`  `。` 也归一到 "."（它不是分隔符，但一起处理更一致）。
+    //   <  《  〈  —— 都是逗号键。
+    // 同样地，句号键的 > 》 〉 。 也归一到 "."。
     let t: &str = match t {
         "<" | "《" | "〈" => ",",
         ">" | "》" | "〉" | "。" => ".",
         _ => t,
     };
     let t = t.trim();
-    // 数字前缀 = 宽度倍数（纯数字的项是数字键本身，不当倍数）
-    let digits_end = t.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(t.len());
-    if digits_end > 0 && digits_end < t.len() {
-        if let Ok(w) = t[..digits_end].parse::<f32>() {
-            if w.is_finite() && (0.5..=12.0).contains(&w) {
-                return KpsKeyCell { name: t[digits_end..].trim_start().to_string(), width: w };
+
+    // 取出开头的数字段：2 或 2.5
+    let num_end = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(t.len());
+    if num_end > 0 && num_end < t.len() {
+        if let Ok(w) = t[..num_end].parse::<f32>() {
+            let rest = t[num_end..].trim_start();
+            // 形如 2x2H：rest 以 x 开头且后面还有数字
+            if let Some(after_x) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+                let h_end = after_x
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .unwrap_or(after_x.len());
+                if h_end > 0 {
+                    if let Ok(h) = after_x[..h_end].parse::<f32>() {
+                        let name = after_x[h_end..].trim_start().to_string();
+                        if !name.is_empty() {
+                            return KpsKeyCell {
+                                name,
+                                width: w.clamp(0.5, 12.0),
+                                height: h.clamp(1.0, 12.0),
+                            };
+                        }
+                    }
+                }
+            }
+            // 只有宽度：1.5H
+            if w.is_finite() && (0.5..=12.0).contains(&w) && !rest.is_empty() {
+                return KpsKeyCell {
+                    name: rest.to_string(),
+                    width: w,
+                    height: 1.0,
+                };
             }
         }
     }
-    KpsKeyCell { name: t.to_string(), width: 1.0 }
+    KpsKeyCell { name: t.to_string(), width: 1.0, height: 1.0 }
 }
 
 impl Config {
@@ -443,13 +481,21 @@ impl Config {
     pub fn kps_key_layout(&self) -> KpsKeyLayout {
         let mut rows: Vec<Vec<KpsKeyCell>> = Vec::new();
         for line in self.kps_keys.split('\n') {
-            let mut cells: Vec<KpsKeyCell> = line.split(',').map(parse_kps_cell).collect();
-            while cells.last().is_some_and(|c| c.name.is_empty()) {
-                cells.pop(); // "E,R," 这种行尾逗号不算空位
+            let trimmed = line.trim_end();
+            if trimmed.trim().is_empty() {
+                continue; // 空行忽略
             }
-            if !cells.is_empty() {
-                rows.push(cells);
+            let cells: Vec<KpsKeyCell> = trimmed.split(',').map(parse_kps_cell).collect();
+            // **行尾逗号 = 末尾空一格**（用户要求）。
+            //
+            // 以前尾部空项被直接丢掉，于是 "H,," 和 "H" 一样。
+            // 但真实键盘布局里「最后一个键右侧留白」很常见（导航区、方向键上方），
+            // 保留它们才能把键挤到指定列。
+            // 只删掉空行、保留真实空位。
+            if cells.is_empty() {
+                continue;
             }
+            rows.push(cells);
         }
         // 没写换行 → 默认每行最多 12 个
         if rows.len() == 1 && rows[0].len() > KPS_ROW_MAX {
@@ -471,10 +517,49 @@ impl Config {
             rows.push(
                 Self::default_kps_keys_for(self.kps_key_count.max(1) as usize)
                     .into_iter()
-                    .map(|name| KpsKeyCell { name, width: 1.0 })
+                    .map(|name| KpsKeyCell { name, width: 1.0, height: 1.0 })
                     .collect(),
             );
         }
+        // **跨行占位**：height = 2 的键格在下一行同列插一个空占位，
+        // 使后面的键不会左移。只在**声明行写一次**，不要求用户重复写。
+        //
+        // 为什么要做这件事：真实键盘里小键盘的 + 与 Enter 是竖向 2 行高的，
+        // 它们右侧的键并不会因此左移。
+        let snapshot = rows.clone();
+        for (ri, row) in snapshot.iter().enumerate() {
+            if ri + 1 >= rows.len() {
+                break;
+            }
+            let mut col = 0usize;
+            for cell in row.iter() {
+                let units = cell.width.max(0.1).ceil() as usize;
+                if cell.height > 1.0 {
+                    for k in 1..(cell.height.round() as usize) {
+                        // 在 rows[ri + k] 的 col 位置插入空占位
+                        if let Some(target) = rows.get_mut(ri + k) {
+                            if col <= target.len() {
+                                let blank = KpsKeyCell {
+                                    name: String::new(),
+                                    width: cell.width,
+                                    height: 1.0,
+                                };
+                                // 直接插在第 col 格。
+                                //
+                                // 跨行键占的就是「声明行那一列」的下方，
+                                // 所以层下行那一格本来就该是空的。
+                                // 不要去「跳过非空项」：那会跳到行尾，
+                                // 反而让后面的键错位。
+                                let at = col.min(target.len());
+                                target.insert(at, blank);
+                            }
+                        }
+                    }
+                }
+                col += units;
+            }
+        }
+
         let cols = rows
             .iter()
             .map(|r| r.iter().map(|c| c.width).sum::<f32>())
@@ -788,6 +873,43 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// 新布局语法：行尾逗号 = 末尾空位。
+    #[test]
+    fn trailing_comma_makes_tail_gap() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "A, B,".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[0].len(), 3, "行尾逗号应产生第 3 个空位：{:?}", l.rows[0]);
+        assert_eq!(l.rows[0][2].name, "");
+    }
+
+    /// 新布局语法：`2x2H` = 宽 2 格、高 2 行。
+    #[test]
+    fn cell_can_span_two_rows() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "2x2H, A\nX, B".into();
+        let l = cfg.kps_key_layout();
+        let c = &l.rows[0][0];
+        assert_eq!(c.name, "H");
+        assert!((c.width - 2.0).abs() < 1e-3, "宽应为 2，实际 {}", c.width);
+        assert!((c.height - 2.0).abs() < 1e-3, "高应为 2，实际 {}", c.height);
+        // 第二行应在同列插入空占位，A 不会左移
+        assert!(
+            l.rows[1].iter().take(2).any(|x| x.name.is_empty()),
+            "第二行应有占位空格：{:?}",
+            l.rows[1].iter().map(|x| &x.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// 只写一个数字仍然是宽度（向后兼容 1.5H）。
+    #[test]
+    fn single_number_is_still_width() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "1.5Tab, Q".into();
+        let l = cfg.kps_key_layout();
+        assert!((l.rows[0][0].width - 1.5).abs() < 1e-3);
+        assert!((l.rows[0][0].height - 1.0).abs() < 1e-3, "高度应保持 1");
+    }
 
     /// 键格布局语法：换行=分行、逗号后无空格也行、空项=空位、数字前缀=宽度倍数、自适应键宽平分最后一行
     #[test]

@@ -471,12 +471,19 @@ fn paint_kps_key_cells(
             let Some(&(x_off, box_w)) = row_pos.get(row).and_then(|r| r.get(cell_idx)) else {
                 break;
             };
+            // 高度支持跨行（`2x2H` 这种写法）：默认 1 行，
+            // 多行时把相邻行的间距也算进去，否则中间会留一道缝。
+            let row_h = if cell.height > 1.0 {
+                cell.height * m.box_h + (cell.height - 1.0) * m.gap
+            } else {
+                m.box_h
+            };
             let rect = Rect::from_min_size(
                 Pos2::new(
                     content.left() + x_off,
                     content.top() + row as f32 * (m.box_h + m.gap),
                 ),
-                Vec2::new(box_w, m.box_h),
+                Vec2::new(box_w, row_h),
             );
             if cell.name.is_empty() {
                 continue; // 空位：占地方，不画不统计
@@ -2568,7 +2575,11 @@ pub(crate) fn key_rows_layout(
             if u <= 0.0 {
                 return Vec::new();
             }
-            // 行宽（不含两侧边距）与两侧边距；限制行恰好左右各一个 gap，其余行居中
+            // 每行**居中**放置。
+            //
+            // 对齐由用户在键表里用逗号自己控制：
+            // 行首写逗号 = 左边空一格，行尾写逗号 = 右边空一格。
+            // 两边都补上就能让这一行顶格，而不需要我们在排版里猜。
             let row_w = box_w * u + gap * (u - 1.0);
             let mut x = (content_w - row_w) * 0.5;
             let mut out = Vec::with_capacity(r.len());
@@ -2891,7 +2902,7 @@ mod tests {
     use super::*;
 
     fn cell(name: &str) -> crate::config::KpsKeyCell {
-        crate::config::KpsKeyCell { name: name.into(), width: 1.0 }
+        crate::config::KpsKeyCell { name: name.into(), width: 1.0, height: 1.0 }
     }
 
     /// 按目标宽度排版时，最宽一行必须**恰好等于目标宽度**、且起点为 0。
@@ -2931,7 +2942,7 @@ mod tests {
 
         // 宽度倍数（2 格宽）的盒宽 = 2 个盒 + 1 条缝；缝仍处处等宽
         let rows = vec![vec![
-            crate::config::KpsKeyCell { name: "H".into(), width: 2.0 },
+            crate::config::KpsKeyCell { name: "H".into(), width: 2.0, height: 1.0 },
             cell("J"),
         ]];
         let pos = key_rows_layout(&rows, 44.0, 210.0);
@@ -2941,7 +2952,10 @@ mod tests {
         assert!((210.0 - (r[1].0 + r[1].1) - m).abs() < 0.05, "右边距 == 左边距");
         assert!((r[0].1 - (88.0 + m)).abs() < 0.05, "2 格宽盒 = 2×44 + 1 条缝");
 
-        // 多行：缝宽统一（取最紧的那行），窄行整体居中、行内左右对称
+        // 多行：缝宽统一（取最紧的那行），窄行整体居中、行内左右对称。
+        //
+        // 居中是对的：想让某行顶格，用户在键表里自己用逗号补空位
+        // （行首 / 行尾都可以补），排版不去猜。
         let rows = vec![
             vec![cell("A"), cell("B"), cell("C"), cell("D")],
             vec![cell("E"), cell("F")],
