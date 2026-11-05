@@ -524,6 +524,59 @@ impl Config {
     ///
     /// 间距用分数 2/3 而不是 0.6667：104 键盘 F 区三段空隙正好均分 2 格，
     /// 小数会产生累积误差、到行尾就错位了。
+    /// 生成该配列**前 n 个键**的键表文本（保持真实分行 / 宽键 / 分区间距）。
+    ///
+    /// 与 `kps_keys_text_for_layout` 的区别只有一个：到第 n 个键就停。
+    /// 「默认键位」按钮用它 —— 用户设了 87 键，点默认后仍是 87 键，
+    /// 只是排成该配列的真实布局，而不是把键数改成整表长度。
+    pub fn kps_keys_text_for_layout_n(layout_id: &str, n: usize) -> String {
+        // 若 n 恰好等于**某个配列的键数**，直接给那个配列的完整真实布局 ——
+        //
+        // 用户设 87 键就是想用 87 配列，硬截 98 配列的前 87 个只会剩个残尾
+        //（第 6 行只剩一个 LCtrl，完全不像键盘）。
+        for id in ["104", "98", "87", "75", "68", "64", "60"] {
+            let profile = crate::keys::layout_profile(id);
+            if profile.keys.len() == n {
+                return Self::kps_keys_text_for_layout(id);
+            }
+        }
+
+        let full = Self::kps_keys_text_for_layout(layout_id);
+        let mut left = n.max(1);
+        let mut out: Vec<String> = Vec::new();
+        for line in full.lines() {
+            if left == 0 {
+                break;
+            }
+            let mut kept: Vec<String> = Vec::new();
+            let mut started = false;
+            for item in line.split(", ") {
+                let t = item.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let cell = parse_kps_cell(t);
+                if cell.name.is_empty() {
+                    // 间距：还没开始收键就保留（行首留白属于布局的一部分）
+                    if !started {
+                        kept.push(t.to_string());
+                    }
+                    continue;
+                }
+                if left == 0 {
+                    break;
+                }
+                started = true;
+                kept.push(t.to_string());
+                left -= 1;
+            }
+            if kept.iter().any(|x| !parse_kps_cell(x).name.is_empty()) {
+                out.push(kept.join(", "));
+            }
+        }
+        out.join("\n")
+    }
+
     pub fn kps_keys_text_for_layout(layout_id: &str) -> String {
         let profile = crate::keys::layout_profile(layout_id);
 
@@ -1010,6 +1063,39 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// **键数等于某个配列时，默认键位应给该配列的完整布局**。
+    ///
+    /// 用户反馈：设 87 键、点「默认键位」后键数变成 98。
+    /// 现在改为按当前键数取，且 87 会直接命中 87 配列。
+    #[test]
+    fn default_keys_respect_key_count() {
+        // 87 -> 87 配列（不是 98 截断）
+        let t87 = Config::kps_keys_text_for_layout_n("104", 87);
+        assert!(t87.contains("PrtScr"), "87 键应命中 87 配列（含 PrtScr）");
+        assert!(!t87.lines().last().unwrap().contains("Num"), "87 配列没有小键盘");
+
+        // 60 -> 60 配列
+        let t60 = Config::kps_keys_text_for_layout_n("104", 60);
+        assert!(t60.lines().count() >= 4, "60 配列至少 4 行，实际 {}", t60.lines().count());
+        assert!(t60.contains("Backspace"), "60 配列应有退格键");
+
+        // 非配列键数（如 50）：截取，键数不越界
+        let t50 = Config::kps_keys_text_for_layout_n("104", 50);
+        let mut cnt = 0usize;
+        for line in t50.lines() {
+            for item in line.split(", ") {
+                let c = parse_kps_cell(item);
+                if !c.name.is_empty() {
+                    cnt += 1;
+                }
+            }
+        }
+        assert_eq!(cnt, 50, "非配列键数应精确截取 50 个键");
+    }
+
+
+
+
     /// 默认键表必须是**真实键盘布局**：6 行、含 F 区分距与宽键、行行等宽。
     ///
     /// 用户手写的那份已成为本程序的默认（他要求"新用户调整键数时自动变成标准配列"）。
