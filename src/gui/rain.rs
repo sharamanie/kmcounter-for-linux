@@ -73,7 +73,11 @@ const ROW_WIDTH_MIN: f32 = 1.5;
 /// 用固定表而不是逐排累加，是为了让相邻两排**一眼就是两种颜色**：
 /// 累加出来的 0.70 / 0.85 都落在紫红一带，叠起来仍是一片粉，分不出前后。
 /// 0.55 ≈ 天青、0.80 ≈ 紫 —— 冷色段彼此距离够远，且不会撞上键格本身的热力青绿。
-const ROW_HUE_TABLE: [Option<f32>; 6] = [None, None, Some(0.55), Some(0.78), Some(0.13), Some(0.33)];
+/// 排号 → 色相表。**现在全部为 None：所有排同色。**
+///
+/// 用户要求：多排时只靠**宽度**区分层次就够了，换色反而花。
+/// 保留这个表而不是直接删掉 row_color，是为了以后想恢复换色时只改这里。
+const ROW_HUE_TABLE: [Option<f32>; 6] = [None, None, None, None, None, None];
 /// 换色排的最低饱和度：纯白没有色相，必须先给饱和度，否则色相原地旋转等于没变。
 const ROW_TINT_SAT: f32 = 0.88;
 /// 取样窗口（秒）。**故意给得远大于"走完一条轨道"**：
@@ -550,7 +554,7 @@ mod tests {
     /// 原因：ROW_ALPHA_TABLE 只有 5 项且第 5 项是 0，ROW_HUE_TABLE 也只有 5 项，
     /// 所以第 4 排（0 起算）之后根本不画。
     #[test]
-    fn all_six_rows_are_visible_and_colored() {
+    fn all_six_rows_are_visible_and_uniform() {
         for row in 0..6usize {
             assert!(
                 row_alpha_scale(row) > 0.0,
@@ -571,11 +575,18 @@ mod tests {
             );
             seen.push(format!("{:?}", (c.r(), c.g(), c.b())));
         }
-        // 至少要有 3 种不同颜色（基色 + 两个换色相），否则分不出层次
+        // **所有排同色**：层次只靠宽度与不透明度区分，不靠颜色。
+        //
+        // 改动前这里是「至少 3 种颜色」，靠换色相分层；用户觉得太花，
+        // 明确要求统一颜色。于是这条断言反过来 —— 必须是同一种颜色。
         seen.sort();
         seen.dedup();
-        println!("各排颜色: {:?}", seen);
-        assert!(seen.len() >= 3, "多排应至少有 3 种颜色区分层次，实际 {:?}", seen);
+        assert_eq!(
+            seen.len(),
+            1,
+            "所有排应同色（层次只靠宽度），实际出现 {:?}",
+            seen
+        );
     }
 
     /// 每排的宽度都得看得见（不能因为连乘变成 0 像素）。

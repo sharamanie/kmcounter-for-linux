@@ -739,14 +739,13 @@ fn paint_kps_meter(
     }
 }
 
-/// 分组 KPS 行：每个组一段「名字 值 KPS (次数)」，**画在数据胶囊内的第二行**。
+/// 分组 KPS 行：**格式与上方总 KPS 一致**，整行居中。
 ///
-/// 为什么放胶囊里：
-/// - 以前它画在胶囊下面，但高度又重复计入了总高，导致文字压在 KPS 图顶部（用户反馈）；
-/// - 跟数据行放在同一块胶囊里，看起来就是一个整体，不会像之前那样孤零零浮在图上。
+/// 显示的形如：`左手 12 KPS` —— 组名有就显示、没有就只显示 `12 KPS`。
+/// 以前会把「这一组包含哪些键」也打出来（`左手 A,S,D,F 12 KPS (340)`），
+/// 太啰嗦：键位在设置里写着，HUD 上不需要重复一遍。
 ///
-/// 参数 `pill_top` / `pill_h` 是胶囊自身的位置与高度；第二行就在胶囊内靠下的 `group_h` 那一条，
-/// 与第一行（当前/Max/平均）分开排。
+/// 颜色与总 KPS 同一套规则（见 kd.color）：分组名用灰色，数值用强调色。
 fn paint_kps_group_row(
     ui: &mut egui::Ui,
     content: Rect,
@@ -758,34 +757,61 @@ fn paint_kps_group_row(
     pill_h: f32,
     avail_w: f32,
 ) {
-    // 第二行的垂直中心：胶囊内的下半部分。
-    //
-    // 胶囊高度 = 第一行（font_cur*1.3）+ 分组行（group_h），
-    // 所以分组行的中心应在 胶囊顶 + 第一行高 + group_h/2。
-    // 之前用「胶囊底往上半个 group_h」，而 group_h 是 font_sub*2（比实际文字高一倍），
-    // 于是整行被推到了胶囊上半部，与第一行重叠。
     let first_h = (pill_h - m.group_h).max(0.0);
     let cy = pill_top + first_h + m.group_h * 0.5;
-    let mut x = content.left() + 8.0 * sc;
-    let right = content.left() + avail_w - 4.0 * sc;
-    for (i, g) in kd.groups.iter().enumerate() {
-        let label = format!("{} {} {} ({})", g.name, fmt_kps(g.kps, kd.method), s.kps_label, g.hits);
-        let galley = ui.painter().layout_no_wrap(
-            label,
+
+    // 先把每段排版出来，量出总宽，才能整体居中
+    let mut parts: Vec<(Option<std::sync::Arc<egui::Galley>>, std::sync::Arc<egui::Galley>)> =
+        Vec::new();
+    for g in kd.groups.iter() {
+        let name = g.name.trim();
+        let name_galley = if name.is_empty() {
+            None
+        } else {
+            Some(ui.painter().layout_no_wrap(
+                name.to_string(),
+                egui::FontId::proportional(m.font_sub),
+                HUD_TEXT,
+            ))
+        };
+        // 与上方总 KPS 同款：「12 KPS」
+        let val_galley = ui.painter().layout_no_wrap(
+            format!("{} {}", fmt_kps(g.kps, kd.method), s.kps_label),
             egui::FontId::proportional(m.font_sub),
-            HUD_TEXT,
+            kd.color,
         );
-        let w = galley.size().x;
-        // 放不下就不再往右排（组很多时按宽度截断，总高固定为一行）
-        if x + w > right && i > 0 {
-            break;
+        parts.push((name_galley, val_galley));
+    }
+
+    let sep = 10.0 * sc;
+    let mut total_w = 0.0f32;
+    for (n, v) in &parts {
+        if let Some(g) = n {
+            total_w += g.size().x + 4.0 * sc;
+        }
+        total_w += v.size().x;
+    }
+    total_w += sep * (parts.len().saturating_sub(1)) as f32;
+
+    let mut x = content.left() + (avail_w - total_w).max(0.0) * 0.5;
+    for (i, (n, v)) in parts.iter().enumerate() {
+        if let Some(g) = n {
+            ui.painter().galley(
+                Pos2::new(x, cy - g.size().y * 0.5),
+                g.clone(),
+                HUD_TEXT,
+            );
+            x += g.size().x + 4.0 * sc;
         }
         ui.painter().galley(
-            Pos2::new(x, cy - galley.size().y * 0.5),
-            galley,
-            if i == 0 { kd.color } else { HUD_TEXT },
+            Pos2::new(x, cy - v.size().y * 0.5),
+            v.clone(),
+            kd.color,
         );
-        x += w + 12.0 * sc;
+        x += v.size().x;
+        if i + 1 < parts.len() {
+            x += sep;
+        }
     }
 }
 
@@ -820,7 +846,18 @@ fn paint_kps_graph_area(
         .map(|v| v as f32)
         .collect();
     let graph_max = hist.iter().copied().fold(0.0f32, f32::max);
-    paint_kps_graph(ui, rect, &hist, kd.avg_kps as f32, kd.color);
+    // KPS 图**恒定一个颜色**，不随当前 KPS 变色。
+    //
+    // 以前传的是 kd.color（按 KPS 高低在绿/橙/红之间跳），于是"冲到 10 左右变橙、
+    // 掉下来又回绿"，整张图忽明忽暗，既干扰读图也让人以为图本身出了什么问题。
+    // 图的用途是看历史趋势，颜色应当是常量。
+    paint_kps_graph(
+        ui,
+        rect,
+        &hist,
+        kd.avg_kps as f32,
+        Color32::from_rgb(0x4F, 0xC3, 0xF7),
+    );
     let resp = ui.interact(rect, ui.id().with("kps_graph"), Sense::hover());
     resp.on_hover_text(format!(
         "{}: {} {} / {} s",
@@ -2364,7 +2401,11 @@ pub(crate) fn kps_hud_metrics(
     let box_h = 30.0 * s;
     let v_gap = 6.0 * s;
     let pitch = unit + gap;
-    let font_cur = 16.0 * s;
+    // 总 KPS 的字号：**比下面的分组行明显大**，一眼就能分出主次。
+    //
+    // 之前是 16，而分组行 9 —— 差得不够，两行看着像同级的两个数字。
+    // 提到 20 之后主次分明；分组行保持 9（再小就糊了）。
+    let font_cur = 20.0 * s;
     let font_sub = 9.0 * s;
 
     let rows = layout.rows.len().max(1);

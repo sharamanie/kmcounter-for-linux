@@ -296,6 +296,11 @@ pub struct KpsGroup {
 pub struct KpsGroupInfo {
     pub name: String,
     /// 组内累计击打次数
+    /// 该组的累计击打次数。
+    ///
+    /// **HUD 上不再显示它**（用户要求分组行格式与总 KPS 一致：只留「组名 12 KPS」），
+    /// 但保留在结构里：导出 / 分区统计都可能用到。
+    #[allow(dead_code)]
     pub hits: u64,
     /// 组内合计 KPS（按当前计算方式与统计窗口）
     pub kps: f64,
