@@ -280,14 +280,55 @@ fn trim_float(v: f32) -> String {
     s.to_string()
 }
 
-/// 解析一格。支持的写法：
+/// 解析「宽度 / 高度 / 间距」用的数值：支持小数与**分数**。
 ///
-/// - `H`            普通键，1 格宽 x 1 行高
-/// - `2J` / `2.5J`  宽 2 / 2.5 格
-/// - `2x2H`         宽 2 格、高 2 行（跨行只在本行写一次）
-/// - 空（两个逗号挨着） 空位，占 1 格
+/// - `1.5` / `0.5` —— 小数
+/// - `2/3` —— 分数（2 除以 3），用于 104 键盘 F 区那种「三个空隙均分 2 格」的场景
 ///
-/// 宽度与高度用 `x` 分隔；只写一个数字时是**宽度**（向后兼容 `1.5H`）。
+/// 为什么需要分数：104 键盘的 F 区里，Esc→F1、F4→F5、F8→F9 这三段空隙
+/// 在真实键盘上并不相等，但加起来正好 2 格。写 `0.6667` 会累积误差，
+/// 写 `2/3` 则是精确值。
+///
+/// 返回 (`消耗掉的字符数`, 数值)。解析失败返回 None。
+fn parse_number(s: &str) -> Option<(usize, f32)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut seen_dot = false;
+    let mut seen_slash = false;
+    while i < s.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_digit() {
+            i += 1;
+        } else if c == '.' && !seen_dot && !seen_slash {
+            seen_dot = true;
+            i += 1;
+        } else if c == '/' && !seen_slash {
+            seen_slash = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    let text = &s[..i];
+    let val = if let Some((a, b)) = text.split_once('/') {
+        let a: f32 = a.parse().ok()?;
+        let b: f32 = b.parse().ok()?;
+        if b <= 0.0 {
+            return None;
+        }
+        a / b
+    } else {
+        text.parse::<f32>().ok()?
+    };
+    if !val.is_finite() {
+        return None;
+    }
+    Some((i, val))
+}
+
 fn parse_kps_cell(item: &str) -> KpsKeyCell {
     let t = item.trim();
     if t.is_empty() {
@@ -304,13 +345,12 @@ fn parse_kps_cell(item: &str) -> KpsKeyCell {
     };
     let t = t.trim();
 
-    // **纯数字 = 间距**：F,0.5,G = F 与 G 之间留 0.5 格。
+    // **纯数字 / 纯分数 = 间距**：F,0.5,G 或 F,2/3,G
     //
     // 和「数字前缀 = 宽度」分开：0.5G 是「宽 0.5 格的 G」（有键名），
     // 而单独一个 0.5（没有键名）是「一道 0.5 格宽的缝」。
-    // 有键名就是宽度，没键名就是间距，不会互相歧义。
-    if let Ok(gap) = t.parse::<f32>() {
-        if gap.is_finite() && gap > 0.0 {
+    if let Some((used, gap)) = parse_number(t) {
+        if used == t.len() && gap > 0.0 {
             return KpsKeyCell {
                 name: String::new(),
                 width: gap.clamp(0.1, 12.0),
@@ -319,33 +359,25 @@ fn parse_kps_cell(item: &str) -> KpsKeyCell {
         }
     }
 
-    // 取出开头的数字段：2 或 2.5
-    let num_end = t
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(t.len());
-    if num_end > 0 && num_end < t.len() {
-        if let Ok(w) = t[..num_end].parse::<f32>() {
-            let rest = t[num_end..].trim_start();
-            // 形如 2x2H：rest 以 x 开头且后面还有数字
+    // 带键名：开头是数值（宽度），可选 `x` + 数值（高度）
+    if let Some((used, w)) = parse_number(t) {
+        if used < t.len() {
+            let rest = t[used..].trim_start();
+            // 形如 2x2H
             if let Some(after_x) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
-                let h_end = after_x
-                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-                    .unwrap_or(after_x.len());
-                if h_end > 0 {
-                    if let Ok(h) = after_x[..h_end].parse::<f32>() {
-                        let name = after_x[h_end..].trim_start().to_string();
-                        if !name.is_empty() {
-                            return KpsKeyCell {
-                                name,
-                                width: w.clamp(0.5, 12.0),
-                                height: h.clamp(1.0, 12.0),
-                            };
-                        }
+                if let Some((h_used, h)) = parse_number(after_x) {
+                    let name = after_x[h_used..].trim_start().to_string();
+                    if !name.is_empty() {
+                        return KpsKeyCell {
+                            name,
+                            width: w.clamp(0.5, 12.0),
+                            height: h.clamp(1.0, 12.0),
+                        };
                     }
                 }
             }
-            // 只有宽度：1.5H
-            if w.is_finite() && (0.5..=12.0).contains(&w) && !rest.is_empty() {
+            // 只有宽度：1.5H / 2/3G
+            if (0.1..=12.0).contains(&w) && !rest.is_empty() {
                 return KpsKeyCell {
                     name: rest.to_string(),
                     width: w,
@@ -888,6 +920,42 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// 分数写法的间距：F,2/3,G 表示留 2/3 格。
+    ///
+    /// 用于 104 键盘 F 区那种「三个空隙均分 2 格」的场景 ——
+    /// 写 0.6667 会累积误差，2/3 是精确值。
+    #[test]
+    fn fraction_gap_is_supported() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "F, 2/3, G".into();
+        let l = cfg.kps_key_layout();
+        let row = &l.rows[0];
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[1].name, "");
+        assert!((row[1].width - 2.0 / 3.0).abs() < 1e-6, "宽度应为 2/3，实际 {}", row[1].width);
+    }
+
+    /// 分数也能当宽度前缀：2/3G = 宽 2/3 格的 G。
+    #[test]
+    fn fraction_prefix_is_width() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "2/3G, H".into();
+        let l = cfg.kps_key_layout();
+        assert_eq!(l.rows[0][0].name, "G");
+        assert!((l.rows[0][0].width - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    /// 三段的 2/3 + 2/3 + 2/3 加起来正好 2 格（不留浮点残渣）。
+    #[test]
+    fn three_thirds_sum_to_two() {
+        let mut cfg = Config::default();
+        cfg.kps_keys = "A, 2/3, 2/3, 2/3, B".into();
+        let l = cfg.kps_key_layout();
+        let total: f32 = l.rows[0].iter().map(|c| c.width).sum();
+        assert!((total - 4.0).abs() < 1e-5, "A + 2格 + B = 4，实际 {total}");
+    }
+
+
     /// 纯数字项 = 间距：F,0.5,G 表示 F 与 G 之间留 0.5 格。
     #[test]
     fn bare_number_is_gap_between_keys() {

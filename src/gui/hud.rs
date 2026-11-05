@@ -2581,13 +2581,21 @@ pub(crate) fn key_rows_layout(
             // 行首写逗号 = 左边空一格，行尾写逗号 = 右边空一格。
             // 两边都补上就能让这一行顶格，而不需要我们在排版里猜。
             let row_w = box_w * u + gap * (u - 1.0);
-            let mut x = (content_w - row_w) * 0.5;
+            let x0 = (content_w - row_w) * 0.5;
             let mut out = Vec::with_capacity(r.len());
+            // **累积格数再乘格宽**，不要每格 `x += bw + gap` 逐次累加。
+            //
+            // 逐次累加会让浮点误差一路放大：一行 20 多个格子、格宽又是循环小数
+            // （如 44.0 除以 22），到行尾能差出零点几像素 —— 第一排看着"轻微错位"
+            // 就是这么来的。改成维护一个累计的 `units_before`（整数格数），
+            // 位置每次都由它一次性乘出来，误差不累积。
+            let mut units_before = 0.0f32;
             for c in r {
                 let w = c.width.max(0.1);
                 let bw = w * box_w + (w - 1.0).max(0.0) * gap;
+                let x = x0 + units_before * (box_w + gap);
                 out.push((x, bw));
-                x += bw + gap;
+                units_before += w;
             }
             out
         })
@@ -2966,6 +2974,37 @@ mod tests {
         assert!((inner - 6.8).abs() < 0.05, "两行缝宽要一致：{inner}");
         let right = 210.0 - (r2[1].0 + r2[1].1);
         assert!((r2[0].0 - right).abs() < 0.05, "窄行左右对称：{} vs {right}", r2[0].0);
+    }
+
+    /// **排版不能用累积误差**：22 格的行动到行尾时，位置必须正好等于
+    /// 起始 + i x (格宽 + 缝宽)，不能多一点少一点。
+    ///
+    /// 用户报「第一排加起来格数对，但看着轻微错位」，根因就是逐格累加
+    /// x += bw + gap 把浮点误差一路放大。
+    #[test]
+    fn row_layout_has_no_drift() {
+        let cells: Vec<_> = (0..22).map(|i| cell(&format!("K{i}"))).collect();
+        let rows = vec![cells];
+        let content_w = 1000.0f32;
+        let pos = key_rows_layout(&rows, 44.0, content_w);
+        let r = &pos[0];
+
+        let gap = r[1].0 - (r[0].0 + r[0].1);
+        for (i, (x, w)) in r.iter().enumerate() {
+            let expect = r[0].0 + i as f32 * (w + gap);
+            assert!(
+                (x - expect).abs() < 0.05,
+                "第 {i} 格位置应为 {expect}，实际 {x}（误差 {}）",
+                (x - expect).abs()
+            );
+        }
+
+        let last = r.last().unwrap();
+        assert!(
+            last.0 + last.1 <= content_w + 0.5,
+            "最后一格右边缘 {} 不应超过 {content_w}",
+            last.0 + last.1
+        );
     }
 
     /// 键格配色（对齐 osu-kps）：heat 管边框色相、press 管底板亮度
