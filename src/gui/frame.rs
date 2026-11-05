@@ -143,6 +143,7 @@ impl App {
 
     /// 托盘请求切换 HUD / APM / KPS，以及各悬浮窗（含它们自己的设置窗）的渲染。
     pub(crate) fn poll_hud_flags(&mut self, ctx: &egui::Context, s: &'static Strings) {
+
         // 托盘等跨线程请求切换 HUD / APM / KPS
         if self.flags.toggle_hud.swap(false, Ordering::Relaxed) || self.flags.toggle_apm_hud.swap(false, Ordering::Relaxed) {
             self.toggle_apm_hud();

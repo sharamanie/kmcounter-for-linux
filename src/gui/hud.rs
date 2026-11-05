@@ -88,8 +88,14 @@ impl App {
         log::info!("APM 悬浮窗 → {}", if self.hud_apm_show { "开" } else { "关" });
         // 关掉之前先把当前实际位置落盘（理由同 toggle_kps_hud）
         if turning_off {
+            // 理由同 toggle_kps_hud：KDE/Wayland 下只有 KWin 上报可用
             let seen = self.hud_apm_seen.lock().pos;
-            if let Some(pos) = seen {
+            #[cfg(target_os = "linux")]
+            let kwin_pos = crate::kwin::hud_pos_reports()[0].map(|r| r.pos);
+            #[cfg(not(target_os = "linux"))]
+            let kwin_pos: Option<(f32, f32)> = None;
+            let pos = seen.or(kwin_pos);
+            if let Some(pos) = pos {
                 log::info!("关闭 APM 前落盘位置: {:?}", pos);
                 self.save_hud_pos(true, pos);
             } else {
@@ -117,8 +123,18 @@ impl App {
         // 于是「拖完马上从托盘关掉」时，新位置根本没写进去，
         // 再打开就回到上一个记忆位置（用户反馈的就是这个）。
         if turning_off {
+            // 位置来源有两条，必须都试：
+            // - winit 能读位置的平台（X11 / Windows）→ seen.pos；
+            // - KDE/Wayland：winit **永远拿不到全局坐标**（seen 恒为 None），
+            //   只能用 KWin 监听脚本上报的位置。
+            //   上一版只读 seen，结果在 KDE 上每次都拿不到、修了等于没修。
             let seen = self.hud_kps_seen.lock().pos;
-            if let Some(pos) = seen {
+            #[cfg(target_os = "linux")]
+            let kwin_pos = crate::kwin::hud_pos_reports()[1].map(|r| r.pos);
+            #[cfg(not(target_os = "linux"))]
+            let kwin_pos: Option<(f32, f32)> = None;
+            let pos = seen.or(kwin_pos);
+            if let Some(pos) = pos {
                 log::info!("关闭 KPS 前落盘位置: {:?}", pos);
                 self.save_hud_pos(false, pos);
             } else {
@@ -130,6 +146,7 @@ impl App {
         cfg.hud_kps_show = self.hud_kps_show;
         let _ = cfg.save(&self.cfg_path);
         // 窗口关了：下次打开要重新恢复一次位置
+        log::info!("KPS 位置记忆现为 {:?}", self.cfg.kps_hud_pos);
         self.kps_pos = HudPosState::default();
         // 托盘菜单的 ✔ 跟着走
         self.push_hud_state();
@@ -1090,8 +1107,16 @@ impl App {
         if st.restored >= 3 {
             return;
         }
+        // KDE/Wayland：这里**不发** OuterPosition。
+        //
+        // Wayland 协议不允许客户端自己定位，winit 发出去也不会生效；
+        // 而 KDE 下位置已经由 KWin 监听脚本（place()）负责恢复。
+        // 两边同时下发会互相覆盖：程序发一次、KWin 拉一次，
+        // 日志里就是「KMCPLACE miss want=..,121 got=..,71」（差一个固定量）。
+        // 只在 winit 真能读位置的平台（seen 不为 None 的 X11 / Windows）才走这条。
+        let can_set_pos = seen.is_some();
         if let Some(p) = saved {
-            if seen.map_or(true, |cur| pos_dist(cur, p) > 1.0) {
+            if can_set_pos && seen.map_or(true, |cur| pos_dist(cur, p) > 1.0) {
                 ctx.send_viewport_cmd_to(
                     vp_id,
                     egui::ViewportCommand::OuterPosition(egui::pos2(p.0, p.1)),

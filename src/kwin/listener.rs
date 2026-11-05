@@ -56,6 +56,7 @@ pub fn hud_pos_reports() -> [Option<HudPosReport>; 2] {
 /// 主窗口被最小化的上报（KWin 脚本在拦截到最小化时置位；程序下一帧消费）
 static MAIN_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+
 /// 取走「主窗口被最小化过」的标记（消费式，取一次清一次）
 pub fn take_main_hidden() -> bool {
     MAIN_HIDDEN.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -207,7 +208,7 @@ function kmcHook(w) {{
     // 按「次数」重试会在窗口定型前耗尽（200% 缩放的大窗口实测就是没恢复成功）——所以改成**时间窗**：
     // 认领后 8 秒内只要窗口没在记忆位置就反复拉回；期间**不上报**（否则会把合成器的默认摆放
     // 写进位置记忆）。用户一旦拖动（started 信号）立即永久放行。
-    var st = {{ tag: null, dragging: false, userMoved: false, born: 0, lastWarn: 0 }};
+    var st = {{ tag: null, dragging: false, userMoved: false, born: 0, lastWarn: 0, placing: false, lastPlace: 0 }};
     function target() {{ return st.tag ? KMC_TARGET[st.tag] : null; }}
     // 恢复窗 30 秒：窗口 map 初始化期间 moveTo 可能被 KWin 的摆放流程吞掉，而脚本没有
     // setTimeout（实测 undefined），重试只能靠几何事件驱动 —— 窗后 KPS/APM 的数字宽度
@@ -227,16 +228,32 @@ function kmcHook(w) {{
         return [Math.max(a.x, Math.min(t[0], a.x + a.width - g.width)),
                 Math.max(a.y, Math.min(t[1], a.y + a.height - g.height))];
     }}
+    // 防回路：place() 自己移窗口会触发 frameGeometryChanged → onChanged → place()。
+    // 加上 KWin 在窗口 map 期间可能连续回调，曾在日志里看到
+    // "RangeError: Maximum call stack size exceeded"。这里用一个标记 + 最小间隔限制重入。
     function place() {{
         if (!st.tag || st.dragging || st.userMoved) return;
+        if (st.placing) return;
+        // 两次摆放至少隔 80ms：KWin 在 map 期间会密集发几何事件，
+        // 而每次摆放都会反过来再触发一次，不限制就成了随机深度递归。
+        var now = Date.now();
+        if (st.lastPlace && now - st.lastPlace < 80) return;
         var t = targetClamped();
-        if (!t || Date.now() - st.born > 30000 || kmcAt(w, t)) return;
-        kmcMoveTo(w, t[0], t[1]);
+        if (!t || now - st.born > 30000 || kmcAt(w, t)) return;
+        st.placing = true;
+        st.lastPlace = now;
+        try {{
+            kmcMoveTo(w, t[0], t[1]);
+        }} finally {{
+            st.placing = false;
+        }}
         // 诊断：moveTo 后仍未到位（节流 5s 一条）；配合程序侧 15s 落盘静默期，记忆不会损坏
         if (!kmcAt(w, t) && Date.now() - (st.lastWarn || 0) > 5000) {{
             st.lastWarn = Date.now();
             var g = w.frameGeometry;
-            print("KMCPLACE miss " + st.tag + " want=" + Math.round(t[0]) + "," + Math.round(t[1]) + " got=" + Math.round(g.x) + "," + Math.round(g.y));
+            print("KMCPLACE miss " + st.tag + " want=" + Math.round(t[0]) + "," + Math.round(t[1])
+                  + " got=" + Math.round(g.x) + "," + Math.round(g.y)
+                  + " size=" + Math.round(g.width) + "x" + Math.round(g.height));
         }}
     }}
     function report() {{
