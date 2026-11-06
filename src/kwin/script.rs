@@ -168,30 +168,55 @@ run();
     run_script("kmc-unkeep", &script);
 }
 
-/// 启动补刀：把「跳过任务栏 / Alt-Tab」直接设到本程序的所有窗口上（HUD 额外钉置顶）。
+/// 启动补刀：把「跳过任务栏 / Alt-Tab」直接设到本程序的所有窗口上（HUD 按配置钉置顶）。
 ///
 /// 为什么规则之外还需要它：KWin 规则在窗口 map 时套用，但启动时「写规则 + reconfigure」
 /// 与「eframe 创建窗口」并发 —— 窗口若赶在 KWin 重载完成前 map，这条规则就漏套了，
 /// 表现是任务栏从此常驻本程序条目（还有个副作用：任务栏条目找不到对应 .desktop 时，
 /// 会回退显示 exe 完整路径，中文目录被按 Latin-1 渲染成乱码）。规则照留（跨会话兜底），
 /// 这里在窗口起来后把属性直接钉上去，不依赖 reconfigure 时序。幂等，重复执行无害。
-pub fn enforce_skip_taskbar(on: bool) {
+pub fn enforce_skip_taskbar(skip: bool, hud_above: bool) {
     if !is_kde() {
         return;
     }
-    let ok = run_script("kmc-enforce", &enforce_js(on));
+    let ok = run_script("kmc-enforce", &enforce_js(skip, hud_above));
     if ok {
         log::debug!(
-            "已直接{}本程序窗口的「跳过任务栏/Alt-Tab」",
-            if on { "钉上" } else { "撤下" }
+            "已直接{}本程序窗口的「跳过任务栏/Alt-Tab」（HUD 置顶: {}）",
+            if skip { "钉上" } else { "撤下" },
+            hud_above
         );
     }
 }
 
+/// 运行时直接向正在运行的 HUD 窗口应用置顶属性（keepAbove）。
+pub fn apply_hud_above(above: bool) {
+    if !is_kde() {
+        return;
+    }
+    let js = format!(
+        r#"
+function run() {{
+    var wins = (typeof workspace.windowList === "function") ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < wins.length; i++) {{
+        var w = wins[i];
+        if (String(w.resourceClass).indexOf("kmcounter") >= 0) {{
+            if (String(w.caption).indexOf("KMC -") === 0) {{
+                w.keepAbove = {above};
+            }}
+        }}
+    }}
+}}
+run();
+"#
+    );
+    run_script("kmc-hud-above", &js);
+}
+
 /// 生成补刀脚本（抽出来便于测试断言内容）：
 /// 主窗口和 HUD（标题 "KMC - " 前缀）都设 skipTaskbar/skipSwitcher；
-/// HUD 的置顶也一并钉上 —— 它和跳任务栏写在同一条规则里，竞态漏一条就一起漏。
-fn enforce_js(on: bool) -> String {
+/// HUD 的置顶根据配置钉上或撤下。
+fn enforce_js(skip: bool, hud_above: bool) -> String {
     format!(
         r#"
 function run() {{
@@ -199,10 +224,10 @@ function run() {{
     for (var i = 0; i < wins.length; i++) {{
         var w = wins[i];
         if (String(w.resourceClass).indexOf("kmcounter") >= 0) {{
-            w.skipTaskbar = {on};
-            w.skipSwitcher = {on};
-            if (String(w.caption).indexOf("KMC -") === 0) {{ w.keepAbove = {on}; }}
-            print("KMC-ENFORCE|" + String(w.caption).substring(0, 24) + "|skipTB=" + w.skipTaskbar);
+            w.skipTaskbar = {skip};
+            w.skipSwitcher = {skip};
+            if (String(w.caption).indexOf("KMC -") === 0) {{ w.keepAbove = {hud_above}; }}
+            print("KMC-ENFORCE|" + String(w.caption).substring(0, 24) + "|skipTB=" + w.skipTaskbar + "|above=" + w.keepAbove);
         }}
     }}
 }}
@@ -279,7 +304,7 @@ fn main_window_scripts_exclude_huds() {
 /// 关闭时对称地全部撤下（先开后关时清掉残留）。不能碰 minimized/opacity 等其他状态。
 #[test]
 fn enforce_script_pins_all_windows_symmetrically() {
-    let on = enforce_js(true);
+    let on = enforce_js(true, true);
     assert!(on.contains(r#"w.skipTaskbar = true"#), "主窗口/HUD 都要钉上: {on}");
     assert!(on.contains(r#"w.skipSwitcher = true"#), "Alt-Tab 也要跳过: {on}");
     assert!(on.contains(r#"w.keepAbove = true"#), "HUD 置顶一起钉（同一条规则，竞态会一起漏）: {on}");
@@ -287,7 +312,11 @@ fn enforce_script_pins_all_windows_symmetrically() {
     assert!(!on.contains("minimized"), "不能碰最小化状态");
     assert!(!on.contains("opacity"), "不能碰透明度");
 
-    let off = enforce_js(false);
+    let on_no_above = enforce_js(true, false);
+    assert!(on_no_above.contains(r#"w.skipTaskbar = true"#));
+    assert!(on_no_above.contains(r#"w.keepAbove = false"#), "HUD 置顶关时即使跳任务栏开，keepAbove 也是 false: {on_no_above}");
+
+    let off = enforce_js(false, false);
     assert!(off.contains(r#"w.skipTaskbar = false"#), "关闭时对称撤下: {off}");
     assert!(off.contains(r#"w.keepAbove = false"#), "HUD 置顶也撤下: {off}");
 }

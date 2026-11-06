@@ -490,7 +490,7 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
                 // 幂等多试几次以覆盖 EGL 初始化耗时不同的启动。
                 for _ in 0..3 {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    kwin::enforce_skip_taskbar(skip);
+                    kwin::enforce_skip_taskbar(skip, hud_on_top);
                 }
             })
             .ok();

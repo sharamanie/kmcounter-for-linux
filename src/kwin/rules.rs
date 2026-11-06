@@ -71,21 +71,22 @@ pub fn set_hud_above_public(above: bool) {
         return;
     }
     let path = rules_path();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let new_text = set_hud_above(&text, above);
-    if new_text == text {
-        return;
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let new_text = set_hud_above(&text, above);
+        if new_text != text {
+            if let Err(e) = std::fs::write(&path, &new_text) {
+                log::error!("写入 HUD 置顶规则失败: {e}");
+            } else {
+                match reconfigure() {
+                    Ok(_) => log::info!("HUD 置顶规则已同步（always_on_top={above}）"),
+                    Err(e) => log::warn!("HUD 置顶规则已写入但 KWin 重载失败: {e}"),
+                }
+            }
+        }
     }
-    if let Err(e) = std::fs::write(&path, &new_text) {
-        log::error!("写入 HUD 置顶规则失败: {e}");
-        return;
-    }
-    match reconfigure() {
-        Ok(_) => log::info!("HUD 置顶规则已同步（always_on_top={above}）"),
-        Err(e) => log::warn!("HUD 置顶规则已写入但 KWin 重载失败: {e}"),
-    }
+    // 无论是新规则还是已有规则，立即向 KWin 运行中的悬浮窗下发 keepAbove 属性
+    super::script::apply_hud_above(above);
+    log::info!("HUD 置顶属性已下发（keepAbove={above}）");
 }
 
 /// 启用/停用「跳过任务栏 + 跳过 Alt-Tab」规则（幂等）。
@@ -104,14 +105,19 @@ pub fn set_skip_taskbar(enabled: bool, hud_above: bool) {
     let has_main = text.contains(MARKER);
     let has_hud = text.contains(HUD_MARKER);
     // 开关状态已对上，**且** HUD 规则里的 above 也已经是期望值时才能提前返回。
-    // 旧写法只看 has_main && has_hud，于是「两条规则都在、但 above 开关刚好变了」的情况
-    // 会直接 return，导致开关改了也不生效（实测真实发生过）。
-    let above_ok = text.contains(HUD_MARKER)
-        && (if hud_above {
-            text.contains("above=true") && text.contains("aboverule=2")
-        } else {
-            !text.contains("aboverule=")
-        });
+    // 必须在 HUD 规则自身的分组体内检查，避免被 SETTINGS_MARKER 的 aboverule 干扰。
+    let (_, groups) = split_ini(&text);
+    let hud_group = groups.iter().find(|(_, body)| body.contains(HUD_MARKER));
+    let above_ok = match hud_group {
+        Some((_, body)) => {
+            if hud_above {
+                body.contains("above=true") && body.contains("aboverule=2")
+            } else {
+                !body.contains("above=true") && !body.contains("aboverule=2")
+            }
+        }
+        None => false,
+    };
     let has_settings = text.contains(SETTINGS_MARKER);
     if enabled == (has_main && has_hud) && above_ok && (has_settings || !enabled) {
         return; // 已是目标状态

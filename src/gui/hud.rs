@@ -1887,11 +1887,13 @@ impl App {
                 .on_hover_text(s.kps_default_keys_hint)
                 .clicked()
             {
-                // 「默认键位」= 当前配列的**真实键盘布局**（多行 + 宽键倍数），
-                // 不是单行 join —— 否则点一下就把真实行布局拍平成“每行 21 个堆砌”。
-                // 这与切换配列时用的是同一个生成函数。
+                // 「默认键位」= 按当前键数匹配对应配列（60/64/68/75/87/98/104），
+                // 若键数未匹配特定配列则截取主配列前 N 个键的真实几何布局。
                 self.cfg.kps_keys =
-                    crate::config::Config::kps_keys_text_for_layout(&self.cfg.layout.keyboard_layout);
+                    crate::config::Config::kps_keys_text_for_layout_n(
+                        &self.cfg.layout.keyboard_layout,
+                        self.cfg.kps_key_count as usize,
+                    );
                 self.cfg.kps_key_count = self
                     .cfg
                     .kps_key_layout()

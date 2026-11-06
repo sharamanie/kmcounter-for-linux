@@ -530,10 +530,21 @@ impl Config {
     /// 「默认键位」按钮用它 —— 用户设了 87 键，点默认后仍是 87 键，
     /// 只是排成该配列的真实布局，而不是把键数改成整表长度。
     pub fn kps_keys_text_for_layout_n(layout_id: &str, n: usize) -> String {
-        // 若 n 恰好等于**某个配列的键数**，直接给那个配列的完整真实布局 ——
-        //
-        // 用户设 87 键就是想用 87 配列，硬截 98 配列的前 87 个只会剩个残尾
-        //（第 6 行只剩一个 LCtrl，完全不像键盘）。
+        // 若 n 对应某个常见配列的标称键数，直接给出该配列的完整真实几何布局：
+        // 60/61 -> Poker 60%; 75/84 -> 75%; 64/68/87/98/104 亦同。
+        let matched_layout = match n {
+            60 | 61 => Some("60"),
+            64 => Some("64"),
+            68 => Some("68"),
+            75 | 84 => Some("75"),
+            87 => Some("87"),
+            98 | 99 | 100 => Some("98"),
+            104 => Some("104"),
+            _ => None,
+        };
+        if let Some(id) = matched_layout {
+            return Self::kps_keys_text_for_layout(id);
+        }
         for id in ["104", "98", "87", "75", "68", "64", "60"] {
             let profile = crate::keys::layout_profile(id);
             if profile.keys.len() == n {
@@ -617,12 +628,13 @@ impl Config {
             .fold(0.0f64, f64::max);
 
         let mut lines: Vec<String> = Vec::with_capacity(rows.len());
-        for (_, list) in rows.iter() {
+        for (row_y, list) in rows.iter() {
             let mut items: Vec<String> = Vec::new();
             let mut prev_end: Option<f64> = None;
             for k in list.iter() {
                 let x = k.x as f64;
                 let w = k.w as f64;
+                let h = k.h as f64;
                 if let Some(pe) = prev_end {
                     let gap = x - pe;
                     if gap > 0.02 {
@@ -635,16 +647,32 @@ impl Config {
                     Some(l) => l.to_string(),
                     None => crate::keys::KEYS[k.idx].name.to_string(),
                 };
-                items.push(if (w - 1.0).abs() < 0.01 {
-                    name
+                if (h - 1.0).abs() > 0.01 {
+                    items.push(format!("{}x{}{}", trim_float(w as f32), trim_float(h as f32), name));
+                } else if (w - 1.0).abs() > 0.01 {
+                    items.push(format!("{}{}", trim_float(w as f32), name));
                 } else {
-                    format!("{}{}", trim_float(w as f32), name)
-                });
+                    items.push(name);
+                }
                 prev_end = Some(x + w);
             }
             let used = row_units(list);
-            if max_units - used > 0.02 {
-                items.push(fmt_gap(max_units - used));
+            let mut covered_end = used;
+            for (other_y, other_list) in rows.iter() {
+                if *other_y < *row_y {
+                    for ok in other_list.iter() {
+                        let k_bottom = (*other_y + ok.h) as f64;
+                        if ok.h > 1.0 && k_bottom > (*row_y as f64) + 0.1 {
+                            let k_end = (ok.x + ok.w) as f64;
+                            if k_end > covered_end {
+                                covered_end = k_end;
+                            }
+                        }
+                    }
+                }
+            }
+            if max_units - covered_end > 0.02 {
+                items.push(fmt_gap(max_units - covered_end));
             }
             lines.push(items.join(", "));
         }
@@ -721,32 +749,30 @@ impl Config {
             if ri + 1 >= rows.len() {
                 break;
             }
-            let mut col = 0usize;
+            let mut cell_x = 0.0f32;
             for cell in row.iter() {
-                let units = cell.width.max(0.1).ceil() as usize;
                 if cell.height > 1.0 {
                     for k in 1..(cell.height.round() as usize) {
-                        // 在 rows[ri + k] 的 col 位置插入空占位
                         if let Some(target) = rows.get_mut(ri + k) {
-                            if col <= target.len() {
-                                let blank = KpsKeyCell {
-                                    name: String::new(),
-                                    width: cell.width,
-                                    height: 1.0,
-                                };
-                                // 直接插在第 col 格。
-                                //
-                                // 跨行键占的就是「声明行那一列」的下方，
-                                // 所以层下行那一格本来就该是空的。
-                                // 不要去「跳过非空项」：那会跳到行尾，
-                                // 反而让后面的键错位。
-                                let at = col.min(target.len());
-                                target.insert(at, blank);
+                            let mut cur_x = 0.0f32;
+                            let mut insert_idx = target.len();
+                            for (idx, target_cell) in target.iter().enumerate() {
+                                if (cur_x - cell_x).abs() < 0.05 || cur_x > cell_x {
+                                    insert_idx = idx;
+                                    break;
+                                }
+                                cur_x += target_cell.width;
                             }
+                            let blank = KpsKeyCell {
+                                name: String::new(),
+                                width: cell.width,
+                                height: 1.0,
+                            };
+                            target.insert(insert_idx, blank);
                         }
                     }
                 }
-                col += units;
+                cell_x += cell.width;
             }
         }
 
@@ -811,7 +837,7 @@ impl Config {
         // ③ 没存过：按旧规则推导一份
         let cur = self.kps_key_layout().names();
         let result = if cur.is_empty() || self.kps_keys_is_default() {
-            Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, n).join(", ")
+            Self::kps_keys_text_for_layout_n(&self.layout.keyboard_layout, n)
         } else {
             let mut list: Vec<String> = cur.into_iter().take(n).collect();
             let used: std::collections::BTreeSet<String> =
@@ -1115,19 +1141,15 @@ mod tests {
         assert!(lines[2].starts_with("1.5Tab"), "Tab 应是 1.5 格宽：{}", lines[2]);
         assert!(lines[5].contains("6.25Space"), "Space 应是 6.25 格宽");
 
-        // 每行解析后格数必须一致（否则居中排版会错位）
-        let mut widths: Vec<f32> = Vec::new();
-        for line in &lines {
-            let mut total = 0.0f32;
-            for item in line.split(',') {
-                let t = item.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                total += parse_kps_cell(t).width;
-            }
-            widths.push(total);
-        }
+        // 每行经 kps_key_layout 解析（含跨行键自动插槽）后格数必须一致（否则居中排版会错位）
+        let mut cfg = Config::default();
+        cfg.kps_keys = text;
+        let layout = cfg.kps_key_layout();
+        let widths: Vec<f32> = layout
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.width).sum())
+            .collect();
         let first = widths[0];
         for (i, w) in widths.iter().enumerate() {
             assert!(
@@ -1672,5 +1694,43 @@ Z,X,C,V".into();
         // None 不落盘（老配置文件不出现空值键）
         let t2 = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!t2.contains("hud_pos"), "None 不该写进文件：\n{t2}");
+    }
+
+    /// 98 配列序列化为 KPS 键表：Backslash 宽 1.5，NumPlus / NumEnter 高 2.0，每行等宽。
+    #[test]
+    fn layout_98_kps_text_dimensions_and_alignment() {
+        let text = Config::kps_keys_text_for_layout("98");
+        assert!(text.contains("1.5Backslash"), "98 配列 Backslash 应为 1.5u，消除右侧空隙: {text}");
+        assert!(text.contains("1x2NumPlus"), "NumPlus 必须输出高度 2: {text}");
+        assert!(text.contains("1x2NumEnter"), "NumEnter 必须输出高度 2: {text}");
+
+        // 经 kps_key_layout 解析后，所有行宽度必须严格一致
+        let mut cfg = Config::default();
+        cfg.kps_keys = text;
+        let layout = cfg.kps_key_layout();
+        assert_eq!(layout.rows.len(), 6, "98 配列应是 6 行");
+        let widths: Vec<f32> = layout.rows.iter().map(|r| r.iter().map(|c| c.width).sum()).collect();
+        let first = widths[0];
+        for (i, w) in widths.iter().enumerate() {
+            assert!(
+                (w - first).abs() < 0.02,
+                "98 配列第 {} 行宽 {} 与第一行 {} 不一致",
+                i + 1,
+                w,
+                first
+            );
+        }
+    }
+
+    /// 设置 60 键并恢复默认键位时，按 60 配列加载而非跳回 98
+    #[test]
+    fn layout_n_matching_60_layout() {
+        let text_60 = Config::kps_keys_text_for_layout_n("98", 60);
+        let expected_60 = Config::kps_keys_text_for_layout("60");
+        assert_eq!(text_60, expected_60, "设为 60 键时必须加载 60 配列真实布局");
+        assert!(text_60.starts_with("Esc, D1, D2"), "60 配列以 Esc 开头: {text_60}");
+
+        let text_61 = Config::kps_keys_text_for_layout_n("98", 61);
+        assert_eq!(text_61, expected_60, "设为 61 键时亦匹配 60 配列");
     }
 }

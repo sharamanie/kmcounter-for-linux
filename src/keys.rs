@@ -958,7 +958,7 @@ pub static KEYS_98: &[LayoutKey] = &[
     lk(37, 10.5, 2.0, 1.0, 0),       // P
     lk(38, 11.5, 2.0, 1.0, 0),       // [
     lk(39, 12.5, 2.0, 1.0, 0),       // ]
-    lkh(40, 13.5, 2.0, 1.0, 1.0, 0), // Backslash（与 ] 同宽：1 格）
+    lkh(40, 13.5, 2.0, 1.5, 1.0, 0), // Backslash (1.5u)
     lk(88, 15.25, 2.0, 1.0, 1),      // Num7
     lk(89, 16.25, 2.0, 1.0, 1),      // Num8
     lk(90, 17.25, 2.0, 1.0, 1),      // Num9
@@ -1296,5 +1296,11 @@ mod tests {
         assert_eq!(layout_profile("68").hour_strip, HourStripPlacement::NavRow);
         assert_eq!(layout_profile("64").hour_strip, HourStripPlacement::NavRow);
         assert_eq!(layout_profile("60").hour_strip, HourStripPlacement::NavRow);
+
+        // 98 配列中的 Backslash 宽 1.5u，主键区右侧对齐到 15.0u，小键盘起始于 15.25u（间隙 0.25u）
+        let backslash_98 = KEYS_98.iter().find(|k| k.idx == 40).expect("98 应含 Backslash");
+        assert_eq!(backslash_98.w, 1.5);
+        assert_eq!(backslash_98.x, 13.5);
+        assert!((backslash_98.x + backslash_98.w - 15.0).abs() < 1e-5);
     }
 }
