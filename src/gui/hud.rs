@@ -595,12 +595,12 @@ fn settings_section(ui: &mut egui::Ui, title: &str) {
 /// 配列 id → 界面显示名（与主界面设置里的名称一致）。
 fn layout_label(id: &str, s: &'static Strings) -> &'static str {
     match id {
-        "98" => s.layout_98,
+        "98" | "99" | "100" => s.layout_98,
         "87" => s.layout_87,
-        "75" => s.layout_75,
+        "75" | "84" => s.layout_75,
         "68" => s.layout_68,
         "64" => s.layout_64,
-        "60" => s.layout_60,
+        "60" | "61" => s.layout_60,
         _ => s.layout_104,
     }
 }
@@ -1325,12 +1325,16 @@ impl App {
     /// 落盘：面板里的副本一起更新（别把新设置覆盖回去），再写回配置文件。
     fn persist_hud_cfg(&mut self) {
         copy_hud_fields(&self.cfg, &mut self.edit);
+        self.edit.layout.keyboard_layout = self.cfg.layout.keyboard_layout.clone();
         let mut cfg = self.cfg_shared.lock();
+        cfg.layout.keyboard_layout = self.cfg.layout.keyboard_layout.clone();
         cfg.hud_apm_show = self.cfg.hud_apm_show;
         cfg.hud_kps_show = self.cfg.hud_kps_show;
         cfg.apm_window_secs = self.cfg.apm_window_secs;
         cfg.kps_window_ms = self.cfg.kps_window_ms;
         cfg.kps_keys = self.cfg.kps_keys.clone();
+        cfg.kps_key_count = self.cfg.kps_key_count;
+        cfg.kps_keys_by_count = self.cfg.kps_keys_by_count.clone();
         cfg.kps_show_hits = self.cfg.kps_show_hits;
         cfg.kps_show_max = self.cfg.kps_show_max;
         cfg.kps_show_avg = self.cfg.kps_show_avg;
@@ -1794,9 +1798,17 @@ impl App {
         // 不用跑回主界面改。改完主界面的键盘图也会跟着变。
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(s.settings_kps_layout).color(HUD_TEXT));
-            let cur = self.cfg.layout.keyboard_layout.clone();
+            let cur = match self.cfg.layout.keyboard_layout.as_str() {
+                "98" | "99" | "100" => "98",
+                "87" => "87",
+                "75" | "84" => "75",
+                "68" => "68",
+                "64" => "64",
+                "60" | "61" => "60",
+                _ => "104",
+            };
             egui::ComboBox::from_id_salt("kps_layout")
-                .selected_text(layout_label(&cur, s))
+                .selected_text(layout_label(cur, s))
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     for (id, label) in [
@@ -1817,6 +1829,9 @@ impl App {
                             && cur != id
                         {
                             self.cfg.layout.keyboard_layout = id.to_string();
+                            self.edit.layout.keyboard_layout = id.to_string();
+                            self.cfg_shared.lock().layout.keyboard_layout = id.to_string();
+                            self.user_sized = false;
                             // 切换配列：键表重置为**该配列的真实键盘顺序**（取当前键数）。
                             //
                             // 不清空「按键数记忆」：用户自己改过的那套仍然在，
@@ -2842,6 +2857,7 @@ pub(crate) fn copy_hud_fields(from: &crate::config::Config, to: &mut crate::conf
     to.kps_auto_width = from.kps_auto_width;
     to.kps_method = from.kps_method.clone();
     to.kps_key_count = from.kps_key_count;
+    to.kps_keys_by_count = from.kps_keys_by_count.clone();
     to.kps_show_buttons = from.kps_show_buttons;
     to.kps_show_stats = from.kps_show_stats;
     to.kps_show_graph = from.kps_show_graph;
@@ -3147,6 +3163,31 @@ mod tests {
         // 窗口两个方向都比屏幕大 → 贴 (0,0)；只宽不高时 Y 保持不动
         assert_eq!(clamp_hud_pos((10.0, 10.0), (2200.0, 2000.0), mon), (0.0, 0.0), "窗口比屏大贴左上");
         assert_eq!(clamp_hud_pos((10.0, 10.0), (2200.0, 40.0), mon), (0.0, 10.0), "只比屏宽时 Y 不用动");
+    }
+
+    /// HUD 字段同步：copy_hud_fields 必须同步按键数记忆 kps_keys_by_count
+    #[test]
+    fn copy_hud_fields_preserves_keys_by_count() {
+        let mut from = crate::config::Config::default();
+        from.kps_keys_by_count.insert("84".into(), "Esc, F1".into());
+
+        let mut to = crate::config::Config::default();
+        copy_hud_fields(&from, &mut to);
+        assert_eq!(to.kps_keys_by_count.get("84"), Some(&"Esc, F1".to_string()));
+    }
+
+    /// layout_label 解析：标称别名与标准 ID 均正确映射到显示文本
+    #[test]
+    fn layout_label_resolves_all_variants() {
+        let s = crate::lang::strings(crate::lang::Lang::Zh);
+        assert_eq!(layout_label("75", s), s.layout_75);
+        assert_eq!(layout_label("84", s), s.layout_75);
+        assert_eq!(layout_label("60", s), s.layout_60);
+        assert_eq!(layout_label("61", s), s.layout_60);
+        assert_eq!(layout_label("98", s), s.layout_98);
+        assert_eq!(layout_label("99", s), s.layout_98);
+        assert_eq!(layout_label("100", s), s.layout_98);
+        assert_eq!(layout_label("104", s), s.layout_104);
     }
 }
 

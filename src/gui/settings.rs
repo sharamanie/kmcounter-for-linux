@@ -328,12 +328,12 @@ impl App {
             settings_label(ui, s.settings_keyboard_profile);
             let cur_layout = self.edit.layout.keyboard_layout.as_str();
             let cur_text = match cur_layout {
-                "98" => s.layout_98,
+                "98" | "99" | "100" => s.layout_98,
                 "87" => s.layout_87,
-                "75" => s.layout_75,
+                "75" | "84" => s.layout_75,
                 "68" => s.layout_68,
                 "64" => s.layout_64,
-                "60" => s.layout_60,
+                "60" | "61" => s.layout_60,
                 _ => s.layout_104,
             };
             egui::ComboBox::from_id_salt("keyboard_profile_combo")
