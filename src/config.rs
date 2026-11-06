@@ -41,9 +41,27 @@ pub const KPS_KEY_MAX: u8 = 104;
 
 /// 单行最多几个键（未显式写换行时的自动折行宽度）。
 ///
-/// 21 是 104 键盘的物理宽度：数字行与 Tab 行都是 21 个键（
-/// 含 Ins/Home/PgUp 与小键盘那一组）。取 21 才能把真实布局完整排下来。
-pub const KPS_ROW_MAX: usize = 21;
+/// 取 25 而不是 21：104 键盘数字行本身就有 21 个键，用户在键表里补了
+/// 分区间距（1/4）之后单个"项"会更多。留到 25 才不会把正常的真实布局
+/// 误判成"太长"而强行折行。
+pub const KPS_ROW_MAX: usize = 25;
+
+/// 104 配列在 HUD 里的**默认键表**（多行文本）。
+///
+/// 为什么不直接从 `KEYS_104` 的几何生成：用户按真实键盘手调过这版 ——
+/// 各功能区之间加了 1/4 格间隔（F 区/导航区/小键盘、方向键前后），
+/// 总长比纯几何多 0.5 格，观感上更接近实物键盘的"分区感"。
+/// 主界面键盘图仍走 `KEYS_104`，两处互不影响。
+///
+/// 改这里会影响：新用户默认、点「默认键位」、切换配列到 104。
+pub const DEFAULT_KPS_KEYS_104: &str = "\
+Esc, 2/3, F1, F2, F3, F4, 2/3, F5, F6, F7, F8, 2/3, F9, F10, F11, F12, 1/4, PrtScr, ScrollLock, Pause, 4.25
+Backquote, D1, D2, D3, D4, D5, D6, D7, D8, D9, D0, Minus, Equal, 2Backspace, 1/4, Insert, Home, PageUp, 1/4, NumLock, NumSlash, NumAsterisk, NumMinus
+1.5Tab, Q, W, E, R, T, Y, U, I, O, P, BracketL, BracketR, 1.5Backslash, 1/4, Delete, End, PageDown, 1/4, Num7, Num8, Num9, 1x2NumPlus
+1.75CapsLock, A, S, D, F, G, H, J, K, L, Semicolon, Quote, 2.25Enter, 3.5, Num4, Num5, Num6
+2.25LShift, Z, X, C, V, B, N, M, Comma, Period, Slash, 2.75RShift, 1.25, Up, 1.25, Num1, Num2, Num3, 1x2NumEnter
+1.25LCtrl, 1.25LWin, 1.25LAlt, 6.25Space, 1.25RAlt, 1.25RWin, 1.25Menu, 1.25RCtrl, 1/4, Left, Down, Right, 1/4, 2Num0, NumDot";
+
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -589,6 +607,11 @@ impl Config {
     }
 
     pub fn kps_keys_text_for_layout(layout_id: &str) -> String {
+        // 104 用用户手调的版本（含 1/4 分区间隔）——见 DEFAULT_KPS_KEYS_104 的说明。
+        // 其他配列仍从 GEOMETRY 生成。
+        if layout_id == "104" {
+            return DEFAULT_KPS_KEYS_104.to_string();
+        }
         let profile = crate::keys::layout_profile(layout_id);
 
         let mut rows: Vec<(f32, Vec<&crate::keys::LayoutKey>)> = Vec::new();
@@ -1089,6 +1112,10 @@ fn migrate_legacy(new: &Path, old: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+
+
+
     /// **键数等于某个配列时，默认键位应给该配列的完整布局**。
     ///
     /// 用户反馈：设 87 键、点「默认键位」后键数变成 98。
@@ -1364,12 +1391,16 @@ Z,X,C,V".into();
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows[3][0].width, 1.5, "写了倍数就按用户写的");
 
-        // 不写换行 → 每行最多 KPS_ROW_MAX (21) 个自动换行；纯数字项是数字键本身，不当倍数
+        // 不写换行 → 每行最多 KPS_ROW_MAX 个自动换行；纯数字项是数字键本身，不当倍数
+        //
+        // 这里**引用常量**而不是写死 21：阈值会随真实键盘布局调整（现为 25），
+        // 写死数字的测试每次改阈值都要跟着改一遍。
         cfg.kps_auto_width = false;
-        cfg.kps_keys = (0..26).map(|i| format!("K{i}")).collect::<Vec<_>>().join(", ");
+        let n = KPS_ROW_MAX + 5;
+        cfg.kps_keys = (0..n).map(|i| format!("K{i}")).collect::<Vec<_>>().join(", ");
         assert_eq!(
             cfg.kps_key_layout().rows.iter().map(|r| r.len()).collect::<Vec<_>>(),
-            vec![21, 5]
+            vec![KPS_ROW_MAX, 5]
         );
         cfg.kps_keys = "D1, D2, M1, 1.5H".into();
         let l = cfg.kps_key_layout();
