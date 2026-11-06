@@ -442,6 +442,16 @@ pub struct KpsTracker {
     graph_reset_at: Option<Instant>,
 }
 
+/// 某规范修饰键名（`shift` / `ctrl` / `alt`）下是否仍有任一侧物理键处于按住状态。
+fn any_canonical_side_held(held: &BTreeSet<String>, canon: &str) -> bool {
+    match canon {
+        "shift" => held.contains("lshift") || held.contains("rshift"),
+        "ctrl" => held.contains("lctrl") || held.contains("rctrl"),
+        "alt" => held.contains("lalt") || held.contains("ralt"),
+        _ => held.contains(canon),
+    }
+}
+
 impl KpsTracker {
     pub fn new(today: &str) -> Self {
         KpsTracker {
@@ -497,9 +507,11 @@ impl KpsTracker {
         if counted {
             self.actions.push_back(now);
             self.session_actions += 1;
-            if !canon.is_empty() {
-                let q = self.key_times.entry(canon.clone()).or_default();
-                q.push_back(now);
+            if !norm.is_empty() {
+                self.key_times.entry(norm.clone()).or_default().push_back(now);
+                if canon != norm {
+                    self.key_times.entry(canon.clone()).or_default().push_back(now);
+                }
             }
         }
         if !norm.is_empty() {
@@ -525,13 +537,17 @@ impl KpsTracker {
         let t = now.checked_sub(age).unwrap_or(now);
         let norm = normalize_kps_key(key_id);
         let canon = canonical_kps_key(&norm);
-        if !canon.is_empty() {
-            let q = self.key_times.entry(canon).or_default();
+        if !norm.is_empty() {
+            let q = self.key_times.entry(norm.clone()).or_default();
             let pos = q.iter().position(|x| *x > t).unwrap_or(q.len());
             q.insert(pos, t);
-        }
-        if !norm.is_empty() {
-            *self.key_hits.entry(norm).or_insert(0) += 1;
+            *self.key_hits.entry(norm.clone()).or_insert(0) += 1;
+            if canon != norm {
+                let cq = self.key_times.entry(canon.clone()).or_default();
+                let cpos = cq.iter().position(|x| *x > t).unwrap_or(cq.len());
+                cq.insert(cpos, t);
+                *self.key_hits.entry(canon).or_insert(0) += 1;
+            }
         }
         let pos = self.actions.iter().position(|x| *x > t).unwrap_or(self.actions.len());
         self.actions.insert(pos, t);
@@ -556,6 +572,12 @@ impl KpsTracker {
         self.key_times.clear();
         self.key_hits.clear();
         self.press_spans.clear();
+        // 按下/松开时刻也要清：query_keys 在没有任何时间轴信息时会退回用它算 glow，
+        // 不清就会出现「键格已被这一次 reset 清空、却仍有几个格子亮着」的残影
+        //（踩过：104 键全景图里 T/Y/U/A/S/D/Z/X/C 亮着，是上一个四排同按场景留下的）。
+        self.recent_presses.clear();
+        self.recent_releases.clear();
+        self.held.clear();
         self.graph_cache = None;
     }
 
@@ -568,6 +590,7 @@ impl KpsTracker {
         if norm.is_empty() {
             return;
         }
+        let canon = canonical_kps_key(&norm);
         let start = now
             .checked_sub(std::time::Duration::from_millis(start_age_ms))
             .unwrap_or(now);
@@ -576,9 +599,15 @@ impl KpsTracker {
                 .unwrap_or(now)
         });
         self.press_spans
-            .entry(norm)
+            .entry(norm.clone())
             .or_default()
             .push_back((start, end));
+        if canon != norm {
+            self.press_spans
+                .entry(canon)
+                .or_default()
+                .push_back((start, end));
+        }
     }
 
     pub fn set_held(&mut self, key_id: &str, down: bool) {
@@ -591,6 +620,7 @@ impl KpsTracker {
         let distinct = canon != norm;
         if down {
             let already_held = self.held.contains(&norm);
+            let canon_already_held = self.held.contains(&canon);
             self.held.insert(norm.clone());
             if distinct {
                 self.held.insert(canon.clone());
@@ -599,19 +629,14 @@ impl KpsTracker {
             // 否则连发的 (now, None) 在松手时只有一个能被闭合，前面的全成了永久未闭合的孤儿幽灵雨。
             if !already_held {
                 self.press_spans.entry(norm.clone()).or_default().push_back((now, None));
-                if distinct {
-                    self.press_spans.entry(canon).or_default().push_back((now, None));
-                }
+            }
+            if distinct && !canon_already_held {
+                self.press_spans.entry(canon).or_default().push_back((now, None));
             }
         } else {
-            // 松开：清「按住」并记下时刻（淡出起点）。
-            // 注：左右修饰键同时按住这类极端情况按「任一松开即灭」处理，与计次口径一致。
+            // 松开：先清具体键 norm，再看合并名 canon 下是否另一侧修饰键仍按着。
             self.held.remove(&norm);
             self.recent_releases.insert(norm.clone(), now);
-            if distinct {
-                self.held.remove(&canon);
-                self.recent_releases.insert(canon.clone(), now);
-            }
             // 键雨：闭合最近的未闭合区间（没有起点就忽略 —— 程序启动前就按着的键）
             if let Some(spans) = self.press_spans.get_mut(&norm) {
                 if let Some(last) = spans.back_mut() {
@@ -620,7 +645,9 @@ impl KpsTracker {
                     }
                 }
             }
-            if distinct {
+            if distinct && !any_canonical_side_held(&self.held, &canon) {
+                self.held.remove(&canon);
+                self.recent_releases.insert(canon.clone(), now);
                 if let Some(spans) = self.press_spans.get_mut(&canon) {
                     if let Some(last) = spans.back_mut() {
                         if last.1.is_none() {
@@ -639,19 +666,23 @@ impl KpsTracker {
         (self.calc_kps(&self.actions, now, window_ms), self.today_peak)
     }
 
-    /// 查询监控按键列表的当前状态（名称、命中次数、是否刚按下、该键自己的 KPS）
+    /// 查询监控按键列表的当前状态（名称、命中次数、是否刚按下、该键自己的 KPS）。
+    ///
+    /// 注意：写入侧（[`record`] / [`set_held`]）在收到 `LCtrl` 等具体修饰键时，已经同时写入了
+    /// `norm`（`"lctrl"`）与 `canon`（`"ctrl"`）两份记录。
+    /// 因此读取侧**只查 `norm`**：
+    /// - 键表写 `"LCtrl"` / `"RCtrl"` 时各查各的，绝不互串；
+    /// - 键表写合并名 `"Ctrl"` / `"Shift"` / `"Alt"` 时，`norm` 本身就是 `"ctrl"`，自动命中合并记录。
     pub fn query_keys(&self, keys: &[String], window_ms: u32) -> Vec<KpsKeyInfo> {
         let now = Instant::now();
         let active_duration = std::time::Duration::from_millis(130);
         keys.iter()
             .map(|k| {
                 let norm = normalize_kps_key(k);
-                let canon = canonical_kps_key(&norm);
                 let hits = self.key_hits.get(&norm).copied().unwrap_or(0);
-                // 按住中：输入层的按住 / 松开事件维护（长按保持点亮；含左右修饰键的规范名）
-                let held = self.held.contains(&norm) || self.held.contains(&canon);
+                let held = self.held.contains(&norm);
                 let empty = VecDeque::new();
-                let times = self.key_times.get(&canon).unwrap_or(&empty);
+                let times = self.key_times.get(&norm).unwrap_or(&empty);
                 // 发光（底板亮度）：按住期间保持满亮（对齐 osu-kps 的 down 状态）；
                 // 松开后沿 50→250ms 曲线渐近淡出（250ms 处约 80%）；没有松开信息时退回
                 // 「按下窗口内满亮」的近似
@@ -696,8 +727,7 @@ impl KpsTracker {
         keys.iter()
             .map(|k| {
                 let norm = normalize_kps_key(k);
-                let canon = canonical_kps_key(&norm);
-                let Some(times) = self.key_times.get(&canon) else {
+                let Some(times) = self.key_times.get(&norm) else {
                     return Vec::new();
                 };
                 // 队列按时间升序：从新往旧扫，超出窗口就停
@@ -723,6 +753,10 @@ impl KpsTracker {
     ///
     /// 区间按时间升序；整段都超出 `within` 的丢弃（已经飘出轨道）。
     /// 返回值与入参 `keys` 一一对应。
+    ///
+    /// 注意：同 [`Self::query_keys`]，这里只按 `norm` 查询，**不回退到 `canon`**：
+    /// 否则按 `LCtrl` 会写入 `"lctrl"` 与 `"ctrl"`，而未按过的 `RCtrl` 查不到 `"rctrl"`
+    /// 就会回退命中 `"ctrl"`，导致按 `LCtrl` 时 `RCtrl` 跟着下键雨。
     pub fn rain_spans(
         &self,
         keys: &[String],
@@ -733,13 +767,8 @@ impl KpsTracker {
         keys.iter()
             .map(|k| {
                 let norm = normalize_kps_key(k);
-                let canon = canonical_kps_key(&norm);
                 let empty = VecDeque::new();
-                let spans = self
-                    .press_spans
-                    .get(&norm)
-                    .or_else(|| self.press_spans.get(&canon))
-                    .unwrap_or(&empty);
+                let spans = self.press_spans.get(&norm).unwrap_or(&empty);
                 let mut out: Vec<(f64, f64)> = Vec::new();
                 for (start, end) in spans.iter().rev() {
                     if *start > now {
@@ -776,18 +805,30 @@ impl KpsTracker {
             .iter()
             .map(|g| {
                 let mut hits = 0u64;
-                // 组内键可能重复（LShift, Shift 规范化后同名）：按 canonical 名去重，
-                // 否则同一次击键会被算两遍
+                // 若组内同时写了合并名（如 "Shift"）和具体名（如 "LShift"），
+                // 以合并名为准去重，避免同一次击键被算两遍；
+                // 但若只写了 "LShift"，则只统计 "lshift" 自己的次数与速率，不把 "RShift" 混进来。
+                let norms: Vec<String> = g.keys.iter().map(|k| normalize_kps_key(k)).collect();
+                let has_canon: BTreeSet<String> = norms
+                    .iter()
+                    .filter(|n| canonical_kps_key(n) == **n)
+                    .cloned()
+                    .collect();
                 let mut seen: BTreeSet<String> = BTreeSet::new();
                 let mut v: Vec<Instant> = Vec::new();
-                for k in &g.keys {
-                    let norm = normalize_kps_key(k);
-                    let canon = canonical_kps_key(&norm);
-                    hits += self.key_hits.get(&norm).copied().unwrap_or(0);
-                    if !seen.insert(canon.clone()) {
+                for norm in norms {
+                    if norm.is_empty() {
                         continue;
                     }
-                    if let Some(times) = self.key_times.get(&canon) {
+                    let canon = canonical_kps_key(&norm);
+                    if canon != norm && has_canon.contains(&canon) {
+                        continue;
+                    }
+                    if !seen.insert(norm.clone()) {
+                        continue;
+                    }
+                    hits += self.key_hits.get(&norm).copied().unwrap_or(0);
+                    if let Some(times) = self.key_times.get(&norm) {
                         v.extend(times.iter().copied());
                     }
                 }
@@ -2198,4 +2239,47 @@ mod tests {
         let q = &t.query_keys(&["Shift".into()], 1000)[0];
         assert!(q.held, "LShift 按住应在 Shift 口径上可见");
     }
+
+    /// 回归测试：按住 LCtrl 时，RCtrl 绝不能跟着下键雨、发光或加单键 KPS；
+    /// 同时合并名 Ctrl 仍能收到 LCtrl 与 RCtrl 的按压与键雨。
+    #[test]
+    fn kps_left_right_modifiers_do_not_bleed_into_each_other() {
+        let mut t = KpsTracker::new("20261106");
+        let keys = vec!["LCtrl".to_string(), "RCtrl".to_string(), "Ctrl".to_string()];
+        t.set_monitored(&keys);
+        t.set_held("LCtrl", true);
+        t.record("20261106", "LCtrl", 1000);
+
+        let now = Instant::now();
+        let spans = t.rain_spans(&keys, std::time::Duration::from_secs(5), now);
+        assert_eq!(spans[0].len(), 1, "LCtrl 应有一条键雨区间");
+        assert!(spans[1].is_empty(), "按住 LCtrl 时 RCtrl 绝不能下键雨: {:?}", spans[1]);
+        assert_eq!(spans[2].len(), 1, "合并名 Ctrl 应收到 LCtrl 的键雨区间");
+
+        let info = t.query_keys(&keys, 1000);
+        // LCtrl
+        assert_eq!(info[0].hits, 1);
+        assert!(info[0].held);
+        assert_eq!(info[0].glow, 1.0);
+        assert_eq!(info[0].kps, 1.0);
+        // RCtrl 必须全部为 0 / false
+        assert_eq!(info[1].hits, 0);
+        assert!(!info[1].held, "按住 LCtrl 时 RCtrl 不应处于 held 状态");
+        assert_eq!(info[1].glow, 0.0, "按住 LCtrl 时 RCtrl 不应发光");
+        assert_eq!(info[1].kps, 0.0, "按住 LCtrl 时 RCtrl 的单键 KPS 应为 0");
+        // 合并名 Ctrl
+        assert_eq!(info[2].hits, 1);
+        assert!(info[2].held);
+        assert_eq!(info[2].glow, 1.0);
+        assert_eq!(info[2].kps, 1.0);
+
+        // 同时按住 RCtrl，再松开 LCtrl：LCtrl 应灭，RCtrl 与合并名 Ctrl 仍保持 held
+        t.set_held("RCtrl", true);
+        t.set_held("LCtrl", false);
+        let info2 = t.query_keys(&keys, 1000);
+        assert!(!info2[0].held, "LCtrl 松开后应不再 held");
+        assert!(info2[1].held, "RCtrl 仍按着");
+        assert!(info2[2].held, "RCtrl 仍按着时合并名 Ctrl 应保持 held");
+    }
 }
+

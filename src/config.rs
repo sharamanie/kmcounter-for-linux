@@ -707,11 +707,33 @@ impl Config {
         Self::default_kps_keys_for_layout("104", n)
     }
 
-    /// 当前键表是否还是"默认序列的前 N 个"（用户没自定义过）
+    /// 当前键表是否还是"默认序列的前 N 个"或标准配列的默认几何键表（用户没自定义过）
     pub fn kps_keys_is_default(&self) -> bool {
         let cur = self.kps_key_layout().names();
-        let want = Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, cur.len());
-        cur.iter().map(|s| s.to_lowercase()).eq(want.iter().map(|s| s.to_lowercase()))
+        let eq_ci = |want: &[String]| {
+            cur.len() == want.len()
+                && cur
+                    .iter()
+                    .zip(want.iter())
+                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        };
+        let want_flat = Self::default_kps_keys_for_layout(&self.layout.keyboard_layout, cur.len());
+        if eq_ci(&want_flat) {
+            return true;
+        }
+        let want_geo = Self::parse_names(&Self::kps_keys_text_for_layout_n(
+            &self.layout.keyboard_layout,
+            cur.len(),
+        ));
+        if eq_ci(&want_geo) {
+            return true;
+        }
+        for id in ["104", "98", "87", "75", "68", "64", "60"] {
+            if eq_ci(&Self::parse_names(&Self::kps_keys_text_for_layout(id))) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 解析「监控按键」为键格布局：
@@ -833,14 +855,15 @@ impl Config {
     /// - 自定义表（用户设置过键位）→ 保留前 N 个，不足的从默认序列补（跳过已经用过的）。
     pub fn resize_kps_keys(&mut self) {
         let n = (self.kps_key_count.clamp(1, KPS_KEY_MAX)) as usize;
-        // ① 先把**当前**键表存进「按键数记忆」。
+        // ① 先把**当前用户自定义过**的键表存进「按键数记忆」。
         //
         // 这一步必须在探索新键表之前：否则用户把 6 改成 12 时，
         // 第九个键起就被覆盖了，改回 6 也找不回原来那套。
-        // 这里必须用「上一份键表的键数」作 key：
-        // 用户把 6 改成 12 时，当前键表还是 6 键那份，直接用它的名字个数做 key。
+        // 注意：只记忆自定义键表（!kps_keys_is_default），否则拖动键数滑块经过的每个中间数字
+        // 都会把自动生成的表写进 kps_keys_by_count。
+        let is_def = self.kps_keys_is_default();
         let prev_names = self.kps_key_layout().names();
-        if !prev_names.is_empty() {
+        if !prev_names.is_empty() && !is_def {
             let cur = self.kps_keys.clone();
             if !cur.trim().is_empty() {
                 self.kps_keys_by_count.insert(prev_names.len().to_string(), cur);
@@ -858,8 +881,8 @@ impl Config {
         }
 
         // ③ 没存过：按旧规则推导一份
-        let cur = self.kps_key_layout().names();
-        let result = if cur.is_empty() || self.kps_keys_is_default() {
+        let cur = prev_names;
+        let result = if cur.is_empty() || is_def {
             Self::kps_keys_text_for_layout_n(&self.layout.keyboard_layout, n)
         } else {
             let mut list: Vec<String> = cur.into_iter().take(n).collect();
@@ -879,17 +902,21 @@ impl Config {
         self.kps_key_count = n as u8;
     }
 
-    /// 从键表字符串里取出真实键名（去掉空位 / 宽度前缀）。
+    /// 从键表字符串里取出真实键名（支持多行、宽高前缀 `1x2NumPlus` 与分数留白 `2/3`）。
     fn parse_names(keys: &str) -> Vec<String> {
-        keys.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                // 宽度前缀："1.5H" / "4X" → 取后面的键名
-                let t = s.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
-                if t.is_empty() { s.to_string() } else { t.to_string() }
-            })
-            .collect()
+        let mut names = Vec::new();
+        for line in keys.split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            for item in line.split(',') {
+                let cell = parse_kps_cell(item);
+                if !cell.name.is_empty() {
+                    names.push(cell.name);
+                }
+            }
+        }
+        names
     }
 
     pub fn load(path: &Path) -> (Config, bool) {
@@ -944,11 +971,7 @@ impl Config {
     }
 
     pub fn kps_key_list(&self) -> Vec<String> {
-        let list: Vec<String> = self.kps_keys
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let list = self.kps_key_layout().names();
         if list.is_empty() {
             vec!["Z".into(), "X".into(), "M1".into(), "M2".into()]
         } else {
@@ -1763,5 +1786,34 @@ Z,X,C,V".into();
 
         let text_61 = Config::kps_keys_text_for_layout_n("98", 61);
         assert_eq!(text_61, expected_60, "设为 61 键时亦匹配 60 配列");
+    }
+
+    /// 多行默认配列应被 `kps_keys_is_default` 识别为默认键表，且在修改键数时保持多行几何结构、不污染 `kps_keys_by_count`。
+    #[test]
+    fn multiline_default_layouts_recognized_and_resized_cleanly() {
+        for id in ["104", "98", "87", "75", "68", "64", "60"] {
+            let mut cfg = Config::default();
+            cfg.layout.keyboard_layout = id.into();
+            cfg.kps_keys = Config::kps_keys_text_for_layout(id);
+            assert!(
+                cfg.kps_keys_is_default(),
+                "{id} 配列的多行默认键表应被识别为默认"
+            );
+        }
+        let mut cfg = Config::default();
+        cfg.layout.keyboard_layout = "98".into();
+        cfg.kps_keys = Config::kps_keys_text_for_layout("98");
+        cfg.kps_key_count = 60;
+        cfg.resize_kps_keys();
+        assert_eq!(
+            cfg.kps_keys,
+            Config::kps_keys_text_for_layout("60"),
+            "从 98 默认键表改键数到 60 应切到 60 多行配列而非压扁成单行"
+        );
+        assert!(
+            cfg.kps_keys_by_count.is_empty(),
+            "默认键表切键数不应污染 kps_keys_by_count: {:?}",
+            cfg.kps_keys_by_count
+        );
     }
 }

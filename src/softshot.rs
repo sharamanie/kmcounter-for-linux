@@ -2676,8 +2676,10 @@ mod tests {
         // 这个场景顺带把分组 KPS 也打开：分组行现在是数据胶囊的第二行，
         // 得有图才看得出它没压到下面的 KPS 图。
         let mut boot = Config::default();
-        boot.kps_keys = "Esc, 2/3, F1, F2, F3, F4, 2/3, F5, F6, F7, F8, 2/3, F9, F10, F11, F12, PrtScr, ScrollLock, Pause, 4\nBackquote, D1, D2, D3, D4, D5, D6, D7, D8, D9, D0, Minus, Equal, 2Backspace, Insert, Home, PageUp, NumLock, NumSlash, NumAsterisk, NumMinus\n1.5Tab, Q, W, E, R, T, Y, U, I, O, P, BracketL, BracketR, 1.5Backslash, Delete, End, PageDown, Num7, Num8, Num9, 1x2NumPlus\n1.75CapsLock, A, S, D, F, G, H, J, K, L, Semicolon, Quote, 2.25Enter, 3, Num4, Num5, Num6, 1\n2.25LShift, Z, X, C, V, B, N, M, Comma, Period, Slash, 2.75RShift, 1, Up, 1, Num1, Num2, Num3, 1x2NumEnter\n1.25LCtrl, 1.25LWin, 1.25LAlt, 6.25Space, 1.25RAlt, 1.25RWin, 1.25Menu, 1.25RCtrl, Left, Down, Right, 2Num0, NumDot, 1".into();
-        boot.kps_key_count = 104;
+        // README 的并排表格里 104 键全景缩到一行宽会把字糊成一片，
+        // 所以主图仍是 4 键特写，全景另出一张 kps-hud-full（见本函数末尾）。
+        boot.kps_keys = "Q, W, E, R".into();
+        boot.kps_key_count = 4;
         boot.kps_show_groups = true;
         boot.kps_groups = "左手=A,S,D,F\n右手=J,K,L".to_string();
         let (mut app, ctx) = headless_app_with_cfg(store_with_days(5), boot);
@@ -2883,6 +2885,22 @@ mod tests {
             assert!(p5.exists());
         }
         app.debug_set_kps_keys("Q, W, E, R");
+
+        // 5) 104 键全景：用户看到的真实默认外观（键雨 + KPS 图同开）。
+        //    与上面几张不并排，README 里单独占一行，宽度不受表格挤压。
+        app.debug_set_kps_keys(crate::config::DEFAULT_KPS_KEYS_104);
+        app.debug_set_kps_rain(true, true, 1200);
+        let p6 = capture(
+            &mut app,
+            &ctx,
+            &mut shot_textures,
+            "kps-hud-full",
+            true,
+            &feed_scene,
+            false,
+            &hud_spec,
+        );
+        assert!(p6.exists());
 
         // —— 再拍一张 APM 胶囊条特写（宽度贴合内容）——
         app.hud_kps_show = false;

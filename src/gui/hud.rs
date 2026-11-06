@@ -1915,6 +1915,9 @@ impl App {
             {
                 // 「默认键位」= 按当前键数匹配对应配列（60/64/68/75/87/98/104），
                 // 若键数未匹配特定配列则截取主配列前 N 个键的真实几何布局。
+                // 同时清掉该键数在 kps_keys_by_count 里的旧自定义记忆，避免切键数再切回时旧自定义覆盖默认键位。
+                let prev_count_key = self.cfg.kps_key_count.to_string();
+                self.cfg.kps_keys_by_count.remove(&prev_count_key);
                 self.cfg.kps_keys =
                     crate::config::Config::kps_keys_text_for_layout_n(
                         &self.cfg.layout.keyboard_layout,
@@ -1927,6 +1930,8 @@ impl App {
                     .len()
                     .clamp(1, crate::config::KPS_KEY_MAX as usize)
                     as u8;
+                let new_count_key = self.cfg.kps_key_count.to_string();
+                self.cfg.kps_keys_by_count.remove(&new_count_key);
                 act.dirty = true;
             }
         });
@@ -1990,6 +1995,9 @@ impl App {
             if captured.len() >= need {
                 self.cfg.kps_keys = captured.into_iter().take(need).collect::<Vec<_>>().join(", ");
                 self.cfg.kps_key_count = need as u8;
+                self.cfg
+                    .kps_keys_by_count
+                    .insert(need.to_string(), self.cfg.kps_keys.clone());
                 act.dirty = true;
                 act.cancel_capture = true;
             }
@@ -2907,6 +2915,16 @@ pub(crate) fn hud_bg_color(rgb: (u8, u8, u8), opacity: u8) -> Color32 {
 /// 改用独立前缀后，设置窗不再匹配 HUD 规则，自己有一条只管它的规则。
 pub(crate) const SETTINGS_TITLE_PREFIX: &str = "KMC# ";
 
+fn dark_settings_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    v.override_text_color = Some(HUD_TEXT);
+    v.widgets.inactive.fg_stroke.color = Color32::from_rgb(0xF0, 0xF2, 0xF8);
+    v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+    v.widgets.active.fg_stroke.color = Color32::WHITE;
+    v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0xE0, 0xE4, 0xEC);
+    v
+}
+
 pub(crate) fn settings_shell(
     cfg_ctx: &egui::Context,
     icon: &str,
@@ -2916,6 +2934,14 @@ pub(crate) fn settings_shell(
     body: impl FnOnce(&mut egui::Ui),
 ) -> bool {
     let mut close = false;
+    // 在渲染设置窗期间，将 cfg_ctx 的全局 Visuals 临时切为深色高对比白字，
+    // 渲染结束后立即恢复。原因：egui 的 ComboBox / menu_button / color_edit_button_srgb /
+    // on_hover_text 弹出层内部用 Area::show(ctx, ...) 创建顶层 Area，其文字颜色继承自
+    // ctx.style() 而非外层 ui.style()。若不临时切换 ctx.visuals，弹出层会拿到
+    // Frame::popup(ui.style()) 的深黑底板 + ctx.style()（主窗口浅色主题）的暗灰文字。
+    let prev_visuals = cfg_ctx.style().visuals.clone();
+    let dark_vis = dark_settings_visuals();
+    cfg_ctx.set_visuals(dark_vis.clone());
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
@@ -2925,21 +2951,7 @@ pub(crate) fn settings_shell(
                 .rounding(8.0),
         )
         .show(cfg_ctx, |ui| {
-            // 这整块是深色面板，但程序全局是浅色主题（主窗口用浅色）。
-            // 不在这里把本 ui 的视觉切成深色的话，DragValue / ComboBox / 按钮会按浅色主题
-            // 画成近乎白的浅灰底，而文字又被统一成白色 —— 白字浅底几乎看不见（用户反馈过两次）。
-            // ui 级的 style 是 Arc 局部覆盖，不会漏到主窗口。
-            // 同时必须将未激活控件（包含 SelectableLabel / ComboBox 选项文本）的前景设为高亮白字，
-            // 彻底杜绝深色底板上未选中项字体呈暗灰色看不清的问题。
-            {
-                let v = ui.visuals_mut();
-                *v = egui::Visuals::dark();
-                v.override_text_color = Some(HUD_TEXT);
-                v.widgets.inactive.fg_stroke.color = Color32::from_rgb(0xF0, 0xF2, 0xF8);
-                v.widgets.hovered.fg_stroke.color = Color32::WHITE;
-                v.widgets.active.fg_stroke.color = Color32::WHITE;
-                v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0xE0, 0xE4, 0xEC);
-            }
+            *ui.visuals_mut() = dark_vis;
             // 标题行：左段可拖动（Wayland 下无边框窗口只能靠这招移动），右端是关闭按钮。
             // 两者用互不重叠的矩形交互，避免"点关闭却拖动了窗口"。
             let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
@@ -2986,6 +2998,7 @@ pub(crate) fn settings_shell(
                     body(ui);
                 });
         });
+    cfg_ctx.set_visuals(prev_visuals);
     // Esc 也能关掉设置窗口
     if cfg_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;

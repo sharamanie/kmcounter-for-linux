@@ -36,9 +36,13 @@
 | --- | --- |
 | ![键雨与 KPS 图](docs/screenshot-kps-rain-both.png) | ![APM 胶囊条](docs/screenshot-apm-hud.png) |
 
-两排键同时按住时的分排效果（第一排保持原宽原色，第二排起逐排变窄变淡）：
+多排键同时按住时的分排效果——几排共用同一条轨道，靠**宽度收窄 + 不透明度递升**区分层级（越靠后的排越窄越实，一眼能数出压着几排）：
 
 ![键雨分排](docs/screenshot-kps-rain-rows.png)
+
+按默认的 104 配列铺满整块键盘时是下面这样（键雨与 KPS 图同开）：
+
+![KPS 悬浮窗全景](docs/screenshot-kps-hud-full.png)
 
 ## 功能
 

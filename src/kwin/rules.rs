@@ -63,7 +63,9 @@ fn hud_rule_body(above: bool) -> String {
     )
 }
 
-/// 运行时切换 HUD 始终置顶（设置面板里改开关时调用，立即生效）。
+static LAST_APPLIED_ABOVE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// 运行时切换 HUD 始终置顶（设置面板里改开关时调用，立即生效；幂等，值未变时不重复下发 D-Bus 脚本）。
 ///
 /// 只动已有 HUD 规则的 above 两行，不新建规则（那是 set_skip_taskbar 的职责）。
 pub fn set_hud_above_public(above: bool) {
@@ -71,9 +73,11 @@ pub fn set_hud_above_public(above: bool) {
         return;
     }
     let path = rules_path();
+    let mut rule_changed = false;
     if let Ok(text) = std::fs::read_to_string(&path) {
         let new_text = set_hud_above(&text, above);
         if new_text != text {
+            rule_changed = true;
             if let Err(e) = std::fs::write(&path, &new_text) {
                 log::error!("写入 HUD 置顶规则失败: {e}");
             } else {
@@ -84,6 +88,12 @@ pub fn set_hud_above_public(above: bool) {
             }
         }
     }
+    let mut last = LAST_APPLIED_ABOVE.lock().unwrap_or_else(|e| e.into_inner());
+    if !rule_changed && *last == Some(above) {
+        return;
+    }
+    *last = Some(above);
+    drop(last);
     // 无论是新规则还是已有规则，立即向 KWin 运行中的悬浮窗下发 keepAbove 属性
     super::script::apply_hud_above(above);
     log::info!("HUD 置顶属性已下发（keepAbove={above}）");

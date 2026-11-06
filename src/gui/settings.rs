@@ -468,6 +468,23 @@ impl App {
         let layout_changed = self.cfg.layout.keyboard_layout != self.edit.layout.keyboard_layout;
         let apm_window_changed = self.cfg.apm_window_secs != self.edit.apm_window_secs;
         let kps_window_changed = self.cfg.kps_window_ms != self.edit.kps_window_ms;
+        // 主窗口设置里切换了「键盘配列」：若 KPS 键表当前仍是某个标准配列的整套默认布局，
+        // 一并切到新配列的键表，保持主窗口键盘图与 KPS 悬浮窗一致。
+        if layout_changed
+            && ["104", "98", "87", "75", "68", "64", "60"]
+                .iter()
+                .any(|id| self.cfg.kps_keys.trim() == crate::config::Config::kps_keys_text_for_layout(id).trim())
+        {
+            self.cfg.kps_keys =
+                crate::config::Config::kps_keys_text_for_layout(&self.edit.layout.keyboard_layout);
+            self.cfg.kps_key_count = self
+                .cfg
+                .kps_key_layout()
+                .names()
+                .len()
+                .clamp(1, crate::config::KPS_KEY_MAX as usize)
+                as u8;
+        }
         self.persist_settings();
         self.apply_saved_settings(apm_window_changed, kps_window_changed);
         if layout_changed {
