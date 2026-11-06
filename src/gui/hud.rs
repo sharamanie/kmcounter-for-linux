@@ -573,7 +573,7 @@ fn hud_check(ui: &mut egui::Ui, value: &mut bool, label: &'static str, act: &mut
 fn settings_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), Sense::hover());
-    let color = Color32::from_rgb(0x8F, 0x9C, 0xB4);
+    let color = Color32::from_rgb(0xB0, 0xC0, 0xDC);
     let galley = ui.painter().layout_no_wrap(
         title.to_string(),
         egui::FontId::proportional(11.0),
@@ -1700,24 +1700,30 @@ impl App {
         cur: crate::stats::KpsMethod,
         act: &mut HudCfgActions,
     ) {
-        // 注意：ComboBox 的弹出层是 egui 浅色主题的白底，
-        // 这里千万别套 HUD_TEXT（白字白底＝看不见，踩过）
+        // 下拉弹出层在深色设置窗下为深色背景（#1E1E1E）。
+        // 未选中项必须显式使用高对比度亮白字（#F0F2F8），严禁使用暗灰字；
+        // 选中项不套死颜色，保留 egui 高亮选中背景搭配的选中文本色。
+        let text_hard = if cur == crate::stats::KpsMethod::Hard {
+            egui::RichText::new(s.kps_method_hard)
+        } else {
+            egui::RichText::new(s.kps_method_hard).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))
+        };
         if ui
-            .selectable_label(
-                cur == crate::stats::KpsMethod::Hard,
-                egui::RichText::new(s.kps_method_hard),
-            )
+            .selectable_label(cur == crate::stats::KpsMethod::Hard, text_hard)
             .on_hover_text(s.kps_method_hard_hint)
             .clicked()
         {
             self.cfg.kps_method = crate::stats::KpsMethod::Hard.as_config().to_string();
             act.dirty = true;
         }
+
+        let text_sens = if cur == crate::stats::KpsMethod::Sensitive {
+            egui::RichText::new(s.kps_method_sensitive)
+        } else {
+            egui::RichText::new(s.kps_method_sensitive).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))
+        };
         if ui
-            .selectable_label(
-                cur == crate::stats::KpsMethod::Sensitive,
-                egui::RichText::new(s.kps_method_sensitive),
-            )
+            .selectable_label(cur == crate::stats::KpsMethod::Sensitive, text_sens)
             .on_hover_text(s.kps_method_sensitive_hint)
             .clicked()
         {
@@ -1802,7 +1808,12 @@ impl App {
                         ("64", s.layout_64),
                         ("60", s.layout_60),
                     ] {
-                        if ui.selectable_label(cur == id, egui::RichText::new(label)).clicked()
+                        let text = if cur == id {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))
+                        };
+                        if ui.selectable_label(cur == id, text).clicked()
                             && cur != id
                         {
                             self.cfg.layout.keyboard_layout = id.to_string();
@@ -1909,23 +1920,22 @@ impl App {
     /// 重置菜单（由底栏用 right_to_left 布局贴到行右端）。
     fn kps_settings_reset_menu(&mut self, ui: &mut egui::Ui, s: &'static Strings, act: &mut HudCfgActions) {
         ui.menu_button(s.kps_reset, |ui| {
-            // 菜单是浅色弹出层：用主题默认深色字（不要 HUD_TEXT，白字白底看不见）
-            ui.label(egui::RichText::new(s.kps_reset_hint));
+            ui.label(egui::RichText::new(s.kps_reset_hint).color(Color32::from_rgb(0xDD, 0xDD, 0xEE)));
             ui.separator();
-            if ui.button(s.kps_reset_counts).clicked() {
+            if ui.button(egui::RichText::new(s.kps_reset_counts).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))).clicked() {
                 act.reset_counts = true;
                 ui.close_menu();
             }
-            if ui.button(s.kps_reset_peak).clicked() {
+            if ui.button(egui::RichText::new(s.kps_reset_peak).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))).clicked() {
                 act.reset_peak = true;
                 ui.close_menu();
             }
-            if ui.button(s.kps_reset_graph).clicked() {
+            if ui.button(egui::RichText::new(s.kps_reset_graph).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))).clicked() {
                 act.reset_graph = true;
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button(s.kps_reset_all).clicked() {
+            if ui.button(egui::RichText::new(s.kps_reset_all).color(Color32::from_rgb(0xF0, 0xF2, 0xF8))).clicked() {
                 act.reset_all = true;
                 ui.close_menu();
             }
@@ -2903,10 +2913,16 @@ pub(crate) fn settings_shell(
             // 不在这里把本 ui 的视觉切成深色的话，DragValue / ComboBox / 按钮会按浅色主题
             // 画成近乎白的浅灰底，而文字又被统一成白色 —— 白字浅底几乎看不见（用户反馈过两次）。
             // ui 级的 style 是 Arc 局部覆盖，不会漏到主窗口。
+            // 同时必须将未激活控件（包含 SelectableLabel / ComboBox 选项文本）的前景设为高亮白字，
+            // 彻底杜绝深色底板上未选中项字体呈暗灰色看不清的问题。
             {
                 let v = ui.visuals_mut();
                 *v = egui::Visuals::dark();
                 v.override_text_color = Some(HUD_TEXT);
+                v.widgets.inactive.fg_stroke.color = Color32::from_rgb(0xF0, 0xF2, 0xF8);
+                v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+                v.widgets.active.fg_stroke.color = Color32::WHITE;
+                v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0xE0, 0xE4, 0xEC);
             }
             // 标题行：左段可拖动（Wayland 下无边框窗口只能靠这招移动），右端是关闭按钮。
             // 两者用互不重叠的矩形交互，避免"点关闭却拖动了窗口"。
