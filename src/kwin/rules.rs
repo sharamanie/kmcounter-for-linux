@@ -520,15 +520,6 @@ mod tests {
         assert!(out.contains(MARKER));
     }
 
-    /// HUD 规则：强制置顶（Wayland 下 winit 的 always_on_top 是空实现）+ 标题子串匹配；
-    /// 主窗口规则不能被带上置顶；删除时两条规则一起走、别人的规则保留
-    #[test]
-    /// **关掉「始终置顶」时，规则里的 above 两行必须真的没了。
-    ///
-    /// 用户反馈：取消置顶后 HUD 仍然一直在最上层。
-    /// 原因：Wayland 下 winit 的 with_always_on_top() 是空实现，置顶完全靠 KWin 规则
-    /// 里写死的 above=true；光改 winit 层没用。
-    #[test]
     /// **设置窗规则必须存在且与 HUD 规则分开。**
     ///
     /// 用户反馈：固定 HUD 后，HUD 设置窗被压在 HUD 下面、点不到。
@@ -581,6 +572,12 @@ mod tests {
         );
     }
 
+    /// **关掉「始终置顶」时，规则里的 above 两行必须真的没了。
+    ///
+    /// 用户反馈：取消置顶后 HUD 仍然一直在最上层。
+    /// 原因：Wayland 下 winit 的 with_always_on_top() 是空实现，置顶完全靠 KWin 规则
+    /// 里写死的 above=true；光改 winit 层没用。
+    #[test]
     fn hud_above_toggles_in_rule() {
         let with_main = add_rule("");
         // 默认开：规则里有 above
@@ -647,6 +644,9 @@ mod tests {
         assert_eq!(set_hud_above(text, false), text);
     }
 
+    /// HUD 规则：强制置顶（Wayland 下 winit 的 always_on_top 是空实现）+ 标题子串匹配；
+    /// 主窗口规则不能被带上置顶；删除时两条规则一起走、别人的规则保留
+    #[test]
     fn hud_rule_forces_above_and_is_removed_together() {
         let with_main = add_rule(SAMPLE);
         let both = add_hud_rule(&with_main, true);

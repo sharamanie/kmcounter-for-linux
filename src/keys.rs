@@ -1155,7 +1155,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// **60 / 64 配列的第一颗键必须是真正的 Esc**（KEYS[0]）。
     ///
     /// 曾经的 bug：那里写的是 `lko(13, ..., "Esc")` —— idx=13 是 Backquote，
@@ -1175,6 +1174,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn lookup_works() {
         assert_eq!(idx_by_win_sc(57), Some(KEYS.iter().position(|k| k.name == "Space").unwrap()));
         assert_eq!(idx_by_lin_code(57), idx_by_win_sc(57));

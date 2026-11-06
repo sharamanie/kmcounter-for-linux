@@ -1255,8 +1255,6 @@ mod tests {
         assert!((l.rows[0][0].height - 1.0).abs() < 1e-3, "高度应保持 1");
     }
 
-    /// 键格布局语法：换行=分行、逗号后无空格也行、空项=空位、数字前缀=宽度倍数、自适应键宽平分最后一行
-    #[test]
     /// 自适应键宽必须作用于**每一行**，而不只是最后一行。
     ///
     /// 用户反馈：多行布局时上面几行还是 1 格宽、只有最后一行被撑满，
@@ -1301,18 +1299,20 @@ Z,X,C,V".into();
         assert!((sum0 - layout.cols).abs() < 1e-3, "第一行应平分到 {}，实际 {sum0}", layout.cols);
     }
 
+    /// 键格布局语法：换行=分行、逗号后无空格也行、空项=空位、数字前缀=宽度倍数、自适应键宽平分最后一行
+    #[test]
     fn kps_key_layout_parses_rows_blanks_and_widths() {
         let mut cfg = Config::default();
         // 用户写的四行
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\nH,J".into();
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows.len(), 4, "四行：{l:?}");
         assert_eq!(l.rows.iter().map(|r| r.len()).collect::<Vec<_>>(), vec![5, 5, 5, 2]);
-        assert_eq!(l.names().len(), 17, "共 17 个键（行尾逗号不算空位）");
+        assert_eq!(l.names().len(), 17, "共 17 个键");
         assert_eq!(l.cols, 5.0, "最宽一行 5 格");
 
         // 空项 = 空位：把 H、J 挪到第 3、4 列
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n,,H,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\n,,H,J".into();
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows[3][0].name, "");
         assert_eq!(l.rows[3][1].name, "");
@@ -1322,43 +1322,39 @@ Z,X,C,V".into();
         assert_eq!(l.cols, 5.0, "空位也占宽度");
 
         // 宽度倍数：1.5H / 4H
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n1.5H,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\n1.5H,J".into();
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows[3][0].width, 1.5);
         assert_eq!(l.rows[3][0].name, "H");
         assert_eq!(l.rows[3][1].width, 1.0);
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n4H,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\n4H,J".into();
         assert_eq!(cfg.kps_key_layout().rows[3][0].width, 4.0);
 
         // 自适应键宽（可开启）：最后一行平分整行 → H、J 各 2.5 格
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\nH,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\nH,J".into();
         cfg.kps_auto_width = true;
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows[3][0].width, 2.5);
-        assert_eq!(l.rows[3][1].width, 2.5);
+        assert_eq!(l.rows[3][0].width, 2.5);
         assert_eq!(l.rows[0][0].width, 1.0, "其它行不受影响");
         // 该行自己写过倍数时不干预
-        cfg.kps_keys = "E,R,Q,W,T,\nY,U,I,O,P,\nA,S,D,F,G,\n1.5H,J".into();
+        cfg.kps_keys = "E,R,Q,W,T\nY,U,I,O,P\nA,S,D,F,G\n1.5H,J".into();
         let l = cfg.kps_key_layout();
         assert_eq!(l.rows[3][0].width, 1.5, "写了倍数就按用户写的");
 
-        // 不写换行 → 每行最多 12 个自动换行；纯数字项是数字键本身，不当倍数
+        // 不写换行 → 每行最多 KPS_ROW_MAX (21) 个自动换行；纯数字项是数字键本身，不当倍数
         cfg.kps_auto_width = false;
         cfg.kps_keys = (0..26).map(|i| format!("K{i}")).collect::<Vec<_>>().join(", ");
         assert_eq!(
             cfg.kps_key_layout().rows.iter().map(|r| r.len()).collect::<Vec<_>>(),
-            vec![12, 12, 2]
+            vec![21, 5]
         );
-        cfg.kps_keys = "1, 2, M1, 1.5H".into();
+        cfg.kps_keys = "D1, D2, M1, 1.5H".into();
         let l = cfg.kps_key_layout();
-        assert_eq!(l.names(), vec!["1", "2", "M1", "H"]);
+        assert_eq!(l.names(), vec!["D1", "D2", "M1", "H"]);
         assert_eq!(l.rows[0][3].width, 1.5);
     }
 
-    /// 键数与默认键位：默认表按 QWERTY 序列重排（6 键 = Q..Y）；自定义表保留并补齐（跳过已用过的键）
-    #[test]
-    /// **按键数记忆键表**：6 改 12 再改回 6，要能找回原来那套键位。
-    #[test]
     /// 默认键序是**按键盘物理顺序从第一排到最后一排**。
     #[test]
     fn default_keys_follow_keyboard_order() {
@@ -1392,8 +1388,6 @@ Z,X,C,V".into();
         assert_eq!(names, vec!["A", ",", "B"], "写 《 也应被当成逗号键");
     }
 
-    /// 上限应与键盘图里的键数一致。
-    #[test]
     /// 默认键序应**跟随配列**：不同配列的起始键都是 Esc、F1…，
     /// 但键数上限与具体键集不同。
     #[test]
@@ -1432,8 +1426,6 @@ Z,X,C,V".into();
         );
     }
 
-    #[test]
-    
     /// 迁移后应该能写成多行字符串并读回。
     #[test]
     fn migration_roundtrip() {
@@ -1445,8 +1437,7 @@ Z,X,C,V".into();
         c.migrate_flat_kps_keys();
         assert!(
             c.kps_keys.contains('\n'),
-            "迁移后应是多行，实际
-{}",
+            "迁移后应是多行，实际\n{}",
             c.kps_keys
         );
         assert_eq!(c.kps_keys.lines().count(), 6, "应是 6 行");
@@ -1458,6 +1449,8 @@ Z,X,C,V".into();
         assert_eq!(back.kps_keys, c.kps_keys, "读回后键表应一致");
     }
 
+    /// 上限应与键盘图里的键数一致。
+    #[test]
     fn key_max_matches_keyboard_model() {
         assert_eq!(
             KPS_KEY_MAX as usize,
@@ -1466,6 +1459,7 @@ Z,X,C,V".into();
         );
     }
 
+    #[test]
     fn key_count_memory_roundtrip() {
         let mut cfg = Config::default();
         // 起点：6 键的自定义键位
@@ -1503,13 +1497,18 @@ Z,X,C,V".into();
         assert!(cfg.kps_key_count <= KPS_KEY_MAX);
     }
 
+    #[test]
     fn kps_key_count_rewrites_default_table() {
         let mut cfg = Config::default();
-        assert_eq!(cfg.kps_keys, "Q, W, E, R", "默认键位是 QWERTY 前 4 个");
+        cfg.kps_keys = Config::default_kps_keys_for_layout("104", 4).join(", ");
         assert!(cfg.kps_keys_is_default());
         cfg.kps_key_count = 6;
         cfg.resize_kps_keys();
-        assert_eq!(cfg.kps_keys, "Q, W, E, R, T, Y", "默认表按新数量重排（6 键 = q..y）");
+        assert_eq!(
+            cfg.kps_keys,
+            Config::default_kps_keys_for_layout("104", 6).join(", "),
+            "默认表按新数量重排（按配列物理顺序）"
+        );
 
         cfg.kps_keys = "Z, X, M1, M2".into();
         cfg.kps_key_count = 6;
@@ -1634,8 +1633,6 @@ Z,X,C,V".into();
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// 悬浮窗位置记忆：配置可来回序列化，None 不写进文件
-    #[test]
     /// 新增的两个开关默认值：固定位置**默认关**、始终置顶**默认开**。
     #[test]
     fn hud_lock_and_on_top_defaults() {
@@ -1651,14 +1648,15 @@ Z,X,C,V".into();
         c.hud_lock_pos = true;
         c.hud_always_on_top = false;
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("hud_lock_pos"), "要写进配置
-{text}");
+        assert!(text.contains("hud_lock_pos"), "要写进配置\n{text}");
         assert!(text.contains("hud_always_on_top"));
         let back: Config = toml::from_str(&text).unwrap();
         assert!(back.hud_lock_pos);
         assert!(!back.hud_always_on_top);
     }
 
+    /// 悬浮窗位置记忆：配置可来回序列化，None 不写进文件
+    #[test]
     fn hud_pos_config_roundtrip() {
         let mut c = Config::default();
         assert_eq!(c.apm_hud_pos, None);

@@ -2409,7 +2409,7 @@ pub(crate) fn kps_hud_metrics(
     let font_sub = 9.0 * s;
 
     let rows = layout.rows.len().max(1);
-    let keys_w = if cfg.kps_show_buttons {
+    let keys_w = if cfg.kps_show_buttons || cfg.kps_show_rain {
         layout
             .rows
             .iter()

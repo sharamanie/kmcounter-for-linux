@@ -588,28 +588,44 @@ impl KpsTracker {
             return;
         }
         let canon = canonical_kps_key(&norm);
+        let distinct = canon != norm;
         if down {
+            let already_held = self.held.contains(&norm);
             self.held.insert(norm.clone());
-            if canon != norm {
-                self.held.insert(canon);
+            if distinct {
+                self.held.insert(canon.clone());
             }
-            // 键雨：开一段新按压区间（None = 还按着；连发 down 幂等，只是多一段零长区间，无害）
-            self.press_spans.entry(norm).or_default().push_back((now, None));
+            // 键雨：若已处于按住中（如 Windows 下自动重复发送 WM_KEYDOWN），不重复开启新区间！
+            // 否则连发的 (now, None) 在松手时只有一个能被闭合，前面的全成了永久未闭合的孤儿幽灵雨。
+            if !already_held {
+                self.press_spans.entry(norm.clone()).or_default().push_back((now, None));
+                if distinct {
+                    self.press_spans.entry(canon).or_default().push_back((now, None));
+                }
+            }
         } else {
             // 松开：清「按住」并记下时刻（淡出起点）。
             // 注：左右修饰键同时按住这类极端情况按「任一松开即灭」处理，与计次口径一致。
-            let distinct = canon != norm;
             self.held.remove(&norm);
             self.recent_releases.insert(norm.clone(), now);
             if distinct {
                 self.held.remove(&canon);
-                self.recent_releases.insert(canon, now);
+                self.recent_releases.insert(canon.clone(), now);
             }
             // 键雨：闭合最近的未闭合区间（没有起点就忽略 —— 程序启动前就按着的键）
             if let Some(spans) = self.press_spans.get_mut(&norm) {
                 if let Some(last) = spans.back_mut() {
                     if last.1.is_none() {
                         last.1 = Some(now);
+                    }
+                }
+            }
+            if distinct {
+                if let Some(spans) = self.press_spans.get_mut(&canon) {
+                    if let Some(last) = spans.back_mut() {
+                        if last.1.is_none() {
+                            last.1 = Some(now);
+                        }
                     }
                 }
             }
@@ -888,7 +904,8 @@ impl KpsTracker {
                     .filter(|e| now.saturating_duration_since(*e) > keep)
                     .is_some()
                     && now.saturating_duration_since(start) > keep;
-                if done {
+                let stale_orphan = end.is_none() && now.saturating_duration_since(start) > keep.saturating_mul(5);
+                if done || stale_orphan {
                     q.pop_front();
                 } else {
                     break;
@@ -1551,10 +1568,6 @@ mod tests {
             infos.iter().map(|i| i.kps).collect::<Vec<_>>()
         );
     }
-    /// 同一颗物理键的各种字符形态都必须归一到同一个内部名。
-    ///
-    /// 用户原话：「, 和《和< 这三个代表逗号，。和》和> 一样，其他类似 & * ) 【 [ { 这种也一样」
-    #[test]
     /// **方向键 Left / Right 不能被当成鼠标左右键。**
     ///
     /// 曾经把 "left" / "right" 归一到 m1/m2，而键盘上方向键的内部名
@@ -1574,6 +1587,10 @@ mod tests {
         assert_eq!(normalize_kps_key("RButton"), "m2");
     }
 
+    /// 同一颗物理键的各种字符形态都必须归一到同一个内部名。
+    ///
+    /// 用户原话：「, 和《和< 这三个代表逗号，。和》和> 一样，其他类似 & * ) 【 [ { 这种也一样」
+    #[test]
     fn same_physical_key_many_spellings() {
         let groups: &[(&str, &[&str])] = &[
             ("bracketl", &["[", "{", "【", "｛", "BracketL"]),
@@ -1616,7 +1633,49 @@ mod tests {
                 assert_eq!(normalize_kps_key(sp), want, "写法 {sp:?} 应归一为 {want}");
             }
         }
-        // 未识别名字原样返回
+    }
+
+    /// Windows 下按住不放会频繁重发 WM_KEYDOWN（连发 down: true）：
+    /// 只能有 1 个开着的按压区间，不能积攒出几十个无法闭合的孤儿幽灵雨。
+    #[test]
+    fn autorepeat_does_not_spawn_multiple_open_spans() {
+        let mut tracker = KpsTracker::new("20261106");
+        // 模拟长按：连续收到 10 次按下事件
+        for _ in 0..10 {
+            tracker.set_held("A", true);
+        }
+        let spans = tracker.press_spans.get("a").expect("应有 a 的记录");
+        assert_eq!(spans.len(), 1, "自动重复不应反复开启新区间，实际 len={}", spans.len());
+        assert!(spans[0].1.is_none(), "长按中应保持未闭合状态");
+
+        // 一次抬起事件：该区间必须闭合
+        tracker.set_held("A", false);
+        let spans = tracker.press_spans.get("a").unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].1.is_some(), "抬起后该区间必须正确闭合");
+    }
+
+    /// 用户在 KPS 配置里写通用修饰键（"Shift" / "Ctrl" / "Alt"）时，
+    /// 按下 LShift/LCtrl 也必须能查到雨条区间。
+    #[test]
+    fn rain_spans_supports_generic_modifier_names() {
+        let mut tracker = KpsTracker::new("20261106");
+        tracker.set_held("LShift", true);
+        let now = Instant::now();
+        let query_keys = vec!["Shift".to_string(), "LCtrl".to_string()];
+        let res = tracker.rain_spans(&query_keys, std::time::Duration::from_secs(10), now);
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].len(), 1, "查询 Shift 应能拿到 LShift 的雨条区间");
+        assert_eq!(res[0][0].1, 0.0, "长按中 end_age 应为 0.0");
+        assert!(res[1].is_empty(), "未按下的 LCtrl 区间应为空");
+
+        tracker.set_held("LShift", false);
+        let res_after = tracker.rain_spans(&query_keys, std::time::Duration::from_secs(10), now);
+        assert_eq!(res_after[0].len(), 1);
+    }
+
+    #[test]
+    fn unmapped_key_name_normalized_to_lowercase() {
         assert_eq!(normalize_kps_key("F5"), "f5");
     }
     use super::*;

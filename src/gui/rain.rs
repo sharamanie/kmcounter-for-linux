@@ -239,9 +239,6 @@ pub(crate) fn paint_kps_rain(
         // 第一排刻意压得比实心淡（0.35）—— 多排是叠在同一条竖线上的，
         // 第一排若已是实心白，中心永远饱和，后面的排无论换色还是调 alpha 都看不出来。
         let alpha_scale = row_alpha_scale(row);
-        if alpha_scale <= 0.0 {
-            continue; // 表外的排彻底透明，连几何都不必算
-        }
         let step = ROW_WIDTH_STEP.powi(row as i32);
         let row_base = row_color(base, row);
         for (cell_idx, cell) in cells.iter().enumerate() {
@@ -261,6 +258,10 @@ pub(crate) fn paint_kps_rain(
             }
             let idx = info_idx;
             info_idx += 1;
+            if alpha_scale <= 0.0 {
+                // 表外的排彻底透明，不绘制几何，但在上面已严格对齐并消耗 info_idx
+                continue;
+            }
             let Some(spans) = kd.rain.get(idx) else {
                 continue;
             };
