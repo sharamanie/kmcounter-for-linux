@@ -1897,8 +1897,12 @@ impl App {
                 )
                 .changed()
             {
+                let old_layout = self.cfg.layout.keyboard_layout.clone();
                 self.cfg.kps_key_count = count.clamp(1, crate::config::KPS_KEY_MAX as i32) as u8;
                 self.cfg.resize_kps_keys();
+                if self.cfg.layout.keyboard_layout != old_layout {
+                    self.user_sized = false;
+                }
                 act.dirty = true;
             }
             if ui
@@ -1914,10 +1918,19 @@ impl App {
                 .clicked()
             {
                 // 「默认键位」= 按当前键数匹配对应配列（60/64/68/75/87/98/104），
-                // 若键数未匹配特定配列则截取主配列前 N 个键的真实几何布局。
+                // 若键数匹配标准配列则连同「配列」下拉框一起自动切换过去；
+                // 若未匹配特定配列则截取主配列前 N 个键的真实几何布局。
                 // 同时清掉该键数在 kps_keys_by_count 里的旧自定义记忆，避免切键数再切回时旧自定义覆盖默认键位。
                 let prev_count_key = self.cfg.kps_key_count.to_string();
                 self.cfg.kps_keys_by_count.remove(&prev_count_key);
+                if let Some(id) =
+                    crate::config::Config::layout_id_for_key_count(self.cfg.kps_key_count as usize)
+                {
+                    if self.cfg.layout.keyboard_layout != id {
+                        self.cfg.layout.keyboard_layout = id.to_string();
+                        self.user_sized = false;
+                    }
+                }
                 self.cfg.kps_keys =
                     crate::config::Config::kps_keys_text_for_layout_n(
                         &self.cfg.layout.keyboard_layout,

@@ -547,10 +547,10 @@ impl Config {
     /// 与 `kps_keys_text_for_layout` 的区别只有一个：到第 n 个键就停。
     /// 「默认键位」按钮用它 —— 用户设了 87 键，点默认后仍是 87 键，
     /// 只是排成该配列的真实布局，而不是把键数改成整表长度。
-    pub fn kps_keys_text_for_layout_n(layout_id: &str, n: usize) -> String {
-        // 若 n 对应某个常见配列的标称键数，直接给出该配列的完整真实几何布局：
-        // 60/61 -> Poker 60%; 75/84 -> 75%; 64/68/87/98/104 亦同。
-        let matched_layout = match n {
+    /// 若键数 `n` 对应某个常见配列的标称键数或实际键数，返回该配列 ID：
+    /// `60/61 -> "60"`、`64 -> "64"`、`68 -> "68"`、`75/84 -> "75"`、`87 -> "87"`、`98/99/100 -> "98"`、`104 -> "104"`。
+    pub fn layout_id_for_key_count(n: usize) -> Option<&'static str> {
+        match n {
             60 | 61 => Some("60"),
             64 => Some("64"),
             68 => Some("68"),
@@ -558,16 +558,20 @@ impl Config {
             87 => Some("87"),
             98 | 99 | 100 => Some("98"),
             104 => Some("104"),
-            _ => None,
-        };
-        if let Some(id) = matched_layout {
-            return Self::kps_keys_text_for_layout(id);
-        }
-        for id in ["104", "98", "87", "75", "68", "64", "60"] {
-            let profile = crate::keys::layout_profile(id);
-            if profile.keys.len() == n {
-                return Self::kps_keys_text_for_layout(id);
+            _ => {
+                for id in ["104", "98", "87", "75", "68", "64", "60"] {
+                    if crate::keys::layout_profile(id).keys.len() == n {
+                        return Some(id);
+                    }
+                }
+                None
             }
+        }
+    }
+
+    pub fn kps_keys_text_for_layout_n(layout_id: &str, n: usize) -> String {
+        if let Some(id) = Self::layout_id_for_key_count(n) {
+            return Self::kps_keys_text_for_layout(id);
         }
 
         let full = Self::kps_keys_text_for_layout(layout_id);
@@ -883,6 +887,9 @@ impl Config {
         // ③ 没存过：按旧规则推导一份
         let cur = prev_names;
         let result = if cur.is_empty() || is_def {
+            if let Some(id) = Self::layout_id_for_key_count(n) {
+                self.layout.keyboard_layout = id.to_string();
+            }
             Self::kps_keys_text_for_layout_n(&self.layout.keyboard_layout, n)
         } else {
             let mut list: Vec<String> = cur.into_iter().take(n).collect();
@@ -1809,6 +1816,10 @@ Z,X,C,V".into();
             cfg.kps_keys,
             Config::kps_keys_text_for_layout("60"),
             "从 98 默认键表改键数到 60 应切到 60 多行配列而非压扁成单行"
+        );
+        assert_eq!(
+            cfg.layout.keyboard_layout, "60",
+            "键数设为 60 时配列应自动联动切换为 60"
         );
         assert!(
             cfg.kps_keys_by_count.is_empty(),
