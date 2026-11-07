@@ -9,9 +9,8 @@
 //! | [`listener`] | **常驻监听脚本**（位置上报 + 夹回屏幕 + 主窗口最小化拦截）+ 接收上报的 DBus 服务 |
 //!
 //! 三条通用约束（都踩过）：
-//! 1. **脚本改不了窗口几何**：`Qt` 在脚本环境里未定义、`moveResize` 已被移除、
-//!    `frameGeometry` 赋普通对象静默失败。要定位窗口只能用**窗口规则**（`positionrule=2`
-//!    Force 能即时生效，`=1` Apply 只在窗口出现时算）。
+//! 1. **窗口规则定位**：KWin `Rules::SetRule` 枚举中 `3 = Apply`（Apply Initially，初始应用后允许用户拖动），
+//!    `2 = Force`（强制锁定），`1 = DontAffect`（不干预）。KWin 6 脚本环境同时支持 `w.frameGeometry = {x,y,width,height}`。
 //! 2. **脚本名必须每次唯一**：`Scripting.start()` 只执行「尚未启动过」的脚本，同名会被静默跳过。
 //! 3. **别卸载刚加载的脚本**：KWin 执行是异步的，立即卸载有竞态；只卸载「上一次」的。
 //!
@@ -36,7 +35,11 @@ pub(crate) use script::{
 };
 
 /// 是否 KDE 会话（只有 KWin 支持这套窗口规则 + 脚本通道）
+/// 单元测试下始终返回 `false`，防止测试污染宿主真实的 `~/.config/kwinrulesrc` 与 `/tmp/kmc-hudpos.js`。
 pub fn is_kde() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.to_uppercase().contains("KDE"))
         .unwrap_or(false)

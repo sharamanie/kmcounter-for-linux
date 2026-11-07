@@ -193,6 +193,40 @@ fn kv_set(kv: &mut Vec<(String, String)>, key: &str, val: String) {
     }
 }
 
+/// 同步 `[General]` 段的 `count`、`rules` 与 KWin 6 的 `Order`：
+/// KWin 6 的 `RuleBookSettings::usrRead()` 会把 `rules=` 迁移到 `Order=` 并删掉 `rules=` 与 `count=`；
+/// 若后续只读 `rules=`，就会误以为现有规则列表为空，导致新写的 `rules=` 只含最后一条规则，
+/// 进而在 `KWin.reconfigure()` 时触发 KWin 6 删光其余所有规则。
+/// 这里合并 `rules`、`Order` 与实际存在的分组名，确保所有分组完整登记且顺序稳定。
+fn sync_general_rules(general: &mut Vec<(String, String)>, groups: &[(String, String)]) {
+    let valid_ids: Vec<String> = groups.iter().map(|(n, _)| n.clone()).collect();
+    let mut ordered: Vec<String> = Vec::new();
+    for key in ["rules", "Order"] {
+        if let Some(val) = kv_get(general, key) {
+            for part in val.split(',') {
+                let id = part.trim();
+                if !id.is_empty()
+                    && valid_ids.iter().any(|v| v == id)
+                    && !ordered.iter().any(|o| o == id)
+                {
+                    ordered.push(id.to_string());
+                }
+            }
+        }
+    }
+    for id in &valid_ids {
+        if !ordered.iter().any(|o| o == id) {
+            ordered.push(id.clone());
+        }
+    }
+    let joined = ordered.join(",");
+    kv_set(general, "count", ordered.len().to_string());
+    kv_set(general, "rules", joined.clone());
+    if kv_get(general, "Order").is_some() {
+        kv_set(general, "Order", joined);
+    }
+}
+
 /// 在 INI 文本中追加本程序规则（若不存在）：主窗口（跳过任务栏 / Alt-Tab）
 fn add_rule(text: &str) -> String {
     add_rule_with(text, MARKER, &main_rule_body())
@@ -203,9 +237,9 @@ fn add_hud_rule(text: &str, above: bool) -> String {
     add_rule_with(text, HUD_MARKER, &hud_rule_body(above))
 }
 
-/// 在 INI 文本中追加一条带标记的规则（自动分配新 id 并登记到 [General] rules）
+/// 在 INI 文本中追加一条带标记的规则（自动分配新 id 并登记到 [General] rules/Order）
 fn add_rule_with(text: &str, marker: &str, body: &str) -> String {
-    let (mut general, groups) = split_ini(text);
+    let (mut general, mut groups) = split_ini(text);
     let next_id = groups
         .iter()
         .filter_map(|(name, _)| name.parse::<u32>().ok())
@@ -213,20 +247,17 @@ fn add_rule_with(text: &str, marker: &str, body: &str) -> String {
         .unwrap_or(0)
         + 1;
     let id = next_id.to_string();
-    let mut rules: Vec<String> = kv_get(&general, "rules")
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-        .unwrap_or_default();
-    if !rules.iter().any(|r| r == &id) {
-        rules.push(id.clone());
+    let mut new_body = format!("Description={marker}\n{body}");
+    if !new_body.ends_with('\n') {
+        new_body.push('\n');
     }
-    kv_set(&mut general, "count", rules.len().to_string());
-    kv_set(&mut general, "rules", rules.join(","));
+    groups.push((id, new_body));
+    sync_general_rules(&mut general, &groups);
 
     let mut out = render_general(&general);
     for (name, group_body) in &groups {
         out.push_str(&format!("\n[{name}]\n{group_body}"));
     }
-    out.push_str(&format!("\n[{id}]\nDescription={marker}\n{body}"));
     out
 }
 
@@ -244,6 +275,7 @@ fn set_hud_above(text: &str, above: bool) -> String {
     // KWin 发现 rules 列表与实际段不一致就会丢弃其他规则（实测：
     // 主窗口与 APM 两条规则被整条吞掉）。
     let (mut general, groups) = split_ini(text);
+    sync_general_rules(&mut general, &groups);
     let mut out = render_general(&general);
     for (name, body) in &groups {
         if !body.contains(HUD_MARKER) {
@@ -274,7 +306,6 @@ fn set_hud_above(text: &str, above: bool) -> String {
         }
         out.push_str(&format!("\n[{name}]\n{body2}"));
     }
-    let _ = &mut general;
     out
 }
 
@@ -291,12 +322,7 @@ fn remove_rule(text: &str) -> String {
     if kept.len() == groups.len() {
         return text.to_string();
     }
-    let ids: Vec<String> = kept.iter().map(|(n, _)| n.clone()).collect();
-    let filtered: Vec<String> = kv_get(&general, "rules")
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| ids.contains(s)).collect())
-        .unwrap_or_default();
-    kv_set(&mut general, "count", filtered.len().to_string());
-    kv_set(&mut general, "rules", filtered.join(","));
+    sync_general_rules(&mut general, &kept);
 
     let mut out = render_general(&general);
     for (name, body) in &kept {
@@ -360,60 +386,63 @@ fn render_general(kv: &[(String, String)]) -> String {
     out
 }
 
-
+/// HUD 位置规则体：
+/// 注意 KWin 的 `Rules::SetRule` 枚举（实测反汇编 `/usr/lib/libkwin.so.6` `WindowRules::checkPosition`）：
+/// `0 = Unused`, `1 = DontAffect（不干预）`, `2 = Force（强制锁死）`, `3 = Apply（初始应用一次）`,
+/// `4 = Remember`, `5 = ApplyNow`, `6 = ForceTemporarily`。
+/// 因此「窗口映射时应用一次记忆位置、之后允许用户自由拖动」必须写 `positionrule=3`（而非 `1`）！
+/// 同时 KConfig 解析 `QPoint` 使用整型 `toInt()`，坐标必须四舍五入为整数。
 fn hud_pos_rule_body(pos: (f32, f32), title: &str) -> String {
     format!(
-        "position={},{}\npositionrule=1\ntitle={title}\ntitlematch=1\ntypes=1\nwmclass=kmcounter\nwmclasscomplete=false\nwmclassmatch=1",
-        pos.0, pos.1
+        "position={},{}\npositionrule=3\ntitle={title}\ntitlematch=1\ntypes=1\nwmclass=kmcounter\nwmclasscomplete=false\nwmclassmatch=1\n",
+        pos.0.round() as i32,
+        pos.1.round() as i32
     )
 }
 
 /// 就地更新某条 HUD 规则的 position（节存在时）：避免 remove+add 让规则节号无限膨胀。
+/// 同时把旧版误写的 `positionrule=1`（DontAffect）升级为 `positionrule=3`（Apply Initially），
+/// 并确保 `[General]` 的 `count` / `rules` / `Order` 完整包含所有分组。
 /// 返回 None 表示没找到该规则（调用方走 add）。
 fn update_rule_position(text: &str, marker: &str, pos: (f32, f32)) -> Option<String> {
     if !text.contains(marker) {
         return None;
     }
-    let new_line = format!("position={},{}", pos.0, pos.1);
-    let mut out = String::with_capacity(text.len() + 16);
-    let mut in_target = false;
-    let mut replaced = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') && t.ends_with(']') {
-            in_target = false;
-            out.push_str(line);
-            out.push('\n');
+    let (mut general, mut groups) = split_ini(text);
+    let new_pos_line = format!("position={},{}", pos.0.round() as i32, pos.1.round() as i32);
+    let mut found = false;
+    for (_, body) in &mut groups {
+        if !body.contains(marker) {
             continue;
         }
-        if t.starts_with("Description=") && t.contains(marker) {
-            in_target = true;
-        }
-        // "position=" 不会误匹配 "positionrule="（第 9 个字符是 'r' 不是 '='）
-        if in_target && !replaced && t.starts_with("position=") {
-            if t != new_line {
-                out.push_str(&new_line);
-                out.push('\n');
+        found = true;
+        let mut updated = String::with_capacity(body.len() + 16);
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("position=") {
+                updated.push_str(&new_pos_line);
+                updated.push('\n');
+            } else if t.starts_with("positionrule=") {
+                updated.push_str("positionrule=3\n");
             } else {
-                out.push_str(line);
-                out.push('\n');
+                updated.push_str(t);
+                updated.push('\n');
             }
-            replaced = true;
-            in_target = false;
-            continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        *body = updated;
     }
-    // lines() 会丢掉文件末尾的换行 —— 保持原样，保证幂等（重复同步文本逐字节一致）
-    if text.ends_with('\n') && !out.ends_with('\n') {
-        out.push('\n');
+    if !found {
+        return None;
     }
-    let _ = replaced;
+    sync_general_rules(&mut general, &groups);
+    let mut out = render_general(&general);
+    for (name, group_body) in &groups {
+        out.push_str(&format!("\n[{name}]\n{group_body}"));
+    }
     Some(out)
 }
 
-/// 从 INI 文本中删除指定 marker 的规则节（保留其他规则），General 的 count/rules 同步
+/// 从 INI 文本中删除指定 marker 的规则节（保留其他规则），General 的 count/rules/Order 同步
 fn remove_rule_by_marker(text: &str, marker: &str) -> String {
     let (mut general, groups) = split_ini(text);
     let kept: Vec<(String, String)> = groups
@@ -424,18 +453,7 @@ fn remove_rule_by_marker(text: &str, marker: &str) -> String {
     if kept.len() == groups.len() {
         return text.to_string();
     }
-    let ids: Vec<String> = kept.iter().map(|(n, _)| n.clone()).collect();
-    let filtered: Vec<String> = kv_get(&general, "rules")
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| ids.contains(&s.to_string()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    kv_set(&mut general, "count", filtered.len().to_string());
-    kv_set(&mut general, "rules", filtered.join(","));
+    sync_general_rules(&mut general, &kept);
     let mut out = render_general(&general);
     for (name, body) in &kept {
         out.push_str(&format!("\n[{name}]\n{body}"));
@@ -706,7 +724,7 @@ mod tests {
         let t = apply_hud_rules(base, Some((10.0, 20.0)), Some((30.0, 40.0)));
         assert!(t.contains("Description=KMCounter HUD APM (auto)"));
         assert!(t.contains("position=10,20"));
-        assert!(t.contains("positionrule=1"), "Apply 语义（窗口出现时应用一次，可拖动）");
+        assert!(t.contains("positionrule=3"), "Apply 语义（SetRule::Apply=3，窗口出现时应用一次，可拖动）");
         assert!(t.contains("title=KMC - APM") && t.contains("titlematch=1"));
         assert!(t.contains("Description=KMCounter HUD KPS (auto)") && t.contains("position=30,40"));
         assert!(t.contains("rules=1,2,3"), "General 的 rules 列表要跟上");
@@ -722,11 +740,27 @@ mod tests {
         assert!(t3.contains("position=10,20"), "APM 的规则不受影响");
         assert!(!t3.contains("position=30,40"), "旧位置应被更新掉");
         // positionrule 不能被误伤（starts_with("position=") 不匹配 "positionrule="）
-        assert!(t3.contains("positionrule=1"));
+        assert!(t3.contains("positionrule=3"));
         // 移除全部：无关规则保留
         let t4 = apply_hud_rules(&t3, None, None);
         assert!(!t4.contains("KMCounter HUD"));
         assert!(t4.contains("Description=other"));
         assert!(t4.contains("rules=1"));
     }
+
+    /// KWin 6 的 `RuleBookSettings::usrSave` 只写 `Order=` 而不写 `rules=` / `count=`；
+    /// 同步 HUD 规则或新增规则时不能把 `Order=` 里的既有规则丢掉，且旧版 `positionrule=1` 与浮点坐标应被自动修正。
+    #[test]
+    fn kwin6_order_only_general_preserves_all_rules_and_upgrades_positionrule() {
+        let kwin6_file = "[19]\nDescription=KMCounter HUD APM (auto)\nposition=51.2,51.2\npositionrule=1\ntitle=KMC - APM\ntitlematch=1\ntypes=1\nwmclass=kmcounter\nwmclasscomplete=false\nwmclassmatch=1\n\n[General]\nOrder=19\n";
+        let out = apply_hud_rules(kwin6_file, Some((51.2, 51.2)), Some((43.0, 1161.0)));
+        assert!(out.contains("rules=19,20"), "应合并 Order=19 与新规则 20: {out}");
+        assert!(out.contains("Order=19,20"), "KWin 6 的 Order 也必须同步为 19,20: {out}");
+        assert!(out.contains("count=2"), "count 应为 2: {out}");
+        assert!(out.contains("position=51,51"), "浮点坐标应四舍五入为整型 QPoint: {out}");
+        assert!(out.contains("position=43,1161"), "KPS 规则应写入: {out}");
+        assert!(!out.contains("positionrule=1"), "旧版 positionrule=1 (DontAffect) 应全部升级为 3: {out}");
+        assert!(out.contains("positionrule=3"), "应使用 positionrule=3 (Apply Initially): {out}");
+    }
 }
+

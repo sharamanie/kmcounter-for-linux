@@ -88,10 +88,12 @@ impl App {
         log::info!("APM 悬浮窗 → {}", if self.hud_apm_show { "开" } else { "关" });
         // 关掉之前先把当前实际位置落盘（理由同 toggle_kps_hud）
         if turning_off {
-            // 理由同 toggle_kps_hud：KDE/Wayland 下只有 KWin 上报可用
+            // 理由同 toggle_kps_hud：KDE/Wayland 下只有 KWin 上报可用，且必须确认是用户拖动过的位置
             let seen = self.hud_apm_seen.lock().pos;
             #[cfg(target_os = "linux")]
-            let kwin_pos = crate::kwin::hud_pos_reports()[0].map(|r| r.pos);
+            let kwin_pos = crate::kwin::hud_pos_reports()[0]
+                .filter(|r| r.user_moved)
+                .map(|r| r.pos);
             #[cfg(not(target_os = "linux"))]
             let kwin_pos: Option<(f32, f32)> = None;
             let pos = seen.or(kwin_pos);
@@ -99,7 +101,7 @@ impl App {
                 log::info!("关闭 APM 前落盘位置: {:?}", pos);
                 self.save_hud_pos(true, pos);
             } else {
-                log::warn!("关闭 APM 时拿不到当前位置，位置记忆可能停在旧值");
+                log::debug!("关闭 APM 时无新拖动位置，保持既有位置记忆 {:?}", self.cfg.apm_hud_pos);
             }
         }
         self.cfg.hud_apm_show = self.hud_apm_show;
@@ -126,11 +128,12 @@ impl App {
             // 位置来源有两条，必须都试：
             // - winit 能读位置的平台（X11 / Windows）→ seen.pos；
             // - KDE/Wayland：winit **永远拿不到全局坐标**（seen 恒为 None），
-            //   只能用 KWin 监听脚本上报的位置。
-            //   上一版只读 seen，结果在 KDE 上每次都拿不到、修了等于没修。
+            //   只能用 KWin 监听脚本上报且标记为 user_moved 的位置。
             let seen = self.hud_kps_seen.lock().pos;
             #[cfg(target_os = "linux")]
-            let kwin_pos = crate::kwin::hud_pos_reports()[1].map(|r| r.pos);
+            let kwin_pos = crate::kwin::hud_pos_reports()[1]
+                .filter(|r| r.user_moved)
+                .map(|r| r.pos);
             #[cfg(not(target_os = "linux"))]
             let kwin_pos: Option<(f32, f32)> = None;
             let pos = seen.or(kwin_pos);
@@ -138,7 +141,7 @@ impl App {
                 log::info!("关闭 KPS 前落盘位置: {:?}", pos);
                 self.save_hud_pos(false, pos);
             } else {
-                log::warn!("关闭 KPS 时拿不到当前位置，位置记忆可能停在旧值");
+                log::debug!("关闭 KPS 时无新拖动位置，保持既有位置记忆 {:?}", self.cfg.kps_hud_pos);
             }
         }
         self.cfg.hud_kps_show = self.hud_kps_show;

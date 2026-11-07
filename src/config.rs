@@ -938,7 +938,17 @@ impl Config {
                     // 迁移若生效，**立即写盘**。
                     // 不能等退出时的 save_all：那路径保存的是 cfg_shared，
                     // 而用户可能直接 kill / 异常退出，迁移结果就丢了。
-                    if c.migrate_flat_kps_keys() {
+                    let mut migrated = c.migrate_flat_kps_keys();
+                    let actual_count = c
+                        .kps_key_layout()
+                        .names()
+                        .len()
+                        .clamp(1, KPS_KEY_MAX as usize) as u8;
+                    if c.kps_key_count != actual_count {
+                        c.kps_key_count = actual_count;
+                        migrated = true;
+                    }
+                    if migrated {
                         if let Err(e) = c.save(path) {
                             log::warn!("键表迁移后写盘失败: {e}");
                         }

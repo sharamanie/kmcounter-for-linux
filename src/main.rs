@@ -465,7 +465,7 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
     let tray = tray::start(tray_lang, cfg.hud_apm_show, cfg.hud_kps_show);
     let autostart_state = Arc::new(std::sync::atomic::AtomicBool::new(autostart::is_enabled()));
 
-    // KDE：按配置维护“跳过任务栏/Alt-Tab”的 KWin 窗口规则（后台执行，避免阻塞启动；仅 Linux）
+    // KDE：按配置维护“跳过任务栏/Alt-Tab”的 KWin 窗口规则与 HUD 位置记忆（仅 Linux）
     #[cfg(target_os = "linux")]
     {
         let skip = cfg.skip_taskbar;
@@ -477,16 +477,17 @@ fn run_app(cfg_path: PathBuf, stats_path: PathBuf) {
             cfg.apm_hud_pos,
             cfg.kps_hud_pos,
         );
+        // 关键：在 eframe::run_native 创建窗口**之前**同步写入 KWin 窗口规则并加载监听脚本，
+        // 确保窗口首次 map 时 KWin 规则（positionrule=3 初始位置恢复 + aboverule=2 置顶 + 跳过任务栏）
+        // 与监听脚本的 windowAdded 钩子已经就绪，避免启动竞态导致位置记忆漏套。
+        kwin::set_skip_taskbar(skip, hud_on_top);
+        kwin::start_hud_pos_service();
+        kwin::sync_hud_listener(ac, kc, ap, kp);
+        kwin::sync_hud_rules(ap, kp);
         std::thread::Builder::new()
             .name("kmcounter-kwin".into())
             .spawn(move || {
-                kwin::set_skip_taskbar(skip, hud_on_top);
-                kwin::start_hud_pos_service();
-                kwin::sync_hud_listener(ac, kc, ap, kp);
-                // 位置恢复的正道：KWin 窗口规则（窗口 map 时由 KWin 核心应用位置）
-                kwin::sync_hud_rules(ap, kp);
-                // 规则与窗口 map 的竞态补刀：窗口若赶在 KWin 重载规则前 map，规则会漏套
-                //（任务栏从此常驻条目）。窗口起来后把「跳过任务栏」直接钉上去，
+                // 规则与窗口 map 的兜底补刀：窗口起来后把「跳过任务栏 + HUD 置顶」直接钉上去，
                 // 幂等多试几次以覆盖 EGL 初始化耗时不同的启动。
                 for _ in 0..3 {
                     std::thread::sleep(std::time::Duration::from_secs(2));

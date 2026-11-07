@@ -208,7 +208,7 @@ function kmcHook(w) {{
     // 按「次数」重试会在窗口定型前耗尽（200% 缩放的大窗口实测就是没恢复成功）——所以改成**时间窗**：
     // 认领后 8 秒内只要窗口没在记忆位置就反复拉回；期间**不上报**（否则会把合成器的默认摆放
     // 写进位置记忆）。用户一旦拖动（started 信号）立即永久放行。
-    var st = {{ tag: null, dragging: false, userMoved: false, born: 0, lastWarn: 0, placing: false, lastPlace: 0 }};
+    var st = {{ tag: null, dragging: false, userMoved: false, born: 0, lastWarn: 0, placing: false, lastPlace: 0, placeCount: 0 }};
     function target() {{ return st.tag ? KMC_TARGET[st.tag] : null; }}
     // 恢复窗 30 秒：窗口 map 初始化期间 moveTo 可能被 KWin 的摆放流程吞掉，而脚本没有
     // setTimeout（实测 undefined），重试只能靠几何事件驱动 —— 窗后 KPS/APM 的数字宽度
@@ -230,18 +230,23 @@ function kmcHook(w) {{
     }}
     // 防回路：place() 自己移窗口会触发 frameGeometryChanged → onChanged → place()。
     // 加上 KWin 在窗口 map 期间可能连续回调，曾在日志里看到
-    // "RangeError: Maximum call stack size exceeded"。这里用一个标记 + 最小间隔限制重入。
+    // "RangeError: Maximum call stack size exceeded"。这里用 st.placing 防同步重入 + 200ms 窗口内最多 8 次防死循环，
+    // 避免单次 80ms 节流把紧跟在 claim() 后的首次尺寸调整（InnerSize）事件吞掉。
     function place() {{
         if (!st.tag || st.dragging || st.userMoved) return;
         if (st.placing) return;
-        // 两次摆放至少隔 80ms：KWin 在 map 期间会密集发几何事件，
-        // 而每次摆放都会反过来再触发一次，不限制就成了随机深度递归。
+        try {{ if (w.move || w.resize) return; }} catch (e) {{}}
         var now = Date.now();
-        if (st.lastPlace && now - st.lastPlace < 80) return;
+        if (now - st.lastPlace < 200) {{
+            if (st.placeCount >= 8) return;
+        }} else {{
+            st.placeCount = 0;
+        }}
         var t = targetClamped();
         if (!t || now - st.born > 30000 || kmcAt(w, t)) return;
         st.placing = true;
         st.lastPlace = now;
+        st.placeCount = (st.placeCount || 0) + 1;
         try {{
             kmcMoveTo(w, t[0], t[1]);
         }} finally {{
@@ -269,10 +274,10 @@ function kmcHook(w) {{
         try {{ moving = moving || !!(w.move || w.resize); }} catch (e) {{}}
         // 用户拖动期间合成器自己在逐帧改位置，此时写 frameGeometry 会被覆盖；
         // 所以拖动中只等「拖动结束」信号再夹取。非拖动的几何变化（程序自己改尺寸等）仍即时夹取。
-        // **注意这里只能置 `dragging`，不能置 `userMoved`**：`w.move` 在合成器自己搬窗口时
-        // 也会为真（实测：KWin 摆放窗口 → 被当成"用户拖动" → 错位被写进位置记忆，
-        // 于是越重启越歪）。`userMoved` 只由下面两个明确的拖动开始信号置位。
-        if (moving) {{ st.dragging = true; }} else {{ place(); kmcClamp(w, st.tag); }}
+        // **绝对不能在这里写 `st.dragging = true`**：`w.move || w.resize` 在程序化改尺寸或合成器初始化时
+        // 不会触发 `interactiveMoveResizeFinished`，一旦置位 `st.dragging` 就会永久卡死为 true，
+        // 导致后续 `place()` 与 `kmcClamp()` 永远失效。`st.dragging` 只由下方明确的交互开始/结束信号维护。
+        if (!moving) {{ place(); kmcClamp(w, st.tag); }}
         report();
     }}
     function onFinished() {{ if (st.tag) {{ st.dragging = false; kmcClamp(w, st.tag); report(); }} }}
@@ -288,6 +293,8 @@ function kmcHook(w) {{
         report();
     }}
     try {{ w.frameGeometryChanged.connect(onChanged); }} catch (e) {{}}
+    try {{ if (w.bufferGeometryChanged) w.bufferGeometryChanged.connect(onChanged); }} catch (e) {{}}
+    try {{ if (w.clientGeometryChanged) w.clientGeometryChanged.connect(onChanged); }} catch (e) {{}}
     // 拖动开始置位：恢复重试立即停手、此后的位置都是用户的选择（正常上报与记忆）
     // 这两个才是"用户拖动开始"的可靠信号（`w.move` 在合成器自己搬窗口时也为真，不能用）。
     // 打一行日志：位置记忆只被这里置过标记的位置更新，出问题时 journalctl 里一搜就知道
@@ -344,8 +351,8 @@ try {{
 
 static HUD_LISTENER: std::sync::Mutex<Option<((String, PathBuf), String)>> = std::sync::Mutex::new(None);
 
-/// 单个 HUD 位置规则的规则体：`positionrule=1`（Apply）= 窗口出现时应用一次，
-/// 之后用户可自由拖动 —— 正是"恢复到记忆位置"的语义（2=Force 会锁死位置，不能用）。
+/// 单个 HUD 位置规则的规则体：`positionrule=3`（Apply Initially）= 窗口出现时应用一次，
+/// 之后用户可自由拖动 —— 正是"恢复到记忆位置"的语义（2=Force 会锁死位置，1=DontAffect 不生效）。
 
 /// 清理历史遗留的孤儿监听脚本：进程异常死亡（被杀 / 崩溃）时 `stop_hud_listener` 没跑，
 /// KWin 里会留下还在运行的旧脚本（实测曾同时挂 3 个版本互相打架、其中一个还在刷错误日志）。
@@ -358,12 +365,25 @@ fn cleanup_orphan_scripts(conn: &zbus::blocking::Connection) {
     for e in entries.flatten() {
         let fname = e.file_name();
         let Some(fname) = fname.to_str() else { continue };
-        let Some(stem) = fname.strip_prefix("kmc-hudpos") else { continue };
+        let Some(stem) = fname
+            .strip_prefix("kmc-hudpos")
+            .and_then(|s| s.strip_suffix(".js"))
+        else {
+            continue;
+        };
         // 只认脚本文件：kmc-hudpos.js（现版固定名）与 kmc-hudpos-<pid>.js（旧版）。
         // 必须限定 .js 结尾 —— /tmp 里同前缀的其它文件（日志等）不能误删（实测教训）
-        if !(stem.is_empty() || stem.starts_with('-')) || !fname.ends_with(".js") {
+        if !(stem.is_empty() || stem.starts_with('-')) {
             continue;
         }
+        let plugin_name = fname.trim_end_matches(".js");
+        let _ = conn.call_method(
+            Some("org.kde.KWin"),
+            "/Scripting",
+            Some("org.kde.kwin.Scripting"),
+            "unloadScript",
+            &(plugin_name,),
+        );
         let _ = conn.call_method(
             Some("org.kde.KWin"),
             "/Scripting",
@@ -399,15 +419,11 @@ pub fn sync_hud_listener(
     let name = "kmc-hudpos".to_string();
     let path = std::env::temp_dir().join(format!("{name}.js"));
     let body = hud_listener_script(apm_clamp, kps_clamp, apm_target, kps_target);
-    if let Err(e) = std::fs::write(&path, body) {
-        log::warn!("写入 HUD 监听脚本失败: {e}");
-        return;
-    }
     let res = (|| -> Result<(), String> {
         let conn = zbus::blocking::Connection::session().map_err(|e| e.to_string())?;
-        // 先清历史孤儿（含本次要加载的固定名，随后会重新加载）
-        cleanup_orphan_scripts(&conn);
-        // 卸载上一个（必然已执行完），避免重载时脚本越积越多
+        // 必须**先**清理旧脚本并删旧文件，**再**把新脚本写进 path！
+        // 之前先写 path 再走 last.take() 的 remove_file(prev_path)，因为 path 固定为 /tmp/kmc-hudpos.js，
+        // 重载时直接把刚写好的新脚本文件删掉了，导致 loadScript 读不到文件、监听脚本彻底阵亡。
         if let Some(((prev_name, prev_path), _)) = last.take() {
             let _ = conn.call_method(
                 Some("org.kde.KWin"),
@@ -418,8 +434,7 @@ pub fn sync_hud_listener(
             );
             let _ = std::fs::remove_file(&prev_path);
         }
-        let p = path.to_string_lossy().to_string();
-        // 同名残留先卸（孤儿脚本跨重启清理，见上）
+        cleanup_orphan_scripts(&conn);
         let _ = conn.call_method(
             Some("org.kde.KWin"),
             "/Scripting",
@@ -427,6 +442,8 @@ pub fn sync_hud_listener(
             "unloadScript",
             &(name.as_str(),),
         );
+        std::fs::write(&path, &body).map_err(|e| format!("写入 HUD 监听脚本失败: {e}"))?;
+        let p = path.to_string_lossy().to_string();
         conn.call_method(
             Some("org.kde.KWin"),
             "/Scripting",
@@ -531,6 +548,18 @@ mod tests {
         assert!(
             js.contains("kmcReport(w, st.tag, st.userMoved)") && js.contains("moved ? 1 : 0"),
             "上报要带「用户是否拖过」标记：{js}"
+        );
+        assert!(
+            !js.contains("if (moving) { st.dragging = true; }"),
+            "onChanged 绝不能锁死 st.dragging = true（否则初始化改尺寸后 place/clamp 永久失效）：{js}"
+        );
+        assert!(
+            js.contains("if (!moving) { place(); kmcClamp(w, st.tag); }"),
+            "非拖动状态下应调用 place() 与 kmcClamp()：{js}"
+        );
+        assert!(
+            js.contains("bufferGeometryChanged") && js.contains("clientGeometryChanged"),
+            "应同时订阅 bufferGeometryChanged 与 clientGeometryChanged：{js}"
         );
     }
 
